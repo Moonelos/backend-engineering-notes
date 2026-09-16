@@ -19,10 +19,10 @@ kafka/
 ├── application_design/    Contracts, Python clients, processing loops, topic design
 │
 │ ── SURVIVE FAILURE ────────────────────────────────────
-├── reliability/           Delivery semantics, transactions, retries, outbox
+├── reliability/           Delivery semantics, idempotency, transactions, retries, outbox/CDC
 │
 │ ── RUN THE PLATFORM ───────────────────────────────────
-├── operations/            Security, capacity, observability, upgrades, recovery
+├── operations/            Security, capacity, observability, upgrades, recovery, tiered storage
 │
 │ ── EXTEND OR REPLACE IT ───────────────────────────────
 └── ecosystem/             Connect, stream processing, share groups, alternatives
@@ -70,14 +70,17 @@ another external system.
 
 **For**: engineers taking an existing event flow to production.
 
-**Working result by entry 2**: derive its real delivery guarantee from a crash trace and select an
-idempotency boundary.
+**Working result by entry 2**: derive its real delivery guarantee from a crash trace and run a
+durable duplicate-collapse example.
 
 1. **Do:** [Trace delivery semantics](reliability/01_delivery_semantics.md).
-2. **Build:** implement the transaction trace in [Idempotence and transactions](reliability/02_idempotence_transactions_and_exactly_once.md).
-3. **Test:** exercise crash windows with the [Kafka service test harness](reliability/05_testing_kafka_services.md).
-4. **Recover:** [Retries, dead letters, and replay](reliability/03_retries_dead_letters_and_replay.md).
-5. **Operate:** [Security](operations/01_security_and_multitenancy.md), [capacity](operations/02_capacity_planning_and_performance.md), and [observability](operations/03_observability_and_incident_response.md).
+2. **Build:** implement [durable consumer-effect idempotency](reliability/02_durable_consumer_effect_idempotency.md).
+3. **Branch:** use [Kafka transactions](reliability/02_idempotence_transactions_and_exactly_once.md)
+   for Kafka-only processing or a [transactional outbox](reliability/04_transactional_outbox_and_cdc.md)
+   for database-authoritative changes.
+4. **Test:** exercise process death and transaction restart with the [Kafka service test harness](reliability/05_testing_kafka_services.md).
+5. **Recover:** [Retries, dead letters, and replay](reliability/03_retries_dead_letters_and_replay.md).
+6. **Operate:** [Security](operations/01_security_and_multitenancy.md), [capacity](operations/02_capacity_planning_and_performance.md), and [observability](operations/03_observability_and_incident_response.md).
 
 **Stop here if** the service has bounded lag, idempotent effects, tested replay, and actionable
 alerts. Continue to deployment and disaster recovery when your team owns the cluster lifecycle.

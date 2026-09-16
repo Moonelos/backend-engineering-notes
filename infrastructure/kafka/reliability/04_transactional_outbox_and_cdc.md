@@ -1,4 +1,4 @@
-# An Outbox Turns Two Writes into One Recoverable Handoff
+# A Polling Outbox Turns Two Writes into One Recoverable Handoff
 
 > **Who this is for**: services that update a database and publish a corresponding event.
 
@@ -14,11 +14,12 @@ state with no event. Reversing the calls creates an event for a database change 
 ```text
 BEGIN → insert orders row → insert outbox(event_id, payload, unpublished) → COMMIT
                                       ↓
-                         relay/CDC publishes to Kafka
+                         polling relay publishes to Kafka
 ```
 
 The relay may publish twice around its own crash, so consumers still deduplicate by `event_id`.
-**Change data capture (CDC)** reads database-log changes; a polling relay claims outbox rows directly.
+This note completes the polling model. [CDC](06_cdc_outbox_relay.md) has a different actor and
+checkpoint and therefore owns a separate production path.
 
 PostgreSQL can own the business row and publication intent in one commit:
 
@@ -78,7 +79,8 @@ captures ordered database changes but introduces connector, log-retention, and s
 dependencies.
 
 A polling relay claims a small batch with `FOR UPDATE SKIP LOCKED`, publishes each event using
-`event_id` as the Kafka key, waits for the broker acknowledgment, and only then sets
+`aggregate_id` (`ord-42`) as the Kafka key, carries `event_id` inside the envelope for duplicate
+collapse, waits for the broker acknowledgment, and only then sets
 `published_at`. Keep claimed rows locked only for a bounded batch:
 
 ```text
@@ -89,6 +91,44 @@ t3  relay-b claims and publishes evt-101 again  → possible duplicate, no loss
 t4  relay-b sets published_at and commits        → cleanup may later archive the row
 ```
 
+The key choice preserves the order of successive events for one aggregate:
+
+```text
+evt-101(order_id=ord-42, order.created) ┐
+                                        ├─ key ord-42 → the same Kafka partition, in publish order
+evt-109(order_id=ord-42, order.paid)    ┘
+```
+
+Keying by unique `event_id` would spread these two events independently and lose that ordering
+relationship. `event_id` and `aggregate_id` solve different problems: deduplication and routing.
+
+### Claim, acknowledge, mark, and reconcile
+
+One relay transaction handles a bounded row like this:
+
+```sql
+BEGIN;
+SELECT event_id, aggregate_id, event_type, payload
+FROM outbox_events
+WHERE published_at IS NULL
+ORDER BY created_at
+FOR UPDATE SKIP LOCKED
+LIMIT 10;
+-- publish each row with key=aggregate_id and wait for its broker delivery callback
+UPDATE outbox_events SET published_at = now() WHERE event_id = $1;
+COMMIT;
+```
+
+The database lock prevents two polling relays from claiming the same row concurrently, but it does
+not make Kafka and PostgreSQL atomic. A crash after Kafka acknowledgment and before the update still
+duplicates the record, which is why the consumer-effect store owns the `event_id` uniqueness
+constraint. Do not hold a large batch transaction open while a broker is unhealthy: cap the batch,
+delivery deadline, and lock timeout.
+
+A reconciliation job compares old unpublished rows with the relay's delivery errors. Its first
+action is to retry publication, not to mark a row published. Alert on the age of the oldest
+unpublished row; row count alone misses one permanently stuck old event in a low-volume service.
+
 The duplicate is intentional evidence of an uncertain acknowledgment boundary. A consumer's
 unique `event_id` constraint collapses both deliveries to one effect. Retain published rows through
 the maximum reconciliation window; deleting them immediately removes the evidence needed to
@@ -96,6 +136,38 @@ compare database intent with Kafka output.
 
 **Success signal:** crash after database commit and before publish; the relay later emits the event.
 Then crash after publish and verify a duplicate causes one downstream effect.
+
+The collection executes those boundaries in a disposable PostgreSQL database. Keep the Kafka
+quick-start broker running, then start PostgreSQL:
+
+```bash
+docker run --rm --name kafka-notes-postgres \
+  -e POSTGRES_PASSWORD=postgres -p 55439:5432 -d postgres:17
+until docker exec kafka-notes-postgres pg_isready -U postgres; do sleep 1; done
+```
+
+From `infrastructure/kafka/examples/python`, run the checked-in integration test and clean up:
+
+```bash
+uv sync --dev
+uv run pytest -q tests/integration/test_outbox.py
+docker stop kafka-notes-postgres
+```
+
+[`test_outbox.py`](../examples/python/tests/integration/test_outbox.py) creates an isolated schema
+and performs four observed transitions:
+
+1. An exception between the `orders` and `outbox_events` inserts rolls both rows back.
+2. The successful transaction leaves exactly one domain row and one related outbox row.
+3. A simulated process death after Kafka acknowledgment rolls back `published_at`, so restart claims
+   and publishes the same event again with key `ord-42`.
+4. The consumer sees two envelopes with one `event_id`; the durable effect store records one effect.
+
+**Success signal:** `1 passed`. Connection refusal on port `55439` means PostgreSQL did not become
+ready; a timeout creating the Kafka topic means the quick-start broker is not running.
+
+These four observations distinguish atomic database intent, at-least-once relay delivery, and
+downstream duplicate collapse. A query that checks only `published_at` proves none of the other two.
 
 > **Key insight**: the outbox does not make database and Kafka atomic; it records a durable promise
 > inside the database so publication can be retried until observed.
@@ -111,4 +183,5 @@ Kafka transaction. Use the smaller atomic boundary.
 
 ---
 
-**Next**: [Testing Kafka Services](05_testing_kafka_services.md)
+**Next**: use [CDC Outbox Relay](06_cdc_outbox_relay.md) when database-log capture is justified, or
+go directly to [Testing Kafka Services](05_testing_kafka_services.md) for a polling relay.

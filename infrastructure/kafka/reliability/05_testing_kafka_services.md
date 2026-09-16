@@ -6,18 +6,18 @@
 
 Mocks can verify that code called `produce`; they cannot prove broker acknowledgment, offsets,
 consumer-group ownership, serialization, or redelivery. Start the disposable broker from
-[First Event Round Trip](../fundamentals/01_first_event_round_trip.md), then run this bounded smoke
-test against `localhost:9092`:
+[First Event Round Trip](../fundamentals/01_first_event_round_trip.md), enter the checked-in example
+project, and run this bounded smoke test against `localhost:9092`:
 
 ```bash
-uv add --dev pytest confluent-kafka
+cd infrastructure/kafka/examples/python
+uv sync --dev
 uv run pytest -q tests/integration/test_kafka_smoke.py
 ```
 
-The test should create a uniquely named topic or key, wait for a delivery callback, consume with a
-unique group, assert key/value/partition/offset, and close both clients in `finally`. Reuse the
-deadline and diagnostics from [Python Producers and Consumers](../application_design/02_python_producers_and_consumers.md)
-instead of an unbounded poll.
+The checked-in [test](../examples/python/tests/integration/test_kafka_smoke.py) creates a uniquely
+named topic, waits for the broker acknowledgment, consumes with a unique group, asserts
+key/value/partition/offset, and closes the consumer in `finally`. Every broker wait is bounded.
 
 **Success signal:** the test exits with `1 passed` and leaves no running consumer. A mock-only green
 test or a test that can hang has not established a Kafka guarantee.
@@ -62,6 +62,31 @@ process; sleeping for an estimated duration makes the crash point nondeterminist
 > **Core:** launch the worker as a child process. Raising an exception inside the test process does
 > not reproduce lost memory, abandoned sockets, group departure, or transactional timeout.
 
+The collection implements the trace in
+[`test_crash_recovery.py`](../examples/python/tests/integration/test_crash_recovery.py). Run it with
+the disposable broker still active:
+
+```bash
+uv run pytest -q tests/integration/test_crash_recovery.py
+```
+
+The controller starts [`crash_worker.py`](../examples/python/kafka_notes/crash_worker.py) at three
+fault stages: before effect, after effect, and after commit. It expects the explicit `FAULT_REACHED`
+line and exit code `86`; cases before commit restart with the same group and SQLite effect store.
+**Success signal:** `3 passed`; the after-effect restart prints `created=false`, Kafka reports the
+group's committed offset as exactly `1`, and SQL reports one `evt-101` row in every case.
+
+The companion transaction test performs the other central boundary:
+
+```bash
+uv run pytest -q tests/integration/test_transactions.py
+```
+
+The first process dies with an open transaction after staging output. The second starts with the
+same `transactional.id`, resolves the previous instance in `init_transactions()`, and atomically
+commits output plus source position. The test requires source-group offset `1`; a `read_committed`
+consumer must also see exactly one output.
+
 > **Key insight**: a delivery guarantee is falsifiable only when the test controls the exact state
 > boundary and observes every durable store on both sides of the crash.
 
@@ -88,9 +113,9 @@ broker-integration case. Load tests and game days run on a scheduled or release 
 cost and disruption are controlled.
 
 > **Production:** pin container images to the deployed Kafka line, retain broker/client logs on
-> failure, cap every wait, and make cleanup idempotent. Testcontainers can manage disposable Kafka
-> containers; use its current [Kafka module guidance](https://java.testcontainers.org/modules/kafka/)
-> rather than deprecated container classes in copied examples.
+> failure, cap every wait, and make cleanup idempotent. The checked-in suite uses the same explicit
+> Docker broker as the first lesson so setup remains visible; a maintained Python container fixture
+> may wrap the same lifecycle in a larger codebase.
 
 ---
 

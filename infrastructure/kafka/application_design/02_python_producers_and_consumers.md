@@ -4,18 +4,69 @@
 
 ## Run one complete Python round trip
 
-Install the native-backed client and save this as `kafka_round_trip.py`:
+Prerequisites are Python 3.11+, `uv`, and the disposable broker from
+[the first round trip](../fundamentals/01_first_event_round_trip.md), still running as
+`kafka-notes`. Create the topic idempotently and verify the broker before writing code:
 
 ```bash
-uv add confluent-kafka
+docker exec kafka-notes /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic orders --partitions 1 --replication-factor 1
+docker exec kafka-notes /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic orders
 ```
+
+The second command must print a line containing `Topic: orders`. `No such container:
+kafka-notes` means the broker prerequisite is absent; return to the linked setup rather than
+debugging the Python client.
+
+Save the contract below as `order-created-v1.schema.json` in a new empty working directory. It is
+the same v1 contract introduced in the previous lesson, included here so this round trip does not
+depend on an undeclared Python module:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["event_id", "event_type", "schema_version", "occurred_at", "producer", "data"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "event_type": {"const": "order.created"},
+    "schema_version": {"type": "integer", "minimum": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "producer": {"type": "string", "minLength": 1},
+    "data": {
+      "type": "object",
+      "required": ["order_id", "currency", "total_minor"],
+      "properties": {
+        "order_id": {"type": "string", "minLength": 1},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "total_minor": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
+```
+
+Save this as `kafka_round_trip.py` beside the schema:
 
 ```python
 import json
+import os
 import time
-from confluent_kafka import Consumer, Producer
+from pathlib import Path
 
-from event_contract import validate_event
+from confluent_kafka import Consumer, Producer
+from jsonschema import Draft202012Validator, FormatChecker
+
+schema = json.loads(Path(__file__).with_name("order-created-v1.schema.json").read_text())
+validator = Draft202012Validator(schema, format_checker=FormatChecker())
+
+
+def validate_event(event: dict) -> None:
+    validator.validate(event)
 
 delivery = {"ack": None, "error": None}
 
@@ -41,7 +92,7 @@ print("delivered", *delivery["ack"])
 
 consumer = Consumer({
     "bootstrap.servers": "localhost:9092",
-    "group.id": "notes-demo-v1",
+    "group.id": os.environ["KAFKA_GROUP"],
     "auto.offset.reset": "earliest",
     "enable.auto.commit": False,
 })
@@ -65,11 +116,20 @@ finally:
     consumer.close()
 ```
 
-Run `uv run python kafka_round_trip.py`. **Success signal:** it prints `delivered <partition>
+Run it in an isolated environment; a fresh group makes the record unread by no previous run:
+
+```bash
+KAFKA_GROUP="notes-demo-$(date +%s)" \
+  uv run --with confluent-kafka --with jsonschema python kafka_round_trip.py
+```
+
+**Success signal:** it prints `delivered <partition>
 <offset>` from the broker acknowledgment followed by `consumed <partition> <offset> ord-42`.
-Rerunning with the same group consumes only records after its committed position. A delivery
-failure names the broker error; a poll failure names the client error; and no unread record exits
-after 15 seconds with a topic/group/offset diagnostic instead of hanging.
+Rerunning with a new timestamped group reads the retained records from the beginning; deliberately
+reusing a group consumes only records after its committed position. A delivery failure names the
+broker error; a poll failure names the client error; and no unread record exits after 15 seconds
+with a topic/group/offset diagnostic instead of hanging. Stop the disposable broker with
+`docker stop kafka-notes` only when you have finished the later live drills.
 
 ---
 
@@ -86,7 +146,8 @@ callbacks and flush during bounded shutdown rather than flush every record.
 
 The example prints, then commits synchronously. Replace `print` with business processing and keep
 the commit after success. This yields at-least-once processing: a crash after the effect but before
-the commit repeats the event, so real effects need [idempotency](../reliability/02_idempotence_transactions_and_exactly_once.md).
+the commit repeats the event, so real effects need
+[durable idempotency](../reliability/02_durable_consumer_effect_idempotency.md).
 
 > **Production:** add authentication, contract validation, bounded polling, structured error
 > handling, metrics, and lifecycle integration before putting this loop in a service.

@@ -23,7 +23,9 @@ printf '%s\n' '{"event_id":"evt-101","type":"order.created","order_id":"ord-42"}
 
 docker exec kafka-notes /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic orders --from-beginning \
-  --max-messages 1 --property print.partition=true --property print.offset=true
+  --max-messages 1 \
+  --formatter-property print.partition=true \
+  --formatter-property print.offset=true
 ```
 
 **Success signal:** the consumer prints partition `0`, offset `0`, and the `ord-42` event. If the

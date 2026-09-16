@@ -24,16 +24,26 @@ t=08  ACCEPT 41                 → complete; no immediate redelivery
 t=10  worker-a receives offset 42, delivery-count=1
 t=18  RELEASE 42                → eligible now; worker-b receives count=2
 t=20  worker-a receives offset 43, delivery-count=1
-t=50  lock expires (no RENEW)   → worker-b receives 43, count=2
+t=50  lock expires (not renewed) → worker-b receives 43, count=2
 t=55  REJECT 43                 → terminal for the group's configured policy
 ```
 
-`RENEW` extends the lock for legitimate long work; it does not acknowledge success. The changed
-delivery count is the visible proof that release or timeout caused redelivery.
+At protocol level, `RENEW` extends the lock for legitimate long work; it does not acknowledge
+success. The changed delivery count is the visible proof that release or timeout caused redelivery.
 
-Share groups became [production-ready in Kafka 4.2](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/)
-and continue to evolve in 4.3. Confirm client and broker support before choosing them; non-Java
-client coverage may lag the broker feature.
+The broker feature became [generally available in Apache Kafka 4.2](https://kafka.apache.org/blog/2026/02/17/apache-kafka-4.2.0-release-announcement/),
+but broker GA does not make every client production-ready. This collection's Python client,
+`confluent-kafka` 2.15.0, exposes a separate `ShareConsumer` only as **Preview** and explicitly does
+not recommend it for production. Its supported acknowledgments are `ACCEPT`, `RELEASE`, and
+`REJECT`; it cannot send `RENEW`, so long-running Python handlers cannot extend the acquisition
+lock and may be redelivered while still running. Its preview surface also lacks wildcard
+subscriptions, a wakeup API, share-group admin and client-metrics APIs, and an async share consumer.
+See the current [`confluent-kafka` ShareConsumer guide](https://github.com/confluentinc/confluent-kafka-python/blob/master/docs/kip-932-share-consumer.md).
+
+For Python today, have the operator set the broker/group lock duration above the legitimate
+processing bound, or use a mature conventional consumer/work queue; this client does not expose
+that setting. Do not implement the `RENEW` step in the trace with `confluent-kafka` 2.15.0 because
+that API does not exist.
 
 **Success signal:** kill a worker holding one record and observe another worker receive it, while an
 accepted record is not immediately redelivered. Throughput alone cannot prove acknowledgment policy.

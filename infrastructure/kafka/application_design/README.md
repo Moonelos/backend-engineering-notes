@@ -21,7 +21,8 @@
 **Working result by entry 2**: validate an `order.created` envelope and publish/consume it from Python.
 
 1. **Do:** define and execute the event-contract validator.
-2. **Do:** run the Python producer and consumer with that validator.
+2. **Do:** start the disposable broker from the fundamentals quick start, then run the Python
+   producer and consumer with that validator.
 3. **Harden:** control processing and topic topology.
 4. **Operate:** add a schema registry when independently deployed clients need centralized compatibility enforcement.
 

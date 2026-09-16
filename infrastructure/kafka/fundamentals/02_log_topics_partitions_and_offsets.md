@@ -10,11 +10,14 @@ Suppose `orders` has two partitions. Records with key `customer-7` land in parti
 partition 0: [offset 0: customer-2/order-A]
 partition 1: [offset 0: customer-7/order-B] [offset 1: customer-7/order-C]
                                                    ↑
-group billing-v1 next position:                    1
+consumer group billing-v1 next position:           1
 ```
 
-After billing processes order B and commits offset `1`, Kafka retains B; the commit says “the next
-record this group should read is offset 1.” It is not an acknowledgment that deletes B.
+A **consumer group** is a named logical subscription: its members share the work and its saved
+position survives any one process. After billing processes order B and commits offset `1`, Kafka
+retains B; the commit says “the next record this group should read is offset 1.” It is not an
+acknowledgment that deletes B. [Consumer Groups](04_consumer_groups_offsets_and_rebalancing.md)
+develops membership and recovery later.
 
 ---
 
@@ -90,4 +93,3 @@ Kafka for the event flow or change log.
 ---
 
 **Next**: [Partitioning, Keys, and Ordering](03_partitioning_keys_and_ordering.md)
-
