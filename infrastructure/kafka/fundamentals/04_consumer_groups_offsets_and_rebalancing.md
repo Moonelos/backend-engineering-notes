@@ -1,124 +1,173 @@
-# Consumer Groups Trade Partition Ownership for Parallel Work
+# Consumer Groups Coordinate Ownership and Progress
 
-> **Who this is for**: engineers scaling consumers or diagnosing duplicate work and lag spikes.
+> **Question:** how do several consumer processes share partitions and resume safely after one
+> disappears?
 
-## A fourth consumer does not make three partitions faster
+## A group turns partitions into units of work
 
-With three partitions and four consumers in group `billing-v1`, three consumers own one partition
-each and one is idle. A conventional consumer-group partition has one active owner at a time:
-
-```text
-orders P0 → billing-1
-orders P1 → billing-2
-orders P2 → billing-3
-             billing-4 (idle)
-```
-
----
-
-## 1. Group identity creates an independent subscription
-
-Consumers sharing a `group.id` divide partitions. A different group reads the same retained records
-from its own positions. Use `billing-v1` and `fraud-v1` for independent applications; do not give
-unrelated services the same group merely because they consume the same topic.
-
-The **group coordinator** is the broker-side actor that tracks membership, drives assignment, and
-stores or serves the group's committed offsets. The group's committed offset is a recovery
-checkpoint, usually the next record to read. It is not the consumer's live in-memory position and
-can lag behind work already fetched.
-
----
-
-## 2. Rebalancing moves ownership and exposes unsafe processing
-
-Membership or subscription changes cause the coordinator to change partition assignment. For
-example, when `billing-2` leaves, the coordinator removes it from the membership, assigns P1 to
-`billing-1`, and tells the new owner to resume from P1's stored checkpoint. Assignment ownership
-changes; the checkpoint does not advance merely because the member left.
-
-A slow consumer can therefore lose ownership while still processing a record. If it performs an
-external effect and fails before its offset is safely committed, the new owner processes that
-record again.
+The `orders` topic has three partitions. Billing runs two consumer processes with the same group ID,
+`billing-v1`:
 
 ```text
-C1 reads offset 8 → charges card → rebalance/crash → no commit
-C2 owns partition → reads offset 8 → charge attempted again
+TOPIC                         GROUP billing-v1
+
+orders P0 ─────────────────► billing-A
+orders P1 ─────────────────► billing-A
+orders P2 ─────────────────► billing-B
 ```
 
-The local safety bridge is **idempotency**: both attempts send the stable operation identity
-`charge:event-evt-101` to a durable payment provider or effect store. The first attempt records the
-charge and its result. The retry makes a unique claim with the same identity, finds the stored
-result, and returns it without applying a second charge. Only then does the consumer commit its
-Kafka offset. A process-local set is insufficient because it disappears in the same crash that
-caused the retry. [Durable Consumer-Effect Idempotency](../reliability/02_durable_consumer_effect_idempotency.md)
-owns the full durable implementation. Thus “one owner at a time” is not “one execution ever.”
+The **group coordinator**, a broker-side component, maintains the membership and assignment. Inside
+one conventional consumer group, each partition has at most one active owner. A consumer can own
+several partitions; one partition is not split between several active consumers.
 
----
+Add a third billing consumer and the coordinator can assign one partition to each. Add a fourth and
+one consumer must remain idle because only three partitions exist.
 
-## 3. Polling is both data access and membership health
-
-The consumer must poll often enough to remain healthy. Long record processing can exceed the
-allowed poll interval, trigger reassignment, and amplify duplicates. Bound work per poll, pause
-partitions while capacity is full, or separate polling from bounded workers without committing
-past unfinished records.
-
-The **consumer group protocol** is Kafka's GA broker-driven assignment protocol. In Kafka 4.3 it is
-not yet the Java client's default: set the effective client property `group.protocol=consumer`.
-Assignment strategy, heartbeat interval, and session timeout then move to broker-side settings;
-client properties `partition.assignment.strategy`, `heartbeat.interval.ms`, and
-`session.timeout.ms`, plus `enforceRebalance(...)`, no longer apply. A client may request a
-broker-provided assignor with `group.remote.assignor`; otherwise the coordinator chooses from the
-broker's `group.consumer.assignors` (whose first/default entry is `uniform`).
-
-The callback contract is incremental too. With a `ConsumerRebalanceListener`,
-`onPartitionsRevoked` runs only when this member actually has a non-empty set to revoke;
-`onPartitionsAssigned` still runs once when an assignment change completes, even for an empty set;
-and `onPartitionsLost` means another member may already own the partitions, so committing from it
-is unsafe. Audit callback code that assumes every rebalance revokes everything.
-
-This is the smallest migration trace:
+Fraud detection uses a different group ID, `fraud-v1`:
 
 ```text
-classic:  partition.assignment.strategy=CooperativeStickyAssignor
-rollout:  group.protocol=consumer; group.remote.assignor=uniform
-observe:  coordinator reports Consumer group; P0/P1/P2 each have one owner
-rollback: replace members with group.protocol=classic
-          → group becomes Classic when the last Consumer-protocol member leaves
+orders P0 ──┬──────────────► billing-v1 owner
+            └──────────────► fraud-v1 owner
 ```
 
-An online rolling migration works only when the classic assignor does not embed custom metadata and
-the broker permits the direction. Otherwise stop every member, let the group become empty, and
-restart all members with the new protocol. Test rollback before finalizing the cluster upgrade:
-once a group has used the new protocol, the cluster cannot be downgraded below Kafka 3.4.1. The
-[Kafka 4.3 protocol guide](https://kafka.apache.org/43/operations/consumer-rebalance-protocol/)
-documents the live migration constraints and effective settings.
+The groups do not steal records from each other. Each group gets its own assignment and committed
+positions over the same retained partitions.
+
+## Processing has four distinct steps
+
+Follow billing-A handling offset `8` from P0:
+
+```text
+broker log         consumer process              external payment API       group state
+
+[P0 offset 8] ──► 1. fetch
+                  2. process ──────────────────► charge ord-42
+                  3. receive success
+                  4. commit next offset 9 ────────────────────────────────► P0 = 9
+```
+
+The external API knows whether the charge happened. Kafka knows only the group's committed next
+offset. Those are separate systems, so there is a gap between the business effect and the commit.
+
+### Crash after the effect but before the commit
+
+```text
+fetch offset 8 → charge succeeds → PROCESS CRASHES → commit 9 never happens
+                                                │
+replacement owner reads committed position 8 ◄─┘
+                                                │
+                                                └─► offset 8 runs again
+```
+
+This produces **at-least-once processing**: Kafka avoids silently skipping offset `8`, but the
+business effect may be attempted again. Use a stable operation identity such as `charge:evt-108`
+at a durable idempotency boundary so the second attempt returns the first result instead of charging
+twice. The implementation belongs in
+[Durable Consumer-Effect Idempotency](../reliability/02_durable_consumer_effect_idempotency.md).
+
+### Commit before the effect creates the opposite failure
+
+```text
+fetch offset 8 → commit 9 → PROCESS CRASHES → charge never happens
+
+replacement owner resumes at 9, so offset 8 is skipped
+```
+
+Committing early can trade duplicates for lost work. “The lag is zero” therefore does not prove
+that the business effects completed.
+
+> **The near-miss:** one partition owner at a time means exclusive ownership during an assignment.
+> It does not mean one execution for all time.
+
+## A rebalance changes ownership, not progress
+
+A **rebalance** changes assignments when consumers join, leave, fail, or change subscriptions.
+Suppose billing-A disappears:
+
+```text
+BEFORE                              AFTER
+
+P0 → billing-A                      P0 → billing-B
+P1 → billing-A       rebalance      P1 → billing-C
+P2 → billing-B      ─────────►      P2 → billing-B
+
+committed P0 = 9                    committed P0 = 9   unchanged
+committed P1 = 14                   committed P1 = 14  unchanged
+committed P2 = 21                   committed P2 = 21  unchanged
+```
+
+The coordinator moves partition ownership but does not invent progress. The new P0 owner resumes at
+`9` because that is the group's last durable checkpoint for P0. Records fetched only into
+billing-A's memory are fetched again when necessary.
+
+This separation is the key to recovery:
+
+- **assignment state** answers “who may read P0 now?”;
+- **committed position** answers “where should that owner resume?”;
+- **business-effect state** answers “did the downstream action already happen?”
+
+Kafka coordinates the first two. The application must reconcile the third.
+
+## Polling proves the owner is still making progress
+
+A consumer polls for records, processes them, and polls again. If processing blocks longer than the
+configured maximum interval, the group can treat that member as failed and reassign its partitions:
+
+```text
+t=0m   billing-A polls P0 offset 9 and starts a slow call
+t=5m   maximum poll interval is exceeded
+t=6m   rebalance assigns P0 to billing-B; billing-B resumes from committed position
+t=8m   billing-A returns, but it no longer safely owns P0
+```
+
+A production loop must bound work, maintain polling, pause partitions when downstream capacity is
+full, and stop committing after ownership is revoked. See
+[Processing Loops, Backpressure, and Shutdown](../application_design/03_processing_loops_backpressure_and_shutdown.md)
+for the implementation.
+
+Kafka's newer consumer rebalance protocol changes assignment mechanics and callback behavior, but
+not the beginner model above. Treat migration as an operational rollout using the
+[consumer-protocol runbook](../operations/04_deployment_upgrades_and_disaster_recovery.md#change-consumer-protocols-as-a-separate-rollout).
+
+## Lag is per group and partition
+
+For P0:
+
+```text
+log end = 120
+billing-v1 committed = 100
+billing-v1 lag = 20
+
+fraud-v1 committed = 117
+fraud-v1 lag = 3
+```
+
+Topic traffic is shared, but backlog belongs to a group. Aggregate lag can also hide one hot
+partition, so inspect the partition distribution when total lag rises.
+
+## Check your model
+
+P0 is committed at `12`. Its owner completes the external effect for offset `12` and crashes before
+committing `13`. A rebalance assigns P0 to another process.
+
+The new owner starts at `12`, because assignment changed but the committed position did not. The
+effect is attempted again. A durable idempotency key can collapse the duplicate; starting at `13`
+would risk hiding unfinished work.
+
+Now change one condition: the old owner committed `13` before performing the effect. The new owner
+starts at `13` and offset `12` is lost from the application's processing history. That is why commit
+ordering is a correctness decision, not bookkeeping.
+
+## Where this model stops
+
+Groups recover from consumer-process failure because the broker log remains available. They do not
+explain what happens when the broker storing a partition fails. Replication supplies that next
+layer.
+
+Conventional groups are also a poor fit when many workers must concurrently claim individual
+records from one partition with per-record acknowledgment. Evaluate
+[share groups](../ecosystem/03_share_groups_and_queue_semantics.md) or a work queue for that shape.
 
 ---
 
-## 4. The observable signals tell different stories
-
-- Rising lag with stable membership means processing capacity is below arrival rate.
-- Repeated assignment changes indicate churn or poll stalls.
-- Many duplicates around rebalances indicate non-idempotent effects or unsafe commits.
-- Idle consumers with lag mean skew, blocked processing, or more consumers than partitions.
-
-**Success signal:** an assignment inspection accounts for every partition exactly once within the
-group, and a controlled consumer restart causes a bounded handoff without lost effects.
-
-> **Key insight**: a consumer group coordinates partition ownership; correctness still depends on
-> how application effects and offset checkpoints cross crashes.
-
----
-
-## 5. What breaks, and when not to use conventional groups
-
-⚠️ Auto-committing offsets can advance the checkpoint before slow business processing completes.
-The symptom after a crash is missing effects even though consumer lag looked healthy.
-
-Do not use conventional groups when many workers must concurrently process individual records from
-the same partition with per-record acknowledgment. Evaluate [share groups](../ecosystem/03_share_groups_and_queue_semantics.md)
-or a purpose-built work queue.
-
----
-
-**Next**: [Replication, Leaders, and KRaft](05_replication_leaders_and_kraft.md)
+**Next:** [Replication Defines the Durability Contract](05_replication_leaders_and_kraft.md)

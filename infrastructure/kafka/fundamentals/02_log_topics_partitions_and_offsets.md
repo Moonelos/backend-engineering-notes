@@ -1,95 +1,148 @@
-# A Kafka Topic Is a Set of Retained Ordered Logs
+# The Retained Log: Topics, Partitions, and Offsets
 
-> **Who this is for**: engineers who completed the first event round trip or need Kafka's storage model.
+> **Question:** after a consumer reads a record, what remains in Kafka and what moves forward?
 
-## Worked trace: two records, one durable position
+## Start with three order facts
 
-Suppose `orders` has two partitions. Records with key `customer-7` land in partition 1:
-
-```text
-partition 0: [offset 0: customer-2/order-A]
-partition 1: [offset 0: customer-7/order-B] [offset 1: customer-7/order-C]
-                                                   ↑
-consumer group billing-v1 next position:           1
-```
-
-A **consumer group** is a named logical subscription: its members share the work and its saved
-position survives any one process. After billing processes order B and commits offset `1`, Kafka
-retains B; the commit says “the next record this group should read is offset 1.” It is not an
-acknowledgment that deletes B. [Consumer Groups](04_consumer_groups_offsets_and_rebalancing.md)
-develops membership and recovery later.
-
----
-
-## 1. A retained log solves independent reading and replay
-
-If reading deleted data, analytics and fraud detection would race billing for the same event. A
-Kafka **log** is an append-only sequence: producers append records, while retention—not consumption—
-eventually removes them. Each consumer group owns an independent position.
-
-> **The near-miss**: a Kafka topic looks like a queue because producers send and consumers receive.
-> The analogy stops at deletion: ordinary consumer reads do not remove records.
-
----
-
-## 2. Partitions create both parallelism and an ordering boundary
-
-A topic is split into partitions so different brokers and consumers can work in parallel. Every
-partition has its own offset sequence. Kafka orders records inside one partition, never across the
-whole topic.
+The broker appends three records to one partition. An append adds to the end; it does not update an
+earlier record in place:
 
 ```text
-P0: 0 → 1 → 2
-P1: 0 → 1 → 2 → 3
+orders / partition 0
+
+oldest                                                        newest
+  │                                                              │
+  ▼                                                              ▼
+┌──────────────┬──────────────┬──────────────────┬─────────────────────┐
+│ offset 0     │ offset 1     │ offset 2         │ next append offset  │
+│ evt-101      │ evt-102      │ evt-103          │ 3                   │
+│ order.created│ order.paid   │ order.packed     │                     │
+└──────────────┴──────────────┴──────────────────┴─────────────────────┘
 ```
 
-There is no meaningful comparison between P0 offset 2 and P1 offset 2. If two events must preserve
-relative order, they must use a key that routes them to the same partition.
-
----
-
-## 3. Retention and compaction answer different cleanup questions
-
-**Time/size retention** removes old log segments after a duration or byte limit. **Log compaction**
-eventually preserves the latest value per key, plus tombstones long enough to propagate deletion.
-Neither is immediate, record-by-record garbage collection.
-
-For `customer-profile`, compaction can reduce:
+The broker chooses offsets `0`, `1`, and `2` as it appends. An offset is meaningful only together
+with its topic and partition:
 
 ```text
-(c7,v1) (c9,v1) (c7,v2) → eventually (c9,v1) (c7,v2)
+(orders, partition 0, offset 2)  → evt-103
 ```
 
-Compaction is suitable for rebuilding latest keyed state. It is not suitable when every historical
-transition is part of the business record.
+Partition 1 can also have an offset `2`. Therefore an offset is not an event ID, timestamp, or
+position across the entire topic.
+
+## Storage position and reader position are different state
+
+Now two applications read the same partition:
+
+```text
+BROKER STATE — retained records
+
+orders P0:  [0: created] [1: paid] [2: packed]       log end = 3
+                 ▲                       ▲
+                 │                       │
+READER STATE     │                       │
+
+fraud-v1 next = 1┘                       └─ billing-v1 next = 3
+```
+
+Read the picture from top to bottom:
+
+1. The broker still stores all three records.
+2. `billing-v1` has completed offsets `0` through `2`, so its next position is `3`.
+3. `fraud-v1` has completed only offset `0`, so its next position is `1`.
+4. Advancing either reader does not move or delete the boxes in the broker log.
+
+A **consumer group** is a named logical reader. Kafka stores a committed next position for each
+group and partition. The group name is what lets `billing-v1` resume at `3` after its process
+restarts. Chapter 4 explains how processes inside a group share partitions.
+
+> **Core model:** partitions own records; consumer groups own positions in those partitions.
+
+## Three offset values answer different questions
+
+The word “offset” appears in several related states. Keep the noun attached:
+
+| Value | Owner | Meaning in the diagram |
+|---|---|---|
+| record offset | broker log | `evt-103` is stored at `2` |
+| log-end offset | broker log | `3` is where the next append will go |
+| committed offset | consumer group | `billing-v1` should resume at `3` |
+
+Kafka commits the **next** offset, not the last completed one. If billing successfully processes
+record `2`, committing `3` says “start with record 3 next time.” Confusing those two conventions
+creates an off-by-one mental model even when the client API is working correctly.
+
+## A new reader can replay retained history
+
+Analytics joins tomorrow as a new group, `analytics-v1`. It has no saved position. If it chooses the
+earliest retained position, it can read `0`, `1`, and `2` even though billing already processed
+them:
+
+```text
+same broker log
+     │
+     ├── billing-v1   resumes at 3
+     ├── fraud-v1     resumes at 1
+     └── analytics-v1 starts at 0
+```
+
+This is why Kafka can rebuild a search index or projection from history. The live consumer does not
+have to stop, and its committed position does not need to be rewound.
+
+The analogy to a database transaction log is useful: both retain an ordered history that readers
+can follow. The analogy stops at authority—Kafka is often a transport and replay source, not
+automatically the authoritative database for mutable business entities.
+
+## Retention decides how long replay remains possible
+
+Records remain until the topic's cleanup policy removes them.
+
+- **Time/size retention** deletes old log segments after an age or size boundary.
+- **Compaction** eventually keeps the latest value for each key, useful for reconstructing current
+  keyed state rather than every historical transition.
+
+These policies change broker storage, not merely reader state. If retention removes offsets `0`
+through `9` while a group is still committed at `5`, the group asks for data that no longer exists.
+Its configured reset behavior may move it to the earliest remaining offset or to the end; neither
+choice reconstructs the deleted history.
+
+For a compacted topic, a key with a null value is a **tombstone**, a record that represents deletion.
+Compaction is asynchronous, so old values and tombstones can remain visible for a while.
+
+## Lag measures distance, not waiting time
+
+With log end `120` and committed next offset `100`:
+
+```text
+lag = log-end offset - committed offset
+    = 120 - 100
+    = 20 records
+```
+
+Those 20 records might represent milliseconds during peak traffic or hours in a quiet topic.
+Monitor record lag to measure backlog and event age to measure business staleness.
+
+## Check your model
+
+The log contains offsets `0` through `9`. Billing is committed at `10`. A new analytics group starts
+at the earliest retained offset. Billing then commits `10` again.
+
+What can analytics read?
+
+It can still read `0` through `9`. Billing changed only billing's group position, and committing the
+same position again changes no broker-log state. The answer changes only if retention or compaction
+has removed some records.
+
+## Where this model stops
+
+One partition gives one ordered append sequence but only one unit of parallel work for a
+conventional consumer group. Kafka scales a topic by using multiple partitions. That creates a new
+design question: which records must remain in the same ordered sequence?
+
+Do not use Kafka as the only system of record when the application needs arbitrary queries,
+relational constraints, or indefinite authoritative history. Pair it with the database or object
+store that owns those requirements.
 
 ---
 
-## 4. Lag measures distance, not elapsed time
-
-**Consumer lag** is approximately `log-end-offset - committed-offset` per partition. Ten records of
-lag could mean milliseconds or hours depending on arrival and processing rates. Monitor both lag
-and the age of the oldest unprocessed event when latency matters.
-
-**Success signal:** given any consumed record, you can name its `(topic, partition, offset)` and the
-consumer group's next committed offset. If a dashboard shows only a topic-wide offset, the model is
-silently hiding the partition dimension.
-
-> **Key insight**: partitions are not merely a scaling knob; they define which events can be ordered
-> together and the unit of ownership, recovery, and lag.
-
----
-
-## 5. What breaks, and when not to use Kafka as storage
-
-⚠️ A consumer that resumes from an offset already deleted by retention encounters an out-of-range
-position and must follow its reset policy, potentially skipping to the end or replaying from the
-earliest available record.
-
-Do not treat Kafka as the only system of record for mutable entities requiring ad hoc queries,
-constraints, or indefinite authoritative history. Use a database or object store for that job and
-Kafka for the event flow or change log.
-
----
-
-**Next**: [Partitioning, Keys, and Ordering](03_partitioning_keys_and_ordering.md)
+**Next:** [Keys Define the Ordering Boundary](03_partitioning_keys_and_ordering.md)

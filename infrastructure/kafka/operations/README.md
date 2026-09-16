@@ -11,7 +11,7 @@
 | [Security and multitenancy](01_security_and_multitenancy.md) | Implementation | Authenticate, encrypt, authorize, and isolate clients |
 | [Capacity and performance](02_capacity_planning_and_performance.md) | Decision guide | Estimate partitions, storage, and throughput |
 | [Observability and incidents](03_observability_and_incident_response.md) | Implementation | Detect lag, replica, disk, and coordinator failures |
-| [Deployment and recovery](04_deployment_upgrades_and_disaster_recovery.md) | Deep dive | Plan ownership, upgrades, and regional recovery |
+| [Deployment and recovery](04_deployment_upgrades_and_disaster_recovery.md) | Deep dive | Stage broker, feature, and client migrations; rehearse regional recovery |
 | [Configuration and topic administration](05_configuration_and_topic_administration.md) | Reference | Change topics and effective configs with rollback evidence |
 | [Tiered storage](06_tiered_storage.md) | Deep dive | Decide and operate the local/remote log-storage boundary |
 

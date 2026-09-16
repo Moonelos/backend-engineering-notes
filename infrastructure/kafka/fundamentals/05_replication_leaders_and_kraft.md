@@ -1,109 +1,186 @@
-# Replication Separates an Acknowledged Write from a Durable Write
+# Replication Defines the Durability Contract
 
-> **Who this is for**: engineers deciding which broker failures Kafka should survive.
+> **Question:** when a producer receives success, which broker failures can the record survive?
 
-## One acknowledged record, two outcomes
+## A partition can have copies on several brokers
 
-A partition leader accepts offset 51. With replication factor one, its disk failure loses the only
-copy. With three replicas, `acks=all`, and `min.insync.replicas=2`, the broker first checks that at
-least two replicas are in sync, then waits for every replica currently in that set to acknowledge.
-
----
-
-## 1. Leaders serialize writes while followers copy the log
-
-Each partition has one leader handling reads and writes and zero or more follower replicas. The
-**in-sync replica set (ISR)** contains replicas sufficiently caught up for normal safe leadership.
-Replication factor describes desired copies; ISR describes currently healthy copies.
+Consider partition P2 of `orders` with replication factor `3`:
 
 ```text
-producer → broker 1: P2 leader, offset 51
-                 ├→ broker 2: P2 follower (ISR)
-                 └→ broker 3: P2 follower (ISR)
+producer ─────────────► broker 1: P2 LEADER [offset 51]
+                                  │
+                                  ├── replicate ──► broker 2: P2 FOLLOWER [offset 51]
+                                  │
+                                  └── replicate ──► broker 3: P2 FOLLOWER [offset 51]
 ```
 
-If broker 1 fails while followers remain in the ISR, the controller elects one of them. Kafka 4.3
-also tracks **eligible leader replicas (ELR)**: replicas outside the current ISR that remain safe
-because strict minimum-ISR rules prevented the high watermark from advancing past them. ELR is
-enabled by default on new clusters since Kafka 4.1.
+The **replication factor (RF)** is the desired number of partition copies. One replica is the
+**leader**: producers send writes to it, and consumers fetch from it. Followers copy the leader's
+log so another broker can take over.
 
-The election order makes the safety boundary concrete:
+Three configured replicas do not imply that all three are currently caught up. Kafka tracks an
+**in-sync replica set (ISR)**—the replicas sufficiently caught up to participate in the normal
+durability contract and safe leader election:
 
 ```text
-ISR={2,3}, ELR={}   → elect broker 2 or 3
-ISR={}, ELR={2}     → broker 2 is unfenced, so elect broker 2 safely
-ISR={}, ELR={}      → no ordinary safe candidate; last-known-leader fallback is separate
+replicas = {1, 2, 3}     desired placement
+ISR      = {1, 2}        current caught-up set; broker 3 is behind
 ```
 
-The KRaft controller chooses from a non-empty ISR first, then an unfenced ELR. Only the configured
-unclean-election fallback may then select the unfenced last known leader; that branch can lose data.
-Availability during an election may pause; durability depends on what was safely replicated before
-acknowledgment. [Kafka's ELR guide](https://kafka.apache.org/43/operations/eligible-leader-replicas/)
-explains the feature and its upgrade boundary.
+RF describes topology. ISR describes current health.
 
----
+## Admission and acknowledgment are separate decisions
 
-## 2. Three settings form one durability contract
+Suppose the topic uses `min.insync.replicas=2` and the producer uses `acks=all`.
 
-`replication.factor=3` requests three copies. `min.insync.replicas=2` is the admission floor: the
-broker rejects an `acks=all` write if fewer than two replicas are in the ISR. After admission,
-`acks=all` waits for the full current ISR, not merely the configured minimum. Configuring only one
-of the three does not express the full contract.
+First, the leader asks whether the current ISR is large enough to admit the write. Then, if admitted,
+`acks=all` waits for every replica currently in the ISR.
+
+### All three replicas are in sync
 
 ```text
-RF=3, ISR={1,2,3}, minISR=2, acks=all
-  → admit the write; wait for brokers 1, 2, and 3
+configuration: RF=3, ISR={1,2,3}, minISR=2, acks=all
 
-RF=3, ISR={1}, minISR=2, acks=all
-  → reject the write; wait for nobody
-  → producer sees NotEnoughReplicas or NotEnoughReplicasAfterAppend
+1. admit?      ISR size 3 >= 2                         yes
+2. append      broker 1 writes offset 51
+3. replicate   broker 2 writes 51; broker 3 writes 51
+4. acknowledge all current ISR replicas have 51       producer sees success
 ```
 
-The second trace can fail before append or after the ISR shrinks during append, hence the two error
-names. Either way, writes fail rather than pretend to meet the durability contract. This is a
-deliberate availability-for-consistency trade. The
-[producer `acks` reference](https://kafka.apache.org/43/generated/producer_config.html) and
-[`min.insync.replicas` reference](https://kafka.apache.org/43/configuration/topic-configs/)
-specify these two independent decisions.
+### One follower falls behind
+
+```text
+configuration: RF=3, ISR={1,2}, minISR=2, acks=all
+
+1. admit?      ISR size 2 >= 2                         yes
+2. append      broker 1 writes offset 52
+3. replicate   broker 2 writes 52
+4. acknowledge both current ISR replicas have 52      producer sees success
+```
+
+Kafka does not wait for broker 3 because it is no longer in the ISR. It does wait for two replicas,
+not because `minISR=2` means “wait for two,” but because the current ISR happens to contain two.
+
+### The ISR falls below the minimum
+
+```text
+configuration: RF=3, ISR={1}, minISR=2, acks=all
+
+1. admit?      ISR size 1 < 2                          no
+2. result      write rejected; producer sees a replica error
+```
+
+Kafka chooses write unavailability over claiming the configured durability level. Depending on
+when ISR state changes, the producer can see `NotEnoughReplicas` or
+`NotEnoughReplicasAfterAppend` and must treat the outcome as a failed/uncertain attempt according to
+its retry and idempotency policy.
+
+## Read the durability matrix
+
+| ISR | Producer setting | Result | Meaning |
+|---|---|---|---|
+| `{1,2,3}` | `acks=all`, `minISR=2` | accept; wait for 1, 2, and 3 | all current ISR copies confirm |
+| `{1,2}` | `acks=all`, `minISR=2` | accept; wait for 1 and 2 | durability reduced but policy still met |
+| `{1}` | `acks=all`, `minISR=2` | reject | policy refuses a single-copy success |
+| `{1}` | `acks=1` | leader acknowledgment can succeed | durability is weaker, and the consumer-visible committed boundary cannot advance while ISR remains below `minISR` |
+
+The [producer `acks` configuration](https://kafka.apache.org/43/configuration/producer-configs/#producerconfigs_acks)
+and [topic `min.insync.replicas` configuration](https://kafka.apache.org/43/configuration/topic-configs/#topicconfigs_min.insync.replicas)
+define these two halves of the contract.
+
+> **The near-miss:** replication factor is not the number of replicas that acknowledged this write.
+> Combine RF, current ISR, `min.insync.replicas`, and producer `acks` before stating a durability
+> claim.
+
+## Safe leader election preserves the acknowledged prefix
+
+Return to the healthy trace where brokers 1, 2, and 3 stored offset `51` before success. Broker 1
+then fails:
+
+```text
+before failure                           after election
+
+leader 1:   [ ... 51 ]   X               broker 2: LEADER [ ... 51 ]
+follower 2: [ ... 51 ]   ─────────►      broker 3: ISR    [ ... 51 ]
+follower 3: [ ... 51 ]
+```
+
+The controller can elect a caught-up replica, and the acknowledged record remains readable after a
+short availability pause. If Kafka instead elects a replica not known to contain the committed
+prefix, availability may return by losing acknowledged data. That is why unclean election is an
+explicit data-loss policy, not a generic recovery switch.
+
+Advanced Eligible Leader Replica (ELR) behavior refines candidate selection when the normal ISR is
+empty. It depends on high-watermark and feature-version state and belongs in the
+[cluster lifecycle runbook](../operations/04_deployment_upgrades_and_disaster_recovery.md#upgrade-eligible-leader-replicas-as-a-separate-feature),
+not in the first replication model.
+
+## KRaft manages metadata; brokers carry event bytes
+
+Kafka also needs agreement about topic definitions, registered brokers, and which replica is leader.
+The **KRaft metadata quorum** is the controller group that maintains that cluster metadata:
+
+```text
+CONTROL PLANE                              DATA PLANE
+
+KRaft controllers                         brokers
+├── topic orders exists                   ├── P2 record bytes
+├── P2 replicas are {1,2,3}               ├── follower fetch
+└── broker 1 leads P2                     └── producer/consumer traffic
+```
+
+Controllers decide and record who leads P2; they are not extra copies of P2's events. Losing
+controller quorum blocks metadata changes and leader elections. Losing enough partition replicas
+threatens the records themselves. Operations monitors and recovers those planes separately.
+
+## Assemble the complete record path
+
+The five Fundamentals chapters now fit into one causal sequence:
+
+```text
+1. producer creates record(key=ord-42, value=evt-151)
+2. key bytes + partitioner choose orders/P2
+3. P2 leader appends offset 51
+4. followers in the ISR copy offset 51
+5. acknowledgment policy is satisfied; producer receives success
+6. group coordinator assigns P2 to billing-B
+7. billing-B fetches offset 51 and performs its effect
+8. billing-v1 commits next offset 52
+9. retention keeps or later removes the record independently of that commit
+```
+
+Every step changes a different piece of state. That is the practical Kafka mental model:
+
+- the key influences partition placement;
+- the partition log owns the record and offset;
+- replicas determine the broker-failure contract;
+- the group assignment chooses the current reader;
+- the committed offset stores that group's recovery position;
+- the application owns the external side effect.
+
+## Check your model
+
+Given `RF=3`, `ISR={1,2}`, `minISR=2`, and `acks=all`:
+
+1. The next write is admitted and waits for brokers 1 and 2.
+2. If broker 2 leaves the ISR before the following write, ISR becomes `{1}`.
+3. The following write is rejected because ISR size `1` is below `minISR=2`.
+
+Changing only `acks` to `1` is not recovery. The producer may receive a leader-only acknowledgment,
+but the record has fewer surviving copies and consumer-visible progress remains blocked while the
+ISR is below `minISR`. Restoring an in-sync replica is what repairs the missing durability and
+visibility.
+
+## Where Fundamentals stops
+
+You can now reason about where a record is stored, ordered, copied, read, and resumed. Building a
+service still requires schema evolution, producer/consumer configuration, retries, shutdown,
+idempotent effects, security, capacity, and observability.
+
+Do not self-host Kafka merely to avoid a service fee if no team can own quorum, disks, upgrades,
+security, and restore testing. A managed service can own cluster mechanics; it does not choose your
+keys, event contracts, commit boundaries, or side-effect guarantees.
 
 ---
 
-## 3. KRaft protects cluster metadata, not event payloads
-
-**KRaft** is Kafka's Raft-based metadata quorum. Controllers agree on topics, partition leadership,
-and cluster configuration; brokers store partition data. Kafka 4.x does not use ZooKeeper; Kafka
-4.0 was the [first ZooKeeper-free major release](https://kafka.apache.org/blog/2025/03/18/apache-kafka-4.0.0-release-announcement/).
-
-Losing controller quorum prevents metadata changes and leader elections even if broker disks still
-contain data. Losing partition replicas threatens event data even if the controllers are healthy.
-Monitor these planes separately.
-
-> **The near-miss**: a controller is not a database replica for topic contents. It coordinates
-> metadata; partition replicas carry the events.
-
----
-
-## 4. Success and failure signals
-
-**Success signal:** topic description shows the intended replication factor and ISR count, and a
-controlled broker stop elects a new leader while acknowledged records remain readable. A green
-broker process count alone is a silent failure because partitions can be under-replicated.
-
-⚠️ Do not confuse safe ELR election with unclean election. Enabling unclean leader election can
-restore availability by electing a replica that is not known safe, losing acknowledged records.
-Treat it as an explicit data-loss policy, not a generic recovery switch.
-
-> **Key insight**: durability is an end-to-end acknowledgment policy across producer settings,
-> replica health, and broker admission—not a property implied by “Kafka is replicated.”
-
----
-
-## 5. When not to self-manage this layer
-
-Do not self-host Kafka solely to avoid a service fee when the team cannot staff quorum, disk,
-upgrade, security, and restore operations. A managed service can move those mechanics to a provider;
-it does not remove application-level key, schema, offset, or idempotency decisions.
-
----
-
-**Next**: [Application Design](../application_design/README.md)
+**Next:** [Application Design](../application_design/README.md)

@@ -53,9 +53,11 @@ partition, offset, and retention independently of the consumer.
 
 1. **Do:** [First event round trip](fundamentals/01_first_event_round_trip.md).
 2. **Understand:** [Logs, topics, partitions, and offsets](fundamentals/02_log_topics_partitions_and_offsets.md).
-3. **Understand:** [Keys and ordering](fundamentals/03_partitioning_keys_and_ordering.md), then [consumer groups](fundamentals/04_consumer_groups_offsets_and_rebalancing.md).
-4. **Build:** [Python producers and consumers](application_design/02_python_producers_and_consumers.md).
-5. **Revisit for service design:** [Event contracts](application_design/01_event_contracts_and_schema_evolution.md) and [topics](application_design/04_topic_and_partition_design.md).
+3. **Understand routing:** [Keys and ordering](fundamentals/03_partitioning_keys_and_ordering.md).
+4. **Understand readers:** [Consumer groups](fundamentals/04_consumer_groups_offsets_and_rebalancing.md).
+5. **Understand failure:** [Replication and acknowledgment](fundamentals/05_replication_leaders_and_kraft.md).
+6. **Build:** [Python producers and consumers](application_design/02_python_producers_and_consumers.md).
+7. **Revisit for service design:** [Event contracts](application_design/01_event_contracts_and_schema_evolution.md) and [topics](application_design/04_topic_and_partition_design.md).
 
 This is an exploration route: it gets a record moving before introducing contract governance. If
 you are building a service rather than exploring Kafka, follow the
@@ -103,6 +105,9 @@ contract. Kafka is valuable only when its retained, partitioned log is part of t
 
 ## Prerequisites
 
-- Comfort with processes, network failures, and database transactions.
+- For Fundamentals: basic programming and ordinary shell use; Docker is needed only for the
+  runnable first record. No messaging or distributed-systems knowledge is assumed.
+- Familiarity with process failure, network failure, and database transactions becomes useful on
+  the Reliability and Operations paths; their Kafka-specific consequences are taught there.
 - [Background work](../../background_work/README.md) is useful when comparing events with durable jobs.
 - [Redis Streams](../redis/02_pubsub_and_streams.md) provides a smaller-system comparison.

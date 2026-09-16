@@ -77,6 +77,85 @@ look uniform.
 These constraints and the command are from the Apache Kafka 4.3
 [upgrade guide](https://kafka.apache.org/43/getting-started/upgrade/).
 
+## Change consumer protocols as a separate rollout
+
+A successful broker upgrade does not prove that consumer behavior is unchanged. Kafka's newer
+consumer rebalance protocol moves assignment calculation to the broker and changes how a group
+receives assignments. Treat adoption as a client rollout after the broker rollout is healthy, not
+as an incidental configuration change during it.
+
+The client opts in with `group.protocol=consumer`. Under that protocol, heartbeat and session
+timing come from broker configuration, and classic client settings such as
+`heartbeat.interval.ms` and `session.timeout.ms` no longer control those timings. Assignment is
+incremental: a rebalance callback must treat the supplied partitions as the change to the existing
+assignment, rather than assuming every callback contains the group's complete new assignment.
+
+Use this state transition:
+
+```text
+stable classic group
+  -> map the classic client-side assignment strategy to a server-side assignor
+  -> canary one non-critical group with group.protocol=consumer
+  -> observe assignment, duplicate processing, lag, and rebalance duration
+  -> roll the remaining instances
+  -> hold, then migrate the next group
+```
+
+The consumer protocol does not use the client's `partition.assignment.strategy`. Choose one of the
+broker's `group.consumer.assignors`; if the classic group used custom placement, implement and
+deploy the equivalent server-side `ConsumerGroupPartitionAssignor` before migrating the group.
+Online migration is available when the classic assignor does not embed custom metadata. If it does,
+stop every member, change the protocol consistently, and restart the group as an explicit outage.
+Before rollout, record the old client configuration and confirm that the chosen client version
+supports downgrade. If the canary fails, stop the new members and restart them with
+`group.protocol=classic`; do not improvise mixed callback semantics during an incident.
+
+**Success signal:** assignments stabilize, each partition has one owner, lag returns to baseline,
+and a controlled member restart neither loses work nor creates an unbounded duplicate burst. The
+[consumer rebalance protocol guide](https://kafka.apache.org/43/operations/consumer-rebalance-protocol/)
+defines the compatibility and migration constraints.
+
+## Upgrade Eligible Leader Replicas as a separate feature
+
+First establish the storage boundary. A partition's **high watermark** is the boundary below which
+records are replicated far enough to be exposed as committed data. Under the normal ISR contract,
+it advances only when every current in-sync replica has copied the records. If a replica leaves the
+ISR, it may still contain all records below the last high watermark even though it is no longer
+caught up with the leader's latest writes.
+
+Eligible Leader Replicas (ELR) preserve knowledge of such replicas when the ISR falls below
+`min.insync.replicas`. If no normal ISR candidate survives, Kafka tries leader candidates in this
+order:
+
+```text
+unfenced ISR member
+  -> unfenced eligible leader replica
+  -> unfenced last known leader
+```
+
+This is safer than treating any assigned replica as electable: an ELR is known to contain the
+committed boundary, even if it lacks later uncommitted tail records. It does not make acknowledged
+records magically durable without the original `acks` and `min.insync.replicas` policy.
+
+Kafka enables ELR by default on newly created clusters from 4.1 onward. For an upgraded cluster,
+make it a separate feature rollout after the binary and metadata upgrade is stable:
+
+```bash
+kafka-features.sh --bootstrap-server broker-1.example.com:9093 \
+  --command-config admin.properties upgrade \
+  --feature eligible.leader.replicas.version=1
+```
+
+Canary the change, inspect ISR/ELR state, and rehearse a leader failure whose candidate set you
+know. Record the rollback before enabling it; where the running release permits downgrade, set the
+feature back to version `0`. Changing `min.insync.replicas` or related replica policy can clear
+recorded eligibility, so do not combine those changes with ELR activation.
+
+**Success signal:** the expected replica is elected, the committed prefix remains readable, and
+no offline partition or unexpected truncation remains after ISR recovery. Apache's
+[ELR operations guide](https://kafka.apache.org/43/operations/eligible-leader-replicas/) is the
+version-specific source for enablement, election order, configuration interactions, and rollback.
+
 ## Regional recovery is a different state transition
 
 A provider may own broker replacement, patching, and control-plane durability. Your team still owns
