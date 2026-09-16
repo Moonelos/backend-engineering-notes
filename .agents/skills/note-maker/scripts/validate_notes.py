@@ -9,11 +9,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-NOTE_NAME = re.compile(r"^\d{2}_.+\.md$")
-NUMBERED_HEADING = re.compile(r"^##\s+(?:\d+\.|[1-9]️⃣)\s+")
-NUMBERED_ITEM = re.compile(r"^\s*\d+\.\s+")
+EXCLUDED_DIRS = {"_meta", "_audit", "site", "node_modules", "vendor", "build", "dist"}
 MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
-PRESCRIPTIVE_MARKER = re.compile(r"(?:> \*\*Rule\*\*:|⚠️|❌|✅)")
 
 
 @dataclass
@@ -39,40 +36,12 @@ def collect_notes(paths: list[Path]) -> list[Path]:
             notes.update(
                 candidate.resolve()
                 for candidate in path.rglob("*.md")
-                if NOTE_NAME.match(candidate.name)
+                if not any(part in EXCLUDED_DIRS or part.startswith(".")
+                           for part in candidate.relative_to(path).parts[:-1])
             )
             continue
         raise FileNotFoundError(path)
     return sorted(notes)
-
-
-def visible_paragraph_count(lines: list[str]) -> int:
-    paragraphs = 0
-    in_code = False
-    pending: list[str] = []
-
-    def flush() -> None:
-        nonlocal paragraphs
-        text = " ".join(pending).strip()
-        if len(text) >= 40:
-            paragraphs += 1
-        pending.clear()
-
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            flush()
-            in_code = not in_code
-            continue
-        if in_code or not stripped:
-            flush()
-            continue
-        if stripped.startswith(("#", ">", "- ", "* ")) or NUMBERED_ITEM.match(stripped):
-            flush()
-            continue
-        pending.append(stripped)
-    flush()
-    return paragraphs
 
 
 def validate_links(path: Path, lines: list[str], result: Result) -> None:
@@ -96,11 +65,6 @@ def validate_note(path: Path) -> Result:
     lines = path.read_text(encoding="utf-8").splitlines()
     total_lines = len(lines)
 
-    if not any(
-        line.strip().startswith("> **Who this is for**:") for line in lines
-    ):
-        result.error("missing '> **Who this is for**:' audience line")
-
     fence_lines = [
         line_number
         for line_number, line in enumerate(lines, start=1)
@@ -109,32 +73,9 @@ def validate_note(path: Path) -> Result:
     if len(fence_lines) % 2:
         result.error(f"unclosed fenced code block near line {fence_lines[-1]}")
 
-    if sum("> **Key insight**:" in line for line in lines) != 1:
-        result.error("note must contain exactly one '> **Key insight**:'")
-
-    if total_lines > 500 and not any(
-        "<!-- length-justification:" in line for line in lines[:30]
-    ):
-        result.error(
-            f"note is {total_lines} lines; split it or add a length justification"
-        )
-
-    if "> **Core:**" not in "\n".join(lines):
-        result.warn("no '> **Core:**' altitude marker")
-    if "**Not handled yet:**" in "\n".join(lines) and "> **Production:**" not in "\n".join(lines):
+    if total_lines > 500:
         result.warn(
-            "deferred concerns exist but no '> **Production:**' altitude marker appears"
-        )
-    if re.search(
-        r"\bedge cases?\b", "\n".join(lines), re.IGNORECASE
-    ) and "> **Edge case:**" not in "\n".join(lines):
-        result.warn("edge-case material appears without a '> **Edge case:**' marker")
-
-    markers = sum(len(PRESCRIPTIVE_MARKER.findall(line)) for line in lines)
-    paragraphs = visible_paragraph_count(lines)
-    if markers > paragraphs * 2:
-        result.warn(
-            f"prescriptive density is high ({markers} markers, {paragraphs} explanatory paragraphs)"
+            f"{total_lines} lines: inspect navigation and learning roles; length alone is not a defect"
         )
 
     validate_links(path, lines, result)
@@ -156,7 +97,7 @@ def main() -> int:
 
     results = [validate_note(path) for path in notes]
     for result in results:
-        status = "FAIL" if result.errors else "PASS"
+        status = "STRUCTURE-FAIL" if result.errors else "STRUCTURE-PASS"
         print(f"{status} {result.path}")
         for message in result.errors:
             print(f"  ERROR: {message}")
@@ -164,7 +105,9 @@ def main() -> int:
             print(f"  WARN:  {message}")
 
     failures = sum(bool(result.errors) for result in results)
-    print(f"\nChecked {len(results)} note(s); {failures} failed.")
+    print(f"\nChecked {len(results)} note(s); {failures} structural failure(s).")
+    print("PEDAGOGY NOT VERIFIED: run the curriculum teach-back and independent audit.")
+    print("EXAMPLES NOT VERIFIED: inspect the collection's example verification manifest.")
     return 1 if failures else 0
 
 

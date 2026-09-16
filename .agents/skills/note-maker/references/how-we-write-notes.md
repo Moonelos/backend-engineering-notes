@@ -16,11 +16,16 @@ Most of what follows is a **required move**, not a prohibition. A note that only
 
 ## Who the note is for
 
-Write for **a competent practitioner in the general domain, meeting this specific subject for the first time.** They know the general basics; they don't know this tool or concept yet.
+Write for the explicit audience in the learning contract. For **from zero**, assume no subject
+knowledge or adjacent specialist prerequisites unless the user supplies them as prior knowledge.
+State concrete general skills that are assumed; do not use “competent engineer” as a substitute.
 
-- Don't re-explain general domain basics (what an API is, what latency means).
-- Do explain the subject's own concepts, vocabulary, and mechanics from zero.
+- Teach the subject's vocabulary and mechanics from zero.
+- Teach necessary supporting concepts inline or in an earlier bridge; links alone do not teach them.
+- Skip general basics only when the audience contract explicitly permits that knowledge.
 - Never assume the reader already knows the thing the note is supposed to teach.
+
+Read `curriculum-research.md` to establish this boundary and independently validate the curriculum.
 
 Their existing expertise is also the cheapest teaching tool you have — see *Work with the model the reader already has*.
 
@@ -42,16 +47,43 @@ The goal is not merely complete notes. It is a path that takes a first-time read
 3. **Production hardening** — the defaults and safeguards that make the mechanism safe under real load and failure.
 4. **Operational awareness** — failure symptoms, limits, trade-offs, recovery procedures, and the practitioner tricks that prevent or diagnose them.
 
-A single file does not need to carry all four layers. The **full learning path as a whole does**; shorter paths may stop at a declared milestone. Each file needs one primary role: foundation/tutorial, implementation, deep dive, decision guide, or reference. Do not turn every foundation note into a production reference in the name of completeness.
+A single file does not need to carry all four layers. The **full learning path as a whole does**; shorter paths may stop at a declared milestone. Each file needs one primary role: foundation, tutorial, implementation, deep dive, decision guide, or reference. A foundation owns a mental model and concrete trace; a tutorial owns a guided runnable result. Do not turn either into a production reference in the name of completeness.
 
 Four rules keep the progression usable:
 
-- **Order paths do → understand → harden.** Every reading path produces a runnable result or concrete worked outcome within its first two entries. A path may revisit an earlier note for greater depth later; label the revisit instead of pretending the sequence is linear.
+- **Build intuition and a concrete result early, then deepen and harden.** A useful trace within two entries is a diagnostic target, not a limit. Teach needed prerequisites before action and justify milestones by the learning dependency. A path may revisit an earlier note for depth; label the revisit.
 - **Teach the smallest complete system before its advanced variants.** A reader should see one durable task before a stateful workflow, one claim before fencing and reconciliation, or one request before a full deployment topology.
 - **Provide stop points.** After the conceptual and minimal layers, say who can stop there and which new requirement makes the next layer necessary.
 - **Give each mechanism one canonical owner.** One note owns the full schema, implementation, or option set. Other notes use a small trace or excerpt and link to that owner instead of repeating the reference material.
 
 A first-time path fails this contract if every individual note is accurate but the reader must learn several production mechanisms before they can explain or build the baseline.
+
+## Coverage has levels; a heading is not coverage
+
+Use five levels to state what a collection promises about a mechanism:
+
+1. **Mentioned** — named only for orientation.
+2. **Defined** — grounded with its kind and basic purpose.
+3. **Explained** — its need, owned state or decision, causal mechanism, and consequence are clear.
+4. **Demonstrated** — the explanation is carried by a named trace or faithful artifact, with a changed-input contrast when the distinction is non-obvious.
+5. **Operationalized** — the reader can verify it, recognize its first real failure, and apply its recovery, rollback, or production boundary.
+
+Core mechanisms on a first-time path normally reach at least **demonstrated** in their canonical
+owner. A definition plus a failure warning does not meet that bar. Production implementation notes
+reach **operationalized** for the behavior they promise to assemble.
+
+Keep each foundation note centered on one mental model. When several mechanisms have independently
+changing state, different prerequisites, or different faithful carriers, split them or explain why
+their composition is the lesson. A short note is welcome when the mechanism is simple; compactness
+is not permission to collapse several teachable mechanisms into a glossary with warnings.
+
+A deep dive may refine a core idea only after an earlier foundation owner establishes the first
+correct model. It cannot be the first place a beginner path actually teaches a required concept.
+
+At the end of a foundation note, test whether a reader can state, from the note itself: the problem,
+the state or decision the mechanism owns, who changes it, one named transition and result, the
+plausible wrong model it rules out, and the first failure that motivates the next layer. This is the
+evidence-backed teach-back; a bare `PASS` without those reconstructable elements is not evidence.
 
 ## Open with the payoff that fits the note's role
 
@@ -61,7 +93,8 @@ declared role:
 
 | Note role | Useful opening payoff |
 |---|---|
-| Foundation/tutorial | A concrete situation and the first correct mental model or worked outcome. |
+| Foundation | A concrete situation, faithful trace, and the first correct mental model. |
+| Tutorial | The smallest runnable path, bounded inputs, visible output, and the explanation that makes it intelligible. |
 | Implementation | The smallest runnable path, its bounded inputs, and the observable result. |
 | Deep dive | The failure, constraint, or surprising behavior that requires this deeper mechanism. |
 | Decision guide | A named decision, the few criteria that change it, and an initial recommendation. |
@@ -85,14 +118,14 @@ The opening has two possible acceptance tests, applied only where the role warra
 
 - **Execution/decision:** the reader can run, trace, or make the promised first decision and observe
   the stated result.
-- **Restatement:** the reader can explain why the example, scenario, or criteria produce that result.
+- **Teach-back:** the reader can reconstruct why the example, scenario, or criteria produce that result from evidence in the note.
 
-A code block can pass execution and fail restatement. A conceptual or decision-oriented opening may
-need only the restatement test.
+A code block can pass execution and fail teach-back. A conceptual or decision-oriented opening may
+need only the teach-back test.
 
 ## Lead with the problem, then state the *why*
 
-Section 1 of every note has a fixed job: put the reader in the situation that makes this subject necessary, then answer it in one sentence. The definition comes after that, not before.
+A teaching opening should make the need intelligible, usually through a concrete situation followed by the central explanation. A brief definition may come first when it clarifies the situation; judge whether the reader understands the need, not the sentence order. Reference notes may open with scope and lookup guidance.
 
 ❌ "Hooks are user-defined handlers that run at specific lifecycle events."
 
@@ -176,16 +209,16 @@ The "stops at" clause is not optional. An analogy without a boundary produces a 
 
 > **The near-miss**: hooks look like "CLAUDE.md, but enforced." They're a different layer. CLAUDE.md is advice to the model — it can be reasoned around, compacted away, or overridden by a later instruction. A hook is harness behavior: it runs whether or not the model cooperates.
 
-At most one per note, and only where the misconception is real. A manufactured "you might think X" is worse than nothing — it plants a wrong idea the reader didn't arrive with.
+Use this only where the misconception is real; there is no required count. A manufactured "you might think X" is worse than nothing — it plants a wrong idea the reader didn't arrive with.
 
 ## Enumerations must be navigable
 
-Any table or list longer than five entries needs a marked entry point, or it's a reference dump the reader has to triage alone. Two required moves:
+When a long enumeration asks the reader to choose among unfamiliar alternatives, provide an entry point. Useful moves:
 
-1. **Mark the subset that matters.** Bold them, add a `★` column, or precede the table with "in practice you'll use three of these: X, Y, Z."
-2. **Show one of them in use.** At least one marked entry appears in a worked example in the same note.
+1. **Mark the subset that matters**, or explain the decision criteria when there is no general default.
+2. **Show a choice in use** when that is needed to understand the options. A lookup list or already explained set does not need an artificial default or another example.
 
-Applies to lifecycle events, CLI flags, config keys, IAM actions, model options — anywhere the full set is long and the used set is short. Listing everything is not the goal; the reader leaving with a default is. If you write "most people only need a few," name them in the same sentence.
+Applies to lifecycle events, CLI flags, config keys, IAM actions, model options — anywhere the full set is long and the used set is short. The goal is that the reader can choose or look up what they need. If you write "most people only need a few," name them in the same sentence.
 
 ## Every instruction ships with its success signal
 
@@ -250,7 +283,7 @@ Safe deferrals include caching and connection reuse, retries and backoff, key ro
 
 One 60-line production block teaches less than a small baseline followed by a hardened diff.
 
-Concept-heavy foundation/tutorial notes follow the same ladder without pretending diagrams are code:
+Concept-heavy foundation notes follow the same ladder without pretending diagrams are code:
 
 1. Start with a small concrete trace: named actors or rows, one input, one transition, and one visible outcome.
 2. Explain the causal mechanism behind the outcome.
@@ -261,29 +294,34 @@ A 100-line SQL block is not minimal merely because it is self-contained. The rea
 
 ## Mark altitude and control prescriptive density
 
-Uniform density makes core ideas and rare edge cases look equally important. Mark the reading altitude explicitly:
+Uniform density makes core ideas and rare edge cases look equally important. Make the reading altitude clear through navigation, headings, prose, or optional callouts such as:
 
 - `> **Core:**` — required to understand or use the baseline
 - `> **Production:**` — required before shipping, skippable while learning
 - `> **Edge case:**` — conditional material to read only when its condition occurs
 
-Rules, warnings, and correct/incorrect markers are conclusions. They follow the mechanism or consequence that earns them. In a teaching note, write at least one paragraph of mechanism or consequence for every two `> **Rule:**`, `⚠️`, `❌`, or `✅` markers. A large imbalance is a checklist wearing a tutorial's clothes.
+Rules, warnings, and correct/incorrect markers are conclusions. They follow the mechanism or consequence that earns them. A large imbalance between prescriptions and causal explanation prompts inspection; it is not a paragraph quota. Add the missing reasoning where it is needed, not filler to improve a ratio.
 
-Split notes over 500 lines unless one file is necessary for a concrete reason; record that reason near the top as `<!-- length-justification: ... -->`. Hardening may occupy most of a note, but never precedes the baseline.
+Inspect long notes for conflicting roles, excessive prerequisite load, or poor navigation. Split at a real learning boundary when it helps; neither 500 lines nor a length-justification comment determines quality. Advanced material follows the baseline it depends on, while a deep dive may open with its motivating failure.
 
-## Finish with the restatement test
+## Finish with evidence-backed teach-back
 
 Accuracy and runnable code are necessary, not sufficient. Before shipping, ask:
 
-> Could a competent engineer who is new to this subject, having read only this note, explain the concept correctly to a colleague in their own words without quoting it?
+> Could the declared reader, using only this note and earlier prerequisites, explain the concept correctly in their own words?
 
-If the reader can only recite rules, the note transferred instructions rather than understanding. Apply this test to the role-appropriate opening payoff, when it teaches a mechanism, and to the completed note as a whole.
+If the reader can only recite rules, the note transferred instructions rather than understanding.
+Make the verdict evidence-based: identify where the note supplies the problem, owned state or
+decision, actor, named transition and result, misconception boundary, and first failure. Apply this
+test to the role-appropriate opening payoff, each core mechanism, and the completed note as a whole.
+At meaningful milestones also test transfer to a changed condition using `curriculum-research.md`,
+with a reasoned solution grounded in material already taught.
 
-## Headers make claims; one insight per note
+## Use headings and insights to aid understanding
 
 **Section headers should answer, not label.** "Lifecycle Events" says what's in the section; "Which events you'll actually use" says what the reader leaves with. The second is also what a returning reader scans for six months later.
 
-**Every note carries exactly one `> **Key insight**:`.** It must be *transferable* — true beyond this specific example — and *non-obvious* — not a restatement of a section's topic sentence. If you can't write one, the note hasn't found its point yet; that's a signal to revise, not to omit the line.
+**Highlight transferable insights when useful.** A callout should explain something beyond the specific example rather than repeat a heading. No exact label or number of callouts is required; an insight taught clearly in prose is sufficient.
 
 **`⚠️` marks failure modes and nothing else.** That turns a decorative marker into navigation: a returning reader scans for ⚠️ to find the landmines without re-reading the note.
 
