@@ -1,16 +1,19 @@
-# Audit metrics — 2026-09-16
-Scope: `infrastructure/kafka` only; 24 teaching notes, 6 learner-facing root/section indexes, 8 named paths, 25 curriculum mechanisms, and 30 executable claims. Excluded: `_audit/` contributor/report artifacts, absent `_meta/`, the rest of the repository, external systems without bounded authorization, and explanatory excerpts from executable denominators.
+# Audit metrics — 2026-09-16 refresh
+Scope: infrastructure/kafka only; 24 teaching notes, 6 root/section indexes, 8 named paths, 26 curriculum/coverage items, 24 per-note teaching units plus one separately reported assembled collection. Excluded: audit/contributor artifacts from learner scope, external notes except prerequisite inspection, vendor certification, exhaustive APIs and executable excerpts from execution denominators.
 Research: COMPLETE
-Essential curriculum items accounted for: 25/25; 0 unresolved research questions, 0 justified exclusions, with undercovered items mapped to canonical coverage findings.
-Transfer checkpoints passed: 3/8 checked; 0 unchecked; 0 n/a excluded.
-Paths with an execution payoff within two entries: 4/8; diagnostic only.
-Paths with an understanding payoff within two entries: 6/8; diagnostic only.
-Core mechanisms at required coverage level: 10/25.
-Executable claims reproduced: 6/30; 9 broken, 3 partial, 12 not-run.
-Current-landscape items absent or stale: 5 (deprecated console formatter option, ELR-safe-election model, Python share-consumer production/`RENEW` applicability, Kafka 4.3 upgrade finalization/rollback boundary, and tiered storage).
+Essential curriculum items accounted for: 26/26 mapped to an owner or explicit gap; 0 unresolved research questions within the scoped investigation. Vendor-specific deployment certification and exhaustive APIs are justified scope exclusions, not missing counted items.
+Transfer checkpoints passed: 3/10 checked; 7 failed; 0 unchecked; 0 n/a checkpoints. These are textual changed-condition checks, not results from human learners. Eight path-level aggregates: 1 PASS, 7 FAIL. Application and ecosystem each have two explicit checkpoints; their aggregate is not counted a third time.
+Lesson quality passed: 7/24 assessed teaching units; 17 failed; 0 unchecked; 6 indexes n/a excluded. The assembled collection separately FAILS and is not a 25th independent chapter.
+Paths with an execution payoff within two entries: 2/6 executable paths; 4 fail; 2 decision/conceptual routes n/a excluded. Decision tables are not executable successes.
+Paths with an understanding payoff within two entries: 5/8; 3 fail. An early local payoff does not clear later lesson or path failures.
+Core mechanisms at required coverage level: 8/26. Narrow retained-read, key-affinity and share-state demonstrations are credited only for those mechanisms; later prescriptions or client readiness are not inferred from them. Retention administration alone does not pass its broader administration item.
+Executable claims reproduced: 6/41; 5 broken, 1 partial component probe, 29 not-run. Two EXCERPT inventory entries are excluded. The 41 include the independently added frontier component probe; only 6 are exact reproduced claims. Multi-service/secured/region/load drills remain unexecuted.
+Current-landscape items absent or stale: 6 scoped items—deprecated console formatter option; missing consumer-protocol rollout; missing ELR continuation; Python share-client applicability/renewal limits; upgrade finalization/downgrade boundary; tiered storage. Stable correctness defects in ACLs, compatibility gating and stream-time closure are separate technical findings, not invented recent changes.
 
-Teaching-note ORDERING verdicts: 19/24 PASS; 5/24 FAIL; indexes excluded.
-Teaching-note EXPLANATION verdicts: 11/24 PASS; 13/24 FAIL; indexes excluded.
-Canonical severity counts: 0 critical, 33 high, 10 med, 0 low. Counts include distinct per-note correctness/explanation findings, reader-path sequence defects, coverage-depth findings, and executable-claim defects; cross-references are not recounted.
+Teaching-note ORDERING: 14/24 PASS; 10/24 FAIL.
+Teaching-note EXPLANATION: 6/24 PASS; 18/24 FAIL.
+Canonical severity counts: 0 critical, 35 high, 11 med, 0 low. Count explicit FIX-/COVERAGE- lines in top-level canonical reports only; RELATED entries, worker fragments, optional placement proposals and the assembled LQ-G00 judgment are not counted again. Structural composition and a distinct executable defect can coexist when they require different corrections.
 
-Research completion, local explanation, coverage depth, transfer, and execution are independent: the reproduced first round trip does not offset the broken production harnesses, and complete research does not imply complete teaching.
+Compared with the previous report, denominators were rebuilt rather than copied: the existing curriculum actually has 26 rows; previously omitted verification drills are now inventoried; missing artifacts are not described as fabricated runtime failures; decision payoffs are separated from executable results. A higher inventory count is not evidence that new note regressions occurred.
+
+Evidence: lesson_quality.audit.md has complete development maps and editorial repair plans; examples.audit.md and _parts/refresh-global retain fresh observed outputs; curriculum.audit.md and topic-worker evidence list primary-source checks. Report-format validation checks completeness, not substantive judgment. The requested from-zero-to-production learning promise remains unmet even though some narrow lessons and the first runnable path pass.

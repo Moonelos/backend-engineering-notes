@@ -1,0 +1,56 @@
+[
+  {
+    "label": "contract",
+    "command": "uv add jsonschema",
+    "returncode": 2,
+    "stdout": "",
+    "stderr": "error: No `pyproject.toml` found in current directory or any parent directory\n"
+  },
+  {
+    "label": "compatibility",
+    "command": "uv add --dev pytest",
+    "returncode": 2,
+    "stdout": "",
+    "stderr": "error: No `pyproject.toml` found in current directory or any parent directory\n"
+  },
+  {
+    "label": "client",
+    "command": "uv add confluent-kafka",
+    "returncode": 2,
+    "stdout": "",
+    "stderr": "error: No `pyproject.toml` found in current directory or any parent directory\n"
+  },
+  {
+    "label": "smoke",
+    "command": "uv run pytest -q tests/integration/test_kafka_smoke.py",
+    "returncode": 2,
+    "stdout": "",
+    "stderr": "error: Failed to spawn: `pytest`\n  Caused by: No such file or directory (os error 2)\n"
+  },
+  {
+    "label": "schema-1",
+    "command": "jq '.fields += [{\"name\":\"coupon_code\",\"type\":[\"null\",\"string\"],\"default\":null}]' \\\n  order-created-v1.avsc > order-created-v2.avsc\n\njq empty order-created-v2.avsc",
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "label": "schema-3",
+    "command": "jq '(.fields[] | select(.name == \"total_minor\").type) = \"string\"' \\\n  order-created-v1.avsc > order-created-breaking.avsc\n\njq empty order-created-breaking.avsc",
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "label": "frontier-gaps",
+    "input": "observed/done offsets10,12; no delivered11",
+    "observed": [
+      [
+        "orders",
+        0,
+        11
+      ]
+    ],
+    "remaining_done": "{('orders', 0): {12}}"
+  }
+]

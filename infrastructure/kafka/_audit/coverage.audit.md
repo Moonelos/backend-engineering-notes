@@ -20,7 +20,7 @@ ROLE: PASS; foundation carries the mechanism with named records and contrasts.
 SIGNAL: path-promise
 SOURCE: lines 5–88.
 
-NO-ACTION: The group first-use problem is local prose ownership in `fundamentals.audit.md`, not missing mechanism depth.
+RELATED: The retained-read/next-offset opening is demonstrated; cleanup, lag operands and recovery are not thereby demonstrated. `lesson_quality.audit.md` LQ-F02 owns the developed-lesson repair across these later promises.
 
 # Key routing and ordering
 Promised by: fundamentals outcome and topic-design path.
@@ -32,7 +32,7 @@ ROLE: PASS; deep dive follows the log baseline.
 SIGNAL: canonical-owner
 SOURCE: lines 5–77.
 
-NO-ACTION: Bad-key, good-key, skew, serializer/partitioner, and partition-expansion consequences are demonstrated.
+RELATED: The bad-key/good-key contrast demonstrates affinity; expansion risk is explained. Hotspot remedies, stable bucket routing/migration and application sequencing are stated rather than demonstrated. `lesson_quality.audit.md` LQ-F03 owns this full-scope instructional repair. Achieved level above applies to core routing only, not every recommended remedy.
 
 # Consumer groups and rebalance ownership
 Promised by: root exploration and fundamentals outcomes.
@@ -44,7 +44,7 @@ ROLE: PASS; appropriate deep dive, incomplete explanation.
 SIGNAL: canonical-owner
 SOURCE: lines 5–83; local corrections in `fundamentals.audit.md`.
 
-RELATED: Per-note findings own the passive coordination explanation and ungrounded idempotency instruction.
+RELATED: `lesson_quality.audit.md` LQ-F04 owns the group/checkpoint/ownership development; the missing consumer-protocol rollout is separately tracked below.
 
 # Consumer protocol migration
 Promised by: Kafka 4.3 current configuration at `fundamentals/04:52–57`.
@@ -68,19 +68,21 @@ ROLE: PASS; deep dive is the right owner.
 SIGNAL: current-landscape
 SOURCE: https://kafka.apache.org/43/generated/producer_config.html and https://kafka.apache.org/43/operations/eligible-leader-replicas/ (checked 2026-09-16).
 
-RELATED: `fundamentals.audit.md` owns the incorrect existing `acks=all`/`min.insync.replicas` claim and stale safe-election model.
+RELATED: `fundamentals.audit.md` owns the ambiguous acknowledgment rule; `lesson_quality.audit.md` LQ-F05 owns developed broker/controller failure reasoning. The source does not literally claim that only ISR members can ever lead.
+
+COVERAGE-MED: For the declared Kafka 4.3 failure-model scope, add a bounded ELR continuation after the basic replication model: distinguish out-of-ISR from necessarily unsafe, then inspect the eligible set before considering unclean election. This is a missing current mechanism, not a falsely quoted exclusive-ISR claim.
 
 # Event contracts and schema evolution
 Promised by: application-design entry one.
 Canonical owner: `application_design/01_event_contracts_and_schema_evolution.md`
 Required: demonstrated
-Achieved: demonstrated
-TEACH-BACK: PASS; missing: none in prose
+Achieved: explained
+TEACH-BACK: FAIL across full evolution promise; missing: distinct old/new reader rules and worked deployment/semantic contrast; envelope validation is demonstrated
 ROLE: PASS; implementation opens with its artifact.
 SIGNAL: path-promise
 SOURCE: lines 5–158.
 
-NO-ACTION: The causal mechanism and semantic boundary are taught; the false-direction test evidence is owned by `examples.audit.md`.
+RELATED: LQ-A01 in lesson_quality.audit.md owns the undeveloped deployment/evolution explanation. examples.audit.md owns false-direction executable tests. The concrete envelope does not demonstrate every compatibility direction.
 
 # Python delivery and checkpoint lifecycle
 Promised by: application-design and root exploration paths.
@@ -116,7 +118,7 @@ ROLE: PASS; decision-guide role is appropriate but too shallow.
 SIGNAL: path-promise
 SOURCE: `application_design/04:5–60`; https://kafka.apache.org/43/configuration/topic-configs/ (checked 2026-09-16).
 
-COVERAGE-MED: The application path asks readers to choose partitions and retention but its canonical owner supplies no workload-to-count carrier and treats compaction as a table row; bring a compact sizing contrast and keyed-state/tombstone boundary into the owner while linking to operations for full arithmetic/configuration.
+RELATED: `lesson_quality.audit.md` LQ-A04 owns developing the topic decisions, sizing contrast and cleanup boundary. Bring the relevant part of operations/02 forward rather than duplicating a separate coverage severity.
 
 # Schema Registry lifecycle
 Promised by: application-design implementation outcome to register, evolve, and restore serialized contracts.
@@ -128,7 +130,7 @@ ROLE: PASS; implementation is the correct role.
 SIGNAL: path-promise
 SOURCE: lines 5–130; https://docs.confluent.io/platform/current/schema-registry/develop/api.html (checked 2026-09-16).
 
-COVERAGE-HIGH: The reader can register/check schemas but cannot produce bytes with a schema ID, deserialize by the exact writer schema, or restore IDs/mappings into a fresh registry — add one client round trip and one bounded restore drill with oldest/newest retained records.
+RELATED: `lesson_quality.audit.md` LQ-A05 owns the undeveloped wire-ID/reader-resolution/restore lifecycle and concrete refactor. Complete the client round trip and bounded restore demonstration as its acceptance evidence; the maturity shortfall is retained without a duplicate severity.
 
 # Delivery semantics and consumer idempotency
 Promised by: production-hardening and reliability entry-two boundary outcomes.
@@ -152,7 +154,7 @@ ROLE: PASS; deep dive may own the advanced mechanism after delivery semantics.
 SIGNAL: path-promise
 SOURCE: lines 5–69; https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html (checked 2026-09-16).
 
-COVERAGE-HIGH: The path promises implementation, but the owner supplies a text API trace without initialization, stable instance identity, consumer settings, error/abort recovery, position reset, or executable observation — add the smallest complete processor and crash verification.
+RELATED: `examples.audit.md` transaction kill/restart owns the absent promised executable processor and configuration. LQ-R02 owns how its explanation connects the three protection boundaries. Keep the coverage shortfall visible without counting the same missing processor twice.
 
 # Retry scheduling, DLT handoff, and controlled replay
 Promised by: reliability recovery implementation outcome.
@@ -188,7 +190,7 @@ ROLE: PASS; implementation role is correct but unfulfilled.
 SIGNAL: path-promise
 SOURCE: lines 5–107 and `examples.audit.md`.
 
-COVERAGE-HIGH: The note teaches what a valid test must contain but supplies no project, smoke file, broker fixture, fault hook, child-process controller, effect store, or offset assertions — implement and run one canonical Python smoke/crash suite.
+RELATED: `examples.audit.md` smoke/crash-harness findings own missing executable fixtures and assertions. LQ-R05 separately credits the developed conceptual test design. Operationalized coverage remains unmet; no duplicate severity here.
 
 # Security and multitenancy
 Promised by: operations implementation outcome and root production continuation.
@@ -266,13 +268,13 @@ NO-ACTION: Translation/checkpointing versus domain workflow, trust, restart evid
 Promised by: ecosystem foundation outcome.
 Canonical owner: `ecosystem/02_stream_processing.md`
 Required: demonstrated
-Achieved: demonstrated
-TEACH-BACK: PASS; missing: none
+Achieved: explained
+TEACH-BACK: FAIL; missing: correct closing-clock progression and aligned recovery/input state
 ROLE: PASS; foundation uses a faithful time/window/restart trace.
 SIGNAL: path-promise
 SOURCE: lines 5–57; https://kafka.apache.org/43/streams/developer-guide/dsl-api/ (checked 2026-09-16).
 
-NO-ACTION: Event time, grace, late data, state restoration, repartitioning, and batch/database boundaries are demonstrated.
+RELATED: The window/restart trace is concrete; current correctness and whole-lesson verdict are in ecosystem.audit.md and lesson_quality.audit.md. A named warning about repartitioning is not demonstration of repartitioning. This row must be read as core window/state coverage only, subject to the time-basis correction.
 
 # Share groups and queue semantics
 Promised by: ecosystem deep-dive outcome and architecture branch.
