@@ -97,11 +97,11 @@ for session lifetime, `flush()` versus commit, and rollback behavior.
 
 Two superficially similar requests can produce different durable changes:
 
-| Starting state for EX-1 | Result of `insert_or_attach` | New publication |
-|---|---|---|
-| No active investigation | Create I-1, `created=True` | Add E-1 to the outbox |
-| I-1 is already queued or processing | Attach to I-1, `created=False` | No additional event |
-| Previous investigation is terminal; explicit request permits rerun | Create I-2, `created=True` | Add E-2 |
+| Starting state for EX-1                                            | Result of`insert_or_attach`   | New publication       |
+| ------------------------------------------------------------------ | ------------------------------- | --------------------- |
+| No active investigation                                            | Create I-1,`created=True`     | Add E-1 to the outbox |
+| I-1 is already queued or processing                                | Attach to I-1,`created=False` | No additional event   |
+| Previous investigation is terminal; explicit request permits rerun | Create I-2,`created=True`     | Add E-2               |
 
 The database's partial unique index permits only one active investigation per `exception_id`.
 The repository handles an insert conflict by looking up the active row; the application uses
@@ -160,13 +160,13 @@ After a successful claim, the handler runs the action and heartbeat concurrently
 both reports broker progress and extends database ownership. Those protect different systems:
 the broker's delivery timer and the application's right to update the investigation.
 
-| Observation | Sample handler behavior |
-|---|---|
-| Action completes normally | Acknowledge the delivery |
-| Unclaimed investigation is already terminal | Acknowledge without running the action |
-| Another live lease owns it | Request redelivery after the remaining lease duration |
-| Ownership is lost while running | Cancel owned execution and request redelivery |
-| Action raises a classified failure | Persist a decision through `RecordInvestigationFailure`, then retry or terminate delivery |
+| Observation                                 | Sample handler behavior                                                                    |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Action completes normally                   | Acknowledge the delivery                                                                   |
+| Unclaimed investigation is already terminal | Acknowledge without running the action                                                     |
+| Another live lease owns it                  | Request redelivery after the remaining lease duration                                      |
+| Ownership is lost while running             | Cancel owned execution and request redelivery                                              |
+| Action raises a classified failure          | Persist a decision through`RecordInvestigationFailure`, then retry or terminate delivery |
 
 `RecordInvestigationFailure` owns the durable decision about another attempt or terminal failure.
 The handler translates the committed outcome into NATS acknowledgement operations. Its local
@@ -255,13 +255,13 @@ Start with the **acceptance** and **resume** rows below. They establish the main
 the remaining tests examine concurrency and delivery. These are existing source locations to
 inspect, not a claim that their suites have been executed as part of this walkthrough.
 
-| Question | Sample test file, relative to its service root | What it can establish |
-|---|---|---|
-| **What does acceptance create?** | orchestrator `tests/unit/application/test_request_investigations.py` | Deduplication and action results with a fake Unit of Work |
-| **Where does a retry resume?** | worker `tests/unit/application/test_investigate_exception.py` | Reuse of analysis and skipping a completed code-write step |
-| Does real concurrent insertion attach correctly? | orchestrator `tests/integration/db/test_investigation_repositories.py` | Database constraint and conflict behavior |
-| Does acknowledgement follow action completion? | worker `tests/unit/adapters/nats/test_handler.py` | Delivery ordering and failure translation with fakes |
-| What if runtime composition fails? | worker `tests/unit/bootstrap/test_runtime.py` | Cleanup after resources were acquired |
+| Question                                         | Sample test file, relative to its service root                          | What it can establish                                      |
+| ------------------------------------------------ | ----------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **What does acceptance create?**           | orchestrator`tests/unit/application/test_request_investigations.py`   | Deduplication and action results with a fake Unit of Work  |
+| **Where does a retry resume?**             | worker`tests/unit/application/test_investigate_exception.py`          | Reuse of analysis and skipping a completed code-write step |
+| Does real concurrent insertion attach correctly? | orchestrator`tests/integration/db/test_investigation_repositories.py` | Database constraint and conflict behavior                  |
+| Does acknowledgement follow action completion?   | worker`tests/unit/adapters/nats/test_handler.py`                      | Delivery ordering and failure translation with fakes       |
+| What if runtime composition fails?               | worker`tests/unit/bootstrap/test_runtime.py`                          | Cleanup after resources were acquired                      |
 
 The acceptance fake uses an in-memory lock and a no-op commit. Its passing concurrency test does
 not prove PostgreSQL locking or rollback. Similarly, an action fake returning successfully cannot
