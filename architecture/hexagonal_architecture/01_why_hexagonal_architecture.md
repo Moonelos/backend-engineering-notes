@@ -8,6 +8,9 @@ rule-based classifier. Tests become a patchwork of SQLAlchemy, AWS, and model SD
 
 **Hexagonal Architecture**, also called **Ports and Adapters**, responds by giving the business
 action its own boundary and making external technologies plug into contracts that action owns.
+The original pattern emphasizes this inside/outside separation rather than a required folder tree;
+see [Cockburn’s original explanation](https://alistair.cockburn.us/hexagonal-architecture). This
+collection then applies the stricter Python conventions in the supplied service-architecture reference.
 
 ---
 
@@ -67,13 +70,14 @@ Each pressure suggests a separation:
 
 | Pressure                                                   | Boundary that answers it                          |
 | ---------------------------------------------------------- | ------------------------------------------------- |
-| API and worker need the same operation                     | A public action in`application/`                |
-| Classification rules must ignore transport                 | Business policy in`application/` or `domain/` |
-| The classifier is remote and nondeterministic              | A caller-owned contract in`ports/`              |
-| Model SDK details must not leak inward                     | A concrete implementation in`genai/`            |
-| SQLAlchemy queries need one owner                          | Persistence code in`db/`                        |
-| Receipt handles and acknowledgements are transport details | A broker consumer in`adapters/`                 |
-| Concrete construction and disposal need one owner          | A composition root in`bootstrap/`               |
+| API and worker need the same operation                     | A public async action in `application/`                |
+| Classification rules must ignore transport                 | Pure business decisions in `domain/` |
+| The classifier is remote and nondeterministic              | A caller-owned contract in `ports/`              |
+| Model SDK details must not leak inward                     | A concrete implementation in `genai/`            |
+| SQLAlchemy queries need one owner                          | Persistence code in `db/`                        |
+| Business outcomes become delivery decisions | A handler in `workers/` chooses ACK or retry |
+| Receipt handles, envelopes, and visibility are broker details | An inbox adapter in `adapters/` performs the mechanics |
+| Concrete construction and disposal need one owner          | A composition root in `bootstrap/`               |
 
 The names are secondary. The reasoning is the architecture: code that changes for business reasons
 should not depend on code that changes because a provider, protocol, or process changes.
@@ -89,31 +93,37 @@ After separating responsibilities, both inbound paths call the same understandab
 
 ```text
 HTTP route ──────┐
-                 ├──► ClassifyTicket ──► TicketRepository
-Queue consumer ──┘          │
-                            ├───────────► TicketClassifier
-                            └───────────► ClassificationPublisher
+                 ├──► classify_ticket ──► TicketRepository
+Worker handler ──┘          │
+                            └───────────► TicketClassifier
 ```
 
-The **application action** is the callable business operation. A **port** is a typed capability it
-needs from outside its deterministic core. An **adapter** translates a specific technology into or
-out of those application-facing shapes.
+The **application action** is the callable business operation. A **port** is a typed I/O capability
+it needs from outside its deterministic core. An **adapter** translates a specific technology into
+or out of those application-facing shapes. In this repository, actions are plain async functions;
+entry points pass their collaborators explicitly as keyword arguments.
+
+This explanatory excerpt shows the action's stable conversation:
 
 ```python
-class ClassifyTicket:
-    def __init__(self, tickets: TicketRepository, classifier: TicketClassifier):
-        self._tickets = tickets
-        self._classifier = classifier
-
-    async def execute(self, ticket_id: UUID) -> Classification:
-        ticket = await self._tickets.get(ticket_id)
-        candidate = await self._classifier.classify(ticket.body)
-        return ticket.accept(candidate)
+async def classify_ticket(
+    *, ticket_id: str, tickets: TicketRepository, classifier: TicketClassifier
+) -> Classification:
+    ticket = await tickets.get(ticket_id)
+    category = await classifier.classify(ticket.body)
+    return Classification(ticket.ticket_id, category)
 ```
 
-The excerpt says what the action requires but not whether the repository is SQLAlchemy-backed or
-the classifier uses a particular provider or rules. The [vertical-slice tutorial](02_build_one_vertical_slice.md)
-turns this shape into a complete runnable example.
+The action says that execution requires a ticket reader and classifier, without selecting memory,
+SQLAlchemy, or a model provider. The HTTP route and worker each call this function with the runtime's
+implementations. That makes their dependencies visible at the call site: adding another capability
+requires updating each caller, and the type checker checks those connections. Bootstrap constructs
+implementations; it does not hide them inside a bound action object.
+
+The [vertical-slice tutorial](02_build_one_vertical_slice.md) turns this shape into a complete
+runnable example. Real eligibility or confidence rules belong in pure `domain/` functions, called
+from the action or inside an atomic database operation. Returning an observed category here does
+not yet introduce that policy or a durable write.
 
 ---
 
@@ -130,16 +140,19 @@ turns this shape into a complete runnable example.
 - A reviewer can ask “who owns this decision?” and find one package responsible for it.
 
 Consider a tenant policy change: confidence below `0.75` now requires human review. In the coupled
-route, testing the rule may require database and model scaffolding. In the separated design, the
-application test supplies a candidate directly through a fake classifier and observes the result.
+route, testing the rule may require database and model scaffolding. In the separated design, a pure
+domain decision accepts the candidate and policy values directly:
 
 ```python
-classifier = StubClassifier(category="billing", confidence=0.61)
-result = await ClassifyTicket(tickets, classifier).execute(ticket_id)
+# Excerpt: the decision is defined in domain/classification.py.
+result = decide_classification(candidate=Candidate("billing", 0.61), threshold=0.75)
 assert result.requires_human_review is True
 ```
 
-That short test is not merely convenient. It proves the policy does not depend on a provider SDK.
+That direct test checks policy without an SDK or fake repository. A separate action test supplies
+a fake classifier and verifies that execution applies the decision; it need not repeat every
+confidence-rule branch. The port isolates the external capability, while the pure function makes
+the business choice independently testable.
 
 > **Key insight**: a boundary pays for itself when it turns a likely external change into a local
 > adapter change while leaving the business action and its tests intact.
@@ -165,8 +178,13 @@ controlled coupling, not the disappearance of complexity.
 ## 6. Small services may not need the full shape
 
 Do not apply the complete directory tree to a health probe, a short-lived internal script, or a
-small CRUD service whose behavior is mostly validated persistence. Direct code may be easier to
-understand until independent change pressure appears.
+small CRUD service whose behavior is mostly validated persistence. For a script outside the service
+standard, direct code may be easier to understand until
+independent change pressure appears. Within a deployable service following this repository standard,
+each business operation still has a public action, even a one-line read; each I/O capability used by
+an action has a port. The economical choice is a small function and a narrow contract, rather than
+an empty hierarchy. Technical health, readiness, metrics, and version endpoints call no business
+action because they report the process itself.
 
 A boundary becomes more valuable when:
 
@@ -178,7 +196,8 @@ A boundary becomes more valuable when:
 
 ⚠️ The first failure of an over-architected service is navigation: a one-line rule requires opening
 an interface, implementation, factory, mapper, and empty domain object. If engineers cannot state
-which real change each boundary isolates, collapse it.
+which real change a wrapper or extra package isolates, collapse that extra structure. Keep the
+public action and its application I/O contracts required by the service standard.
 
 **Success signal:** a new queue entry point can invoke the existing action without importing the
 API package or copying its business branches. If the worker must construct an HTTP request or patch

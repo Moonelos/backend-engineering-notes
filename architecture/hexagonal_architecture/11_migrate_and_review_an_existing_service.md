@@ -42,8 +42,9 @@ Use three labels:
 - **Preference:** naming or layout differs but dependency direction and ownership remain clear.
 
 For example, naming the composition package `wiring/` instead of `bootstrap/` is usually a
-preference in a generic review. In this repository's standardized service layout, rename it only
-when consistency provides a stated navigation benefit—not because one name is universally correct.
+preference in a generic review. For a service following this repository standard, however,
+`bootstrap/` is the required composition owner. Generic hexagonal architecture permits other names; the agreed repository
+contract fixes names so every reviewer knows where to look. A migration targets that contract.
 
 ---
 
@@ -54,12 +55,12 @@ For the coupled route from part 1, the smallest coherent sequence is:
 ```text
 1. Characterize current HTTP behavior with tests
 2. Extract typed ClassificationCandidate and stable failures
-3. Extract ClassifyTicket with existing behavior unchanged
+3. Extract classify_ticket with existing behavior unchanged
 4. Put provider invocation behind TicketClassifier
 5. Move SQLAlchemy queries to the persistence owner
 6. Keep the route as input/output translation
 7. Move concrete construction and disposal to bootstrap
-8. Add the worker against the public action
+8. Move existing worker callers to the public action
 ```
 
 Move contract errors before application code would otherwise import concrete provider errors.
@@ -72,21 +73,29 @@ large test run makes regressions hard to locate and review.
 
 ## 4. Preserve behavior while changing dependency ownership
 
-Temporary re-exports can keep consumers working during an incremental migration:
+During a staged edit, a temporary import can keep callers working while their imports move. That
+is a work-in-progress tool, not the completed internal architecture. For example, the old route
+module may briefly import `classify_ticket` from its new application owner. Search all in-repository
+callers, migrate their imports, and delete the forwarding module in the same repository change.
+Otherwise the next engineer sees two public paths and must discover which one owns behavior.
 
-```python
-# Transitional compatibility import; remove after callers migrate.
-from ticket_triage.application.classify_ticket import ClassifyTicket
-
-__all__ = ["ClassifyTicket"]
-```
-
-Mark these explicitly and track their removal. Do not leave two permanent public paths to the same
-action.
+A genuinely independent consumer may be unable to migrate atomically. A shared library can then
+keep an additive supported API until a named removal condition is met, such as the final old
+consumer being retired. That compatibility boundary differs from an internal-only shim: describe
+who still needs it and verify both supported paths rather than treating every old import as a
+reason for permanent forwarding.
 
 Update more than Python imports: process commands, FastAPI app targets, worker entry points,
 migrations, fixture paths, pytest markers, pre-commit filters, CI selectors, Docker commands,
 telemetry service names, and documentation may all encode the old layout.
+
+For example, a mixed route-test module has both fake-only policy checks and tests needing a real
+database. Split those execution profiles before moving their owners. Keep assertions unchanged;
+move the database fixture to the integration profile and importable support into a qualified
+support package rather than importing `conftest.py`. Update selectors and run each supported
+profile. Promoting the fixture to root scope would make previously isolated tests acquire
+infrastructure, even if every test still passes. [Boundary testing](09_test_through_architectural_boundaries.md)
+owns the detailed test placement and evidence.
 
 ---
 
@@ -95,19 +104,31 @@ telemetry service names, and documentation may all encode the old layout.
 The highest-value final checks are:
 
 ```text
-[ ] Every public business action lives under application/
+[ ] Every business operation, including one-call reads, has a public application action
+[ ] Stateless actions are async functions with explicit keyword collaborators
 [ ] Domain and ports import no framework, ORM, provider SDK, or bootstrap
 [ ] Application imports no API, adapter, DB, GenAI, or concrete client
-[ ] API and consumers call public application actions
+[ ] Each business API/worker entry point calls exactly one public action
+[ ] Technical health/readiness/metrics/version endpoints call no business action
+[ ] Workers own business input/settlement choices; inbox adapters own provider mechanics
+[ ] Pure decisions are domain functions imported directly, never wrapped in Protocols
 [ ] Concrete adapters translate success and failure at their boundary
-[ ] Bootstrap alone selects ordinary runtime implementations
-[ ] Every AI concern lives below root genai/
+[ ] Bootstrap constructs implementations once; runtime fields are collaborators, not bound actions
+[ ] No forwarding layers remain except the public one-call catalog action
+[ ] Behavior-changing AI concerns live below genai/; trace-only middleware belongs to observability/
 [ ] No root messaging/, utils/, common/, or global error/constant bucket exists
 [ ] Packages are flat until demonstrated pressure justifies nesting
 [ ] Unit tests replace costly boundaries without patching SDK internals
 [ ] Integration and E2E prerequisites are explicit and reproducible
 [ ] All Python imports use the full absolute package path
+[ ] Import-linter contracts enforce every canonical boundary in pre-commit and CI
+[ ] Library independence and kind-specific importer contracts are enforced too
 ```
+
+Import rules need executable contracts, not only this review list.
+[Dependency direction](03_dependencies_point_toward_business_policy.md) explains enforcement;
+[boundary testing](09_test_through_architectural_boundaries.md) separates static, semantic, and
+behavioral evidence. A passing import contract cannot prove rollback or safe external retries.
 
 **Success signal:** changing the classifier implementation modifies its adapter and bootstrap wiring
 while application tests remain unchanged; adding a worker reuses the action without importing
@@ -129,9 +150,9 @@ promoting expensive fixtures to root scope, the migration damaged test ownership
 Do not migrate a stable small service merely for symmetry with a larger neighbor. Apply the
 architecture when it solves named ownership, change, lifecycle, or test-isolation problems.
 
-> **Production:** remove transitional imports only after import searches, focused suites, type
-> checks, process startup checks, and CI profiles prove all consumers moved. Roll out independently
-> deployed process changes in a compatibility-safe order.
+> **Production:** import searches, focused suites, type checks, process startup checks, and CI
+> profiles must prove internal consumers moved before completing the same change and deleting its
+> shims. Independently deployed processes still require compatibility-safe rollout ordering.
 
 ---
 
@@ -140,7 +161,7 @@ architecture when it solves named ownership, change, lifecycle, or test-isolatio
 After migration, a cold reader should be able to answer:
 
 - Where is each process constructed and shut down?
-- Which action owns classification policy?
+- Which action coordinates classification, and which pure domain function decides its policy?
 - Which contract shields that action from model-provider behavior?
 - Where are provider errors translated?
 - Which test proves business handling without live infrastructure?

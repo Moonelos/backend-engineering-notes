@@ -1,3 +1,4 @@
+
 # Trace One Investigation Across an API and a Worker
 
 > **Who this is for**: Engineers who understand a port and an application action but want to read a real multi-service implementation from request to result.
@@ -36,6 +37,31 @@ Source paths below are relative to `temp/services/<service>/src/<service>/`; tes
 relative to the corresponding service root. They identify the supplied sample, while the traces
 remain readable without that temporary directory. This is an architectural case study, not a
 certification of the sample's correctness.
+
+### Read the existing shape against the current standard
+
+The source sample uses a different implementation shape from the current
+[Python Service Architecture rules](../../python-service-architecture/SKILL.md).
+Its `RequestInvestigations` and `InvestigateException` classes are existing source names,
+not the default action shape taught in the earlier chapters. Today, a stateless operation is a
+public async function; routes, workers, and tools pass its port collaborators explicitly from
+narrow runtime views. Bootstrap builds implementations and policies rather than bound actions.
+
+For example, the source route selects an explicit-ID or filtered-selection action. Under the
+current one-action-per-entry-point rule, one public acceptance action would own that selection,
+receive a typed selection value, and delegate to private steps. The HTTP route would translate
+input and call that one operation. Likewise, the current worker would call one execution action;
+its inbox adapter would own NATS polling, heartbeat, and settlement without importing the action.
+The durable rows, replay windows, and checkpoint questions below still need the same reasoning
+after that separation.
+
+The sample's acceptance action also exposes several repositories through a Unit of Work. A
+current design first asks whether one atomic `accept_batch` store operation can read/lock,
+apply pure domain decisions, and commit acceptance plus its outbox rows. Keep an action-level
+Unit of Work when the action genuinely interleaves decisions and persistence operations; several
+tables alone do not require it. See the [transaction-owner comparison](05_design_ports_and_adapter_contracts.md).
+This chapter explains what the supplied implementation does, without silently changing its
+names or certifying its conformance to the selected standard.
 
 ---
 
@@ -172,11 +198,13 @@ the broker's delivery timer and the application's right to update the investigat
 The handler translates the committed outcome into NATS acknowledgement operations. Its local
 protocols describe collaborators; they do not mean the application imports NATS types.
 
-There is still an architectural tension: this handler also coordinates durable claims and examines
-business statuses. For a second inbound transport, an application-level execution coordinator
-could own claim/run/failure sequencing, leaving each adapter to translate delivery behavior. That
-would improve reuse when it is needed; moving the existing file solely to match a tree would not
-prove the boundary is better.
+The current standard identifies a concrete boundary violation here: this provider handler calls
+several actions, coordinates durable claims, and examines business statuses. One public execution
+action should own claim/run/failure sequencing, with pure status decisions in `domain/`.
+A consumer in `workers/` calls it and maps its typed outcome to settlement; a NATS inbox adapter
+applies the settlement and maintains delivery timing. Adding a second transport then reuses the
+same worker/action contract rather than copying the durable decisions. Merely renaming the
+handler's folder would leave its mixed responsibilities intact.
 
 > **Production:** inspect ownership predicates before claiming stale writers are fenced out.
 > **Fencing** means rejecting writes from an obsolete ownership attempt. The sample uses a

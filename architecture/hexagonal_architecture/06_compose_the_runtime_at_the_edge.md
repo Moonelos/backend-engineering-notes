@@ -1,6 +1,6 @@
 # Compose the Runtime at the Process Edge
 
-> **Who this is for**: Engineers wiring settings, database engines, clients, model handles, application actions, and deterministic shutdown.
+> **Who this is for**: Engineers wiring settings, database engines, clients, model handles, capability implementations, and deterministic shutdown.
 
 Moving constructors out of an action is incomplete if concrete dependencies become module globals
 spread across routes and workers. A **composition root** is the one ordinary runtime location that
@@ -16,7 +16,8 @@ This module opens a client as a side effect of import:
 # Wrong owner: importing the module starts runtime construction.
 settings = Settings()
 http_client = httpx.AsyncClient(timeout=settings.timeout)
-classifier = LLMTicketClassifier(http_client)
+model = build_model(settings=settings.ticket_classification)
+classifier = LLMTicketClassifier(model=model)
 ```
 
 Tests importing one symbol now require configuration. Reload behavior can duplicate handles.
@@ -31,41 +32,49 @@ before the process accepts work.
 
 ---
 
-## 2. A typed runtime exposes already-composed entry points
+## 2. A typed runtime exposes implementations and policies
 
-This explanatory excerpt shows the shape; the concrete factories belong to their technical owners:
+The baseline's `Runtime` contains `tickets` and `classifier`, not a constructed action. Keep that
+shape when memory becomes a database and keyword matching becomes a model. This is an explanatory
+excerpt: imports, validated settings, and the concrete implementations belong to the packaged service.
 
 ```python
-@dataclass(frozen=True)
+# bootstrap/runtime.py — excerpt
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Runtime:
-    classify_ticket: ClassifyTicket
-    session_factory: async_sessionmaker[AsyncSession]
+    tickets: TicketRepository
+    classifier: TicketClassifier
 
 
 @asynccontextmanager
 async def build_runtime(settings: Settings) -> AsyncIterator[Runtime]:
-    engine = create_async_engine(settings.database_url)
-    try:
-        session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        model = build_model(
-            model_name=settings.classification_model,
-            model_provider=settings.model_provider,
+    async with AsyncExitStack() as stack:
+        engine = create_async_engine(settings.database_url)
+        stack.push_async_callback(engine.dispose)
+        model = build_model(settings=settings.ticket_classification)
+        yield Runtime(
+            tickets=SqlAlchemyTicketRepository(sessions=async_sessionmaker(engine)),
+            classifier=LLMTicketClassifier(model=model),
         )
-        classifier = LLMTicketClassifier(model=model)
-        repository = SqlAlchemyTicketRepository(session_factory)
-        action = ClassifyTicket(repository, classifier)
-        yield Runtime(action, session_factory)
-    finally:
-        await engine.dispose()
 ```
 
-The runtime container exposes useful constructed dependencies, not the whole settings object or a
-generic dictionary. FastAPI dependencies and worker consumers receive the action; they do not
-rebuild it.
+The database engine has a cleanup owner immediately after acquisition. If model construction
+fails, the stack disposes the engine; the same cleanup runs after a successful runtime exits.
+The model integration builds its own SDK clients from the settings passed to its factory. Do not
+create a separate HTTP or boto3 client for the model when its integration accepts the required
+settings. A custom client is an exception only when a required option cannot be expressed through
+the integration; document that option and register the custom client's cleanup immediately.
+Other adapters may still borrow bootstrap-owned clients; borrowing does not transfer disposal.
 
-If the model handle or HTTP client owns an async close operation, bootstrap closes it too. Disposal
-runs in reverse dependency order: stop new intake, await bounded in-flight work, then close the
-resources that work uses.
+`Runtime` exposes port-shaped implementations, not raw sessions, clients, the entire settings object,
+or prebound actions. A route calls `classify_ticket(ticket_id=id, tickets=runtime.tickets,
+classifier=runtime.classifier)`. A worker makes the same explicit call. Adding a collaborator requires
+updating each call site, so no entry point can silently skip the dependency. Bootstrap constructs
+technology; it neither wraps actions in handler classes nor binds them with `partial`.
+
+Domain policy values can join these fields when the action actually requires them. Request-specific
+transactions stay inside the persistence implementation or a fresh Unit of Work; one shared runtime
+does not mean one mutable session shared by concurrent requests.
 
 ---
 
@@ -74,26 +83,31 @@ resources that work uses.
 Bootstrap coordinates factories; it should not absorb their internals:
 
 ```python
-# genai/ticket_classification/llm.py
-def build_model(*, model_name: str, model_provider: str):
+# genai/ticket_classification/llms.py — provider factory excerpt
+from langchain.chat_models import init_chat_model
+from langchain_core.language_models import BaseChatModel
+
+
+def build_model(*, settings: TicketClassificationSettings) -> BaseChatModel:
     return init_chat_model(
-        model=model_name,
-        model_provider=model_provider,
-    ).with_structured_output(ClassificationOutput)
+        settings.model_name,
+        model_provider="openai",
+        timeout=settings.timeout_seconds,
+        max_retries=0,
+        temperature=settings.temperature,
+        max_tokens=settings.max_output_tokens,
+    )
 ```
 
-```python
-# bootstrap/runtime.py
-model = build_model(
-    model_name=settings.classification_model,
-    model_provider=settings.model_provider,
-)
-classifier = LLMTicketClassifier(model=model)
-```
-
-The task-level factory knows how to bind structured output. Bootstrap knows which validated values
-and lifecycle dependencies to supply. Neither application code nor a module import chooses the
-provider.
+The task settings slice owns defaults for timeout and tuning; the factory owns provider policy,
+including disabled SDK retries. Bootstrap passes that slice without constructing SDK clients.
+The [LangChain model guide](https://docs.langchain.com/oss/python/langchain/models) describes
+`init_chat_model`; the [OpenAI integration](https://docs.langchain.com/oss/python/integrations/chat/openai)
+defines this provider's timeout and retry options. Another provider must verify its own options.
+Move identical reused construction policy to `genai/shared/llms.py` when a second task needs it.
+One-line structured binding stays in the runner constructor, as shown in
+[GenAI](08_treat_genai_as_an_external_capability.md). Neither application code nor a module import
+chooses the provider.
 
 ---
 
@@ -114,8 +128,7 @@ def create_app() -> FastAPI:
 ```
 
 `bootstrap/app.py` owns the FastAPI instance, lifespan, router registration, and framework
-instrumentation. `api/dependencies.py` may retrieve the already-built action from app state and
-present it to routes.
+instrumentation. `api/dependencies.py` exposes one typed runtime dependency; routes pass its fields to function actions.
 
 A worker process can enter the same `build_runtime()` context without importing FastAPI. That is
 why runtime composition belongs above process adapters rather than inside a route.
@@ -127,16 +140,48 @@ why runtime composition belongs above process adapters rather than inside a rout
 A long-running worker needs task creation, stop events, health, and graceful shutdown. Put those
 mechanics in `bootstrap/supervisor.py`:
 
-```python
-async def supervise(consumer: TicketConsumer, stop: asyncio.Event) -> None:
-    async with asyncio.TaskGroup() as tasks:
-        tasks.create_task(consumer.run(stop))
-        tasks.create_task(report_health(stop))
+A `TaskGroup` supplies **fail-together** concurrency: when one child fails, its siblings are
+cancelled immediately. That is useful for one operation whose parallel parts cannot succeed alone.
+A process supervisor that promises graceful shutdown needs a different sequence:
+
+```text
+external stop signal → set shared stop event → loops stop accepting new work
+                     → wait up to grace deadline for in-flight actions
+                     → cancel and await any remaining tasks
+                     → leave build_runtime() → close clients and engine
 ```
 
-The supervisor controls process lifetime. The consumer translates deliveries. `ClassifyTicket`
-owns business execution. Business stage order does not belong in the supervisor merely because it
-runs actions sequentially.
+If a classifier is halfway through a call, closing HTTP first causes a use-after-close. Waiting
+forever avoids that error but prevents deployment shutdown. The grace deadline bounds the trade-off;
+unfinished durable deliveries remain unsettled so the broker can redeliver them.
+
+This shutdown excerpt assumes `tasks` contains every loop task started by the supervisor:
+
+```python
+async def drain(tasks: list[asyncio.Task[None]], stop: asyncio.Event, grace: float) -> None:
+    stop.set()
+    try:
+        async with asyncio.timeout(grace):
+            await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                log.warning("worker_shutdown_failure", error_type=type(result).__name__)
+```
+
+The process owner catches the timeout to record unfinished work; it propagates external cancellation
+and unexpected loop defects. The supervisor contains declared dependency outages with stop-aware
+backoff, and fails fast on defects. It must track and await every task; a detached `create_task()`
+can keep using resources after their owner exits. Production cleanup that can hang needs its own
+bounded, cancellation-aware treatment, beyond this sequencing excerpt.
+
+The supervisor controls process lifetime. An inbox translates deliveries, a worker invokes the
+function action, and `classify_ticket` owns business execution. Business stage order does not belong
+in the supervisor merely because the supervisor starts several loops.
 
 > **Key insight**: bootstrap may know every concrete object while knowing no business decision; its
 > job is to create, connect, start, and dispose the graph.
@@ -205,6 +250,9 @@ bounded handling; see [signals and shutdown](../../fundamentals/core_concepts/si
 
 ### Several supervisors can share resources without owning business stages
 
+The following is a source-tour comparison of the supplied investigation worker, not the current
+service scaffold. Under the current standard, business admission and batch decisions belong in
+actions or pure domain policy; the generic supervisor owns cadence, stop, health, and drain.
 In the investigation worker, `AdmissionSupervisor` controls how much work enters, `AimdSupervisor`
 adjusts the concurrency target, and `ReconcilerSupervisor` runs periodic checks. **AIMD**, additive
 increase and multiplicative decrease, means raising capacity gradually during stable operation
@@ -238,8 +286,8 @@ while a consumer task is still processing. The symptom is a burst of connection 
 errors exactly when the deployment terminates.
 
 Do not centralize short-lived request transactions in the process runtime. Bootstrap owns the
-session factory or engine lifetime; the repository or request dependency owns each transaction's
-narrower lifetime.
+session factory or engine lifetime; the persistence implementation or a fresh Unit of Work owns each transaction's
+narrower lifetime. API dependencies expose a runtime view, never raw sessions.
 
 > **Production:** give graceful shutdown a bounded deadline. Once it expires, record unfinished work
 > and rely on durable redelivery or reconciliation instead of waiting forever.

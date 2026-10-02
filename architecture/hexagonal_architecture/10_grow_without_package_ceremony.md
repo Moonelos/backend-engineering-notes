@@ -15,23 +15,26 @@ A small API with one classification action might begin here:
 ```text
 src/ticket_triage/
 ├── main.py
-├── bootstrap.py
+├── bootstrap/
+│   ├── app.py
+│   └── runtime.py
 ├── api/
-│   └── routers/
-│       └── tickets.py
+│   ├── dependencies.py
+│   └── routes.py
 ├── application/
 │   └── classify_ticket.py
 ├── ports/
 │   └── ticket_classifier.py
 └── genai/
     └── ticket_classification/
-        ├── llm.py
+        ├── llms.py
+        ├── prompts.py
         ├── schemas.py
-        └── classifier.py
+        └── runner.py
 ```
 
 The specialized `genai/` boundary is explicit because AI implementation exists. There is no
-`domain/`, `db/`, general `adapters/`, supervisor, middleware, prompt module, or diagnostics
+`domain/`, `db/`, general `adapters/`, supervisor, middleware, or diagnostics
 package because the current service does not own those responsibilities.
 
 > **Core:** create a boundary when its responsibility exists; create a nested package only when
@@ -49,8 +52,7 @@ application/
 │   ├── classify.py
 │   ├── replay.py
 │   └── close.py
-└── alerts/
-    └── send.py
+└── send_alert.py
 ```
 
 Only the ticket slice earned a package. Do not create symmetrical one-file packages for alerts,
@@ -83,9 +85,11 @@ ports/
 ```
 
 Extract `schemas/`, `errors.py`, or a same-named package only after multiple cohesive definitions
-need independent ownership. GenAI task responsibilities are a deliberate exception when they
-exist: keep model construction, provider schemas, prompts, agent assembly, and capability
-invocation separate because they change and test differently.
+need independent ownership. GenAI follows the current service standard's fixed vocabulary: `llms.py` for construction,
+`prompts.py` for versioned prompts, `schemas.py` for provider output, and `runner.py` for invocation.
+Simple structured binding stays in the runner constructor. Add `agent.py`, `tools.py`,
+`middleware.py`, or `memory.py` only when that responsibility exists; a growing file becomes a
+folder of the same name. This specific GenAI convention refines the general flat-first rule.
 
 ---
 
@@ -96,7 +100,7 @@ A module named `utils.py` predicts no owner. Place behavior by meaning:
 | Behavior | Better owner |
 |----------|--------------|
 | Ticket subject normalization | `domain/ticket_normalization.py` |
-| SQS envelope serialization | `adapters/aws/sqs_serialization.py` |
+| SQS envelope serialization | `adapters/sqs_inbox.py` |
 | Prompt rendering | `genai/ticket_classification/prompts.py` |
 | Trace-context propagation | `observability/propagation.py` |
 | Classification retry mapping | Classifier adapter or application action, depending on the decision |
@@ -111,8 +115,13 @@ collections. “Used twice” is not enough; shared code needs shared meaning an
 
 ## 5. Shared libraries are capabilities rather than miniature services
 
-Extract a library only after two current consumers share the same semantics, or when an independent
-protocol/client/schema boundary has a concrete compatibility reason.
+Two current consumers with identical intended semantics may justify an admitted library; three
+identical copies across deployables require extraction. If two copies intended to stay identical
+have diverged, extract them or document the meaningful semantic difference in each copy. Reuse an
+already admitted library of the right kind before creating another. An independently valuable
+wire contract, schema, or client can justify one consumer when compatibility or dependency isolation
+is needed today. [Shared Libraries](13_share_libraries_without_service_layers.md) develops the
+complete decision and its permitted importers.
 
 ```text
 libs/ticket_contracts/
@@ -120,6 +129,7 @@ libs/ticket_contracts/
 ├── src/
 │   └── ticket_contracts/
 │       ├── __init__.py
+│       ├── py.typed
 │       ├── events.py
 │       └── serialization.py
 └── tests/
@@ -134,9 +144,10 @@ meaning are duplication, not necessarily reusable abstraction.
 
 The sample's `ctc_database`, `platform_db`, and `platform_observability` libraries show three
 concrete forms of reuse: database access, table mappings, and telemetry mechanics. None needs
-`application/`, `ports/`, and `bootstrap/` solely to resemble its consumers. A library earns
-internal ports when it owns policy that needs replaceable dependencies; a focused database
-implementation can remain directly coupled to its database technology.
+`application/`, `ports/`, and `bootstrap/` solely to resemble its consumers. Those are descriptive
+source examples, not a declaration that every current library policy is satisfied. The standard admits one kind per library with cohesive modules; it does not grow a
+service tree containing `ports/` or `adapters/`. In particular, query and engine mechanics in the
+existing CTC package need explicit classification and reconciliation before reuse as a new template.
 
 [Shared Libraries](13_share_libraries_without_service_layers.md) owns the detailed walkthrough:
 why the worker still wraps the shared CTC reader, how ORM models differ from domain state, and
@@ -158,9 +169,10 @@ Do not flatten boundaries merely to reduce directories when concrete framework i
 mix with business policy. Flat-first applies *inside* meaningful owners; it does not erase the
 dependency graph.
 
-> **Production:** preserve public imports deliberately during a file-to-package migration, then
-> remove transitional re-exports after consumers move. Use absolute imports through the full
-> package path so ownership remains visible.
+> **Production:** migrate internal consumers and remove their compatibility re-exports in the same
+> repository change. Independently migrated consumers may need an additive supported API with an
+> explicit removal condition. Use absolute imports through the full package path so ownership
+> remains visible.
 
 ---
 

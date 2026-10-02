@@ -2,7 +2,7 @@
 
 > **Who this is for**: Engineers who ran the vertical slice and want to understand why calls may go outward while imports still point inward.
 
-`ClassifyTicket` invokes a classifier at runtime, yet the application must not import the concrete
+`classify_ticket` invokes a classifier at runtime, yet the application must not import the concrete
 LLM classifier. That apparent contradiction is the mechanism at the heart of Hexagonal
 Architecture: control flow and source dependency are different graphs.
 
@@ -16,9 +16,11 @@ Suppose the action constructs its dependency directly:
 from ticket_triage.genai.ticket_classification.classifier import LLMClassifier
 
 
-class ClassifyTicket:
-    def __init__(self) -> None:
-        self._classifier = LLMClassifier()
+async def classify_ticket(*, ticket_id: str, tickets: TicketRepository) -> Classification:
+    classifier = LLMClassifier()
+    ticket = await tickets.get(ticket_id)
+    category = await classifier.classify(ticket.body)
+    return Classification(ticket_id, category)
 ```
 
 The action now changes when model construction changes, tests need provider setup unless they patch
@@ -36,14 +38,14 @@ choice.
 At runtime, the action calls an injected implementation:
 
 ```text
-ClassifyTicket ──call──► LLMClassifier ──HTTP──► model provider
+classify_ticket ──call──► LLMClassifier ──HTTP──► model provider
 ```
 
 In source code, both sides depend on the stable port:
 
 ```text
 application/classify_ticket.py ──import──► ports/ticket_classifier.py
-genai/.../classifier.py         ──import──► ports/ticket_classifier.py
+genai/.../runner.py         ──import──► ports/ticket_classifier.py
 ```
 
 The concrete classifier may explicitly implement or merely structurally satisfy the protocol. The
@@ -96,45 +98,72 @@ conversation. Concrete adapters translate richer provider APIs into that shape.
 Someone must connect the abstract requirement to a concrete implementation. That code belongs at
 the process edge, normally `bootstrap/runtime.py`:
 
+This excerpt separates construction from the entry point's business call:
+
 ```python
-repository = SqlAlchemyTicketRepository(session_factory)
+# bootstrap/runtime.py — constructs the implementations and the runtime value.
+repository = SqlAlchemyTicketRepository(sessions=session_factory)
 classifier = LLMTicketClassifier(model=model)
-classify_ticket = ClassifyTicket(
-    tickets=repository,
-    classifier=classifier,
+runtime = Runtime(tickets=repository, classifier=classifier)
+
+# api/routes.py — reads the API's runtime view and names action collaborators.
+result = await classify_ticket(
+    ticket_id=ticket_id,
+    tickets=runtime.tickets,
+    classifier=runtime.classifier,
 )
 ```
 
-This **composition root** is the ordinary runtime location that constructs the dependency graph.
-It imports inward-facing actions and outward-facing implementations because choosing between them
-is its job. Business packages never import bootstrap back.
+The **composition root** constructs the process dependency graph at its edge. It knows concrete
+implementations because choosing and disposing them is its job. The public action stays a plain
+async function; it receives ports explicitly when an entry point calls it. Bootstrap never creates
+a class, closure, or `partial` that hides those collaborators inside a bound action.
 
-Construction is not a loophole for business policy. Bootstrap may choose a classifier from trusted
-configuration; the application action still decides what a low-confidence candidate means for a
-ticket.
+The entry point imports its own narrow runtime Protocol, not the concrete `Runtime` definition from
+bootstrap. The concrete runtime structurally satisfies that view. This keeps API code from reaching
+through the object into unrelated implementations and prevents an import back into the module that
+already imports API code. [Runtime Composition](06_compose_the_runtime_at_the_edge.md) develops the
+view and lifetime in a complete process.
+
+Construction does not own business policy. Bootstrap may build a settings-derived threshold value
+and select a classifier; a pure `domain/` decision determines what low confidence means. The action
+or an atomic repository method calls that decision with values. Neither imports configuration to
+look up the rule dynamically.
 
 ---
 
 ## 5. An import audit makes the rule testable
 
-For the representative service, the allowed dependency map is:
+For the representative service, this map shows the main permitted edges, rather than every
+allowed import. Bootstrap may also import domain, port, and observability types:
 
 ```text
-main ──► bootstrap ──► api, db, adapters, genai, application
-api ─────────────────► application, domain
-adapter consumers ───► application, ports
-application ─────────► domain, ports
-db ──────────────────► domain, ports
-genai ────────────────► domain, ports
-domain ───────────────► dependency-light Python only
-ports ────────────────► domain and dependency-light Python only
+main ──► bootstrap ──► api, workers, db, adapters, genai
+api, workers ────────► application, domain, ports types
+application ────────► domain, ports, observability
+db ─────────────────► domain, ports
+genai ──────────────► domain, ports
+adapters ───────────► ports, domain; inbox imports its workers/inbox contract
+domain ─────────────► dependency-light Python only
+ports ──────────────► domain and dependency-light Python only
 ```
+
+A GenAI tool has one explicit inbound-adapter exception: it may import the public application
+action it invokes, just as an HTTP route does. The action still never imports the tool or its SDK.
+An inbox adapter imports the worker-owned contract it implements, not the business handler.
+
+An outer component can also implement a Protocol private to another outer consumer, when an
+actual dependency/substitution trigger earns that contract. For example, a database evidence
+index can import the retriever-owned Protocol without letting the retriever import concrete SQL.
+Permit that exact contract edge; do not open general imports between concrete integrations.
 
 The highest-value review checks are:
 
-- `application/` imports no `api`, `bootstrap`, `db`, `adapters`, `genai`, ORM, or provider SDK.
+- `application/` imports no `api`, `workers`, `bootstrap`, `config`, `db`, `adapters`, `genai`, ORM, or provider SDK.
 - `domain/` and `ports/` import no framework or concrete integration.
-- Inbound adapters call public application actions.
+- API routes and business worker handlers each call exactly one public application action.
+- A provider inbox adapter implements the worker's inbound contract and does not select actions.
+- Entry points and implementations never import bootstrap; bootstrap constructs their runtime.
 - Concrete driven adapters depend inward on the port they fulfill.
 - Business code never imports bootstrap.
 
@@ -153,18 +182,29 @@ imports the old provider even though construction was moved.
 import is often the first visible symptom. Moving imports inside functions hides the cycle without
 fixing the two-way ownership.
 
-Another smell is a layer that only forwards every argument and return value. An application action
-with no policy, sequencing, stable contract, or meaningful operation may not have earned a separate
-class yet. Keep the action as a small function, or call the adapter directly from the boundary when
-there is genuinely no business use case to preserve.
+Another smell is a layer that forwards every argument and result without owning behavior. Remove
+handler wrappers, re-export modules, and transaction coordinators that merely rename a call. A
+public application action is a deliberate exception: every business operation stays in the catalog,
+even when its body is one port call.
 
-Do not use this dependency structure when a small integration wrapper is the product and there is
-no independent business policy. A cohesive provider client library should expose its own capability
-rather than imitate a deployable service shell.
+```python
+# Excerpt: a business read remains discoverable and reusable by every entry point.
+async def read_ticket(*, ticket_id: str, tickets: TicketRepository) -> Ticket:
+    return await tickets.get(ticket_id)
+```
 
-> **Production:** add static import rules with a dependency checker when the service has enough
-> contributors that review alone no longer preserves the graph. The rule should encode actual
-> forbidden edges, not merely require every possible layer.
+Adding fake steps to make this action look substantial would obscure the operation. Its role is a
+stable entry contract and a complete catalog, not another layer of business decisions. Technical
+liveness, readiness, metrics, and version endpoints call no business action. A provider client
+library has a different role from a deployable service and does not copy this service shell.
+
+**Every service enforces the import graph from creation.** Add import-linter contracts to pre-commit
+and a CI job running those same hooks, including when CI does not exist yet. Contracts name the
+canonical boundaries even if some directories are not present today. Waiting for enough contributors
+lets the first outward import establish a dependency later features imitate. Static checks catch
+that edge early; they cannot establish whether a pure function owns the right business decision or
+whether a write is atomic. [Boundary Testing](09_test_through_architectural_boundaries.md) owns the
+runnable contract configuration, deliberate failing edge, and behavioral evidence.
 
 ---
 

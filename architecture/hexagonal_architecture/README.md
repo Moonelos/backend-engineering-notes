@@ -2,6 +2,13 @@
 
 > Design FastAPI services, workers, and AI-enabled backends so business actions outlive their current frameworks and providers.
 
+The implementation convention follows the supplied
+[Python Service Architecture](../../python-service-architecture/SKILL.md): plain async actions,
+explicit runtime collaborators, pure domain decisions, mandatory application I/O ports, and
+separate HTTP, worker, and concrete integration boundaries. Those are this collection's selected
+rules; the broader Ports and Adapters pattern does not prescribe Python folder names.
+The service/library samples are explicitly comparative source tours, not the current scaffold.
+
 ---
 
 ## Contents
@@ -12,7 +19,7 @@
 | [02 — Build One Vertical Slice](02_build_one_vertical_slice.md) | Tutorial | A complete application action with two inbound adapters | Run one use case from API- and worker-shaped entry points |
 | [03 — Dependency Direction](03_dependencies_point_toward_business_policy.md) | Foundation | Runtime calls versus source dependencies | Draw and audit the dependency rule |
 | [04 — Boundary Placement](04_map_code_to_owning_boundaries.md) | Decision guide | Where source files belong | Place ambiguous code by ownership rather than framework |
-| [05 — Ports and Adapter Contracts](05_design_ports_and_adapter_contracts.md) | Deep dive | Port admission, types, and failure translation | Define useful contracts without interface ceremony |
+| [05 — Ports and Adapter Contracts](05_design_ports_and_adapter_contracts.md) | Decision guide | Capability contracts, atomic operations, and failure translation | Define useful contracts without interface ceremony |
 | [06 — Runtime Composition](06_compose_the_runtime_at_the_edge.md) | Implementation | Construction, lifespan, and disposal | Build a composition root without leaking policy into bootstrap |
 | [07 — APIs and Workers](07_apply_the_pattern_to_apis_and_workers.md) | Implementation | FastAPI, consumers, scheduled work, and hybrids | Reuse an action across process boundaries safely |
 | [08 — GenAI Boundary](08_treat_genai_as_an_external_capability.md) | Deep dive | Models, prompts, agents, tools, and typed results | Keep AI mechanics outside business execution |
@@ -20,7 +27,7 @@
 | [10 — Flat-First Growth](10_grow_without_package_ceremony.md) | Decision guide | When modules earn packages and abstractions | Grow structure without empty layers or catch-alls |
 | [11 — Migration and Review](11_migrate_and_review_an_existing_service.md) | Decision guide | Moving an existing service safely | Produce an ownership map and incremental migration plan |
 | [12 — Investigation Case Study](12_trace_an_investigation_across_services.md) | Deep dive | One request across API, outbox, worker, and checkpoints | Trace durable changes and distinguish implemented behavior from unproven recovery guarantees |
-| [13 — Shared Libraries](13_share_libraries_without_service_layers.md) | Decision guide | Shared integrations, ORM models, and resource ownership | Explain which boundaries remain service-owned and when a library needs its own ports |
+| [13 — Shared Libraries](13_share_libraries_without_service_layers.md) | Decision guide | Shared integrations, ORM models, and resource ownership | Choose library kinds, allowed importers, and service-owned boundaries |
 
 ---
 
@@ -42,7 +49,7 @@ handler and a queue-worker-shaped handler, then observe identical business resul
 4. **Organize:** [Boundary Placement](04_map_code_to_owning_boundaries.md) turns that rule into a Python package tree.
 5. **Harden when required:** add [Port Contracts](05_design_ports_and_adapter_contracts.md), [Runtime Composition](06_compose_the_runtime_at_the_edge.md), and [Boundary Testing](09_test_through_architectural_boundaries.md).
 
-**Stop here if** one process, a small action, and direct dependencies remain easy to test and
+**Stop here if** one process, a small action, and its explicit port collaborators remain easy to test and
 change. Continue when another transport, costly external capability, complex lifecycle, or
 independent failure policy appears.
 
@@ -88,8 +95,8 @@ why its repositories share a transaction without sharing a session across concur
 
 **Stop after entry 3 if** you can locate and explain the action, transaction, service adapter,
 shared implementation, and construction site. Continue when diagnosing retries, stale ownership,
-startup failures, or changing AI configuration. The samples illustrate ownership decisions; they
-are not a universal scaffold or proof that every failure window is handled.
+startup failures, or changing AI configuration. The samples illustrate ownership decisions and show where the existing source differs from the
+current standard; they are not proof that every failure window is handled.
 
 ---
 
