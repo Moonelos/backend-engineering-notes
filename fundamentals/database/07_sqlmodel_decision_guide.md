@@ -50,7 +50,9 @@ than `create_all()` to evolve an existing schema.
 ## 2. Table and data models remain different roles
 
 Accepting a table model directly at an API boundary can expose database-owned fields such as primary
-keys. Define a data model for client input and let the table model own persistence:
+keys. Define a data model for client input and let the table model own persistence. This is a
+separate example in a fresh process, with the `Field` and `SQLModel` imports from the first
+example; do not redefine its table on the existing metadata:
 
 ```python
 class OrderCreate(SQLModel):

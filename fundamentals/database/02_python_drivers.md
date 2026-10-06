@@ -35,9 +35,9 @@ psycopg3 is the third major version of the most widely used Python PostgreSQL dr
 ### Install
 
 ```bash
-pip install psycopg[binary]       # recommended — includes compiled C extensions
+pip install "psycopg[binary]"       # binary wheel — bundles client libraries; choose packaging deliberately
 pip install psycopg               # pure Python fallback
-pip install psycopg[binary,pool]  # with built-in connection pool
+pip install "psycopg[binary,pool]"  # with the separate psycopg_pool package
 ```
 
 ### 1.1 Synchronous psycopg3
@@ -99,12 +99,37 @@ with conn.cursor() as cur:
     # All rows as list of tuples
     rows = cur.fetchall()       # [(1, 'a@b.com', 'Alice'), ...]
 
-    # One row (advances cursor)
-    row = cur.fetchone()        # (1, 'a@b.com', 'Alice') or None
+    # The same result is exhausted after fetchall().
+    row = cur.fetchone()        # None
+    rows = cur.fetchmany(5)     # []
 
-    # N rows
-    rows = cur.fetchmany(5)     # up to 5 rows
+    # Reexecute before demonstrating incremental reads.
+    cur.execute("SELECT id, email, name FROM users ORDER BY id LIMIT 10")
+    row = cur.fetchone()        # first row, or None when result is empty
+    rows = cur.fetchmany(5)     # up to 5 remaining rows
 ```
+
+#### Bind values; compose allowed identifiers separately
+
+A placeholder binds a value, not an SQL table/column name. `SELECT %s FROM users` selects a constant value for each row; it does not dynamically choose a column. For a caller-selected report field, validate the choice, then quote it with psycopg's identifier composer. This excerpt uses the `conn` and users fixture from earlier:
+
+```python
+from psycopg import sql
+
+field = "email"  # supplied by a caller
+if field not in {"email", "name"}:
+    raise ValueError("unsupported report field")
+with conn.cursor() as cur:
+    cur.execute(
+        sql.SQL("SELECT {} FROM {} WHERE id = %s").format(
+            sql.Identifier(field), sql.Identifier("users")
+        ),
+        (1,),
+    )
+    print(cur.fetchone())
+```
+
+The allowlist controls what the report may expose; quoting controls SQL syntax. A value such as `email; DROP TABLE users` fails the allowlist rather than becoming executable SQL. Continue to bind data values even when the identifier is composed. [SQL composition](https://www.psycopg.org/psycopg3/docs/api/sql.html).
 
 #### Dictionary Rows (Row Factories)
 
@@ -213,6 +238,43 @@ conn.commit()
 `executemany` for large batches. Measure with your row width, constraints, indexes, transaction size,
 network placement, server, and driver versions; no fixed multiplier transfers across workloads.
 
+#### Keep import and export memory bounded
+
+A regular client cursor may buffer the complete result even when the code calls fetchmany(). A **named server cursor** retains the result position on PostgreSQL and transfers batches. Keep its connection and transaction open until iteration finishes; committing or returning the connection early invalidates the ordinary non-holdable cursor. This excerpt uses an existing non-autocommit `conn` (as in the baseline), users table, and an output path in a disposable directory. An autocommit connection must instead wrap the cursor in an explicit transaction:
+
+```python
+import csv
+
+with open("users_export.csv", "w", newline="") as output:
+    writer = csv.writer(output)
+    with conn.cursor(name="users_export") as cur:
+        cur.execute("SELECT id, email, name FROM users ORDER BY id")
+        while batch := cur.fetchmany(500):
+            writer.writerows(batch)
+# Caller commits or closes only after this cursor has closed.
+```
+
+Only the current batch is held by this loop, rather than building a list of all users. The transaction can retain a snapshot while the cursor is open, so set an export deadline, close it on cancellation, and monitor long-running transactions. A file consumer that accumulates every batch would defeat the bound.
+
+For imports, a generator plus COPY avoids materializing all input rows. This excerpt imports that CSV into an independently created `users_import(id INTEGER, email TEXT, name TEXT)` table. Do not copy back into users without deliberately choosing conflict/identity semantics:
+
+```python
+import csv
+
+def imported_rows(path):
+    with open(path, newline="") as source:
+        for row in csv.reader(source):
+            yield int(row[0]), row[1], row[2]
+
+with conn.transaction():
+    with conn.cursor() as cur:
+        with cur.copy("COPY users_import (id, email, name) FROM STDIN") as copy:
+            for row in imported_rows("users_export.csv"):
+                copy.write_row(row)
+```
+
+The source yields one row at a time, while psycopg streams COPY protocol buffers; memory does not grow with total row count. CSV structure and field lengths still need input limits, and converting the ID can fail. That exception leaves the transaction context and rolls back the import. The shown policy is one atomic import; for very large jobs, use a staging table plus bounded committed chunks and an explicit checkpoint/retry policy. Keep the source, COPY context, and connection alive together; an external file write is not rolled back by a database rollback. [Server cursors](https://www.psycopg.org/psycopg3/docs/advanced/cursors.html#server-side-cursors), [COPY streaming](https://www.psycopg.org/psycopg3/docs/basic/copy.html).
+
 #### Connection Pool (sync)
 
 ```python
@@ -251,6 +313,8 @@ async with await psycopg.AsyncConnection.connect(connstr) as conn:
 ```
 
 #### Async Pool with FastAPI
+
+Integration excerpt: requires `DATABASE_URL`, the users schema from 01, and a FastAPI application module. Pool creation/shutdown belongs to application lifespan; request dependencies borrow and return connections. The full deployment and sizing continuation is in [05](05_connection_pooling.md).
 
 ```python
 from contextlib import asynccontextmanager
@@ -353,7 +417,7 @@ async with pool.connection() as conn:
 
 ## 2. asyncpg
 
-asyncpg is a high-performance, pure-async PostgreSQL driver written in Cython. It's faster than psycopg3 async for most workloads because it uses PostgreSQL's binary protocol for all communication and avoids Python overhead.
+asyncpg is a PostgreSQL driver with an asyncio-native API and binary type adaptation. Both asyncpg and psycopg can use binary adaptation and COPY; protocol support alone does not establish which is faster. Measure the same queries, row conversion, network path, pool concurrency, and COPY format on your workload.
 
 ### Install
 
@@ -373,7 +437,7 @@ await conn.close()
 # Connection pool (for applications)
 pool = await asyncpg.create_pool(
     dsn="postgresql://user:pass@localhost:5432/mydb",
-    min_size=5,      # connections always open
+    min_size=5,      # create initially; idle expiry can close connections later
     max_size=20,     # max connections
     command_timeout=30,
 )
@@ -453,6 +517,8 @@ if row is None: ...         # no row found
 
 ### 2.5 FastAPI Integration
 
+Integration excerpt: supply `DATABASE_URL`, install FastAPI, and create the users schema before running this app. The examples illustrate driver ownership; production authentication, request schemas, and response error mapping are outside this database lesson.
+
 ```python
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Depends, HTTPException
@@ -513,23 +579,23 @@ async with pool.acquire() as conn:
         )
         # commits on exit, rolls back on exception
 
-# Nested transaction (savepoint)
+# Nested transaction (savepoint): integration excerpt; logs(msg), users and duplicate must exist.
 async with pool.acquire() as conn:
     async with conn.transaction():
         # outer transaction
         await conn.execute("INSERT INTO logs (msg) VALUES ($1)", "start")
 
-        async with conn.transaction():
-            # nested — creates a SAVEPOINT
-            try:
-                await conn.execute("INSERT INTO users (email) VALUES ($1)", duplicate)
-            except asyncpg.UniqueViolationError:
-                pass  # savepoint rolled back, outer transaction continues
+        try:
+            async with conn.transaction():
+                # The exception must leave this context so it rolls back to SAVEPOINT.
+                await conn.execute("INSERT INTO users (email, name) VALUES ($1, $2)", duplicate, "Duplicate")
+        except asyncpg.UniqueViolationError:
+            pass  # rollback completed; outer transaction is usable again
 
         await conn.execute("INSERT INTO logs (msg) VALUES ($1)", "done")
 ```
 
-### 2.7 Bulk Insert — Where asyncpg Excels
+### 2.7 Bulk Insert with asyncpg
 
 asyncpg exposes PostgreSQL's binary `COPY` protocol directly:
 
@@ -589,13 +655,19 @@ await conn.execute("NOTIFY events_channel, 'user_created:42'")
 
 ### 2.9 Error Handling
 
+Integration excerpt: inside an async FastAPI handler with `pool`, validated `email` and `name`. Each pool.execute acquisition owns this individual statement; for a multi-statement operation, catch errors outside its explicit transaction context.
+
 asyncpg has typed exceptions for PostgreSQL error codes:
 
 ```python
 import asyncpg
+import logging
+from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 try:
-    await pool.execute("INSERT INTO users (email) VALUES ($1)", email)
+    await pool.execute("INSERT INTO users (email, name) VALUES ($1, $2)", email, name)
 except asyncpg.UniqueViolationError:
     raise HTTPException(409, "Email already exists")
 except asyncpg.ForeignKeyViolationError:
@@ -604,7 +676,7 @@ except asyncpg.NotNullViolationError:
     raise HTTPException(400, "Required field missing")
 except asyncpg.PostgresError as e:
     # Catch any other PostgreSQL error
-    logger.error("Database error", code=e.sqlstate, msg=str(e))
+    logger.error("Database error sqlstate=%s", e.sqlstate)
     raise HTTPException(500, "Database error")
 ```
 
@@ -616,14 +688,14 @@ except asyncpg.PostgresError as e:
 |---------|----------|---------|
 | Sync support | Yes (native) | No |
 | Async support | Yes | Yes (native, optimized) |
-| Performance (async) | Good | Excellent (binary protocol) |
+| Performance (async) | Measure matched workloads | Measure matched workloads |
 | Parameter style | `%s` (standard DB-API) | `$1`, `$2`, ... (PostgreSQL native) |
 | Row type | tuple / dict / namedtuple (configurable) | `asyncpg.Record` (tuple+dict-like) |
-| COPY support | Yes | Yes (binary, fastest) |
+| COPY support | Text and binary COPY | Binary COPY via copy_records_to_table |
 | SQLAlchemy backend | `psycopg` (recommended for new projects) | `asyncpg` |
-| Typed exceptions | Via `pgcode` | Rich exception hierarchy |
+| Typed exceptions | SQLSTATE classes and `sqlstate` | SQLSTATE classes and `sqlstate` |
 | Connection pool | `psycopg_pool` (separate package) | Built-in |
-| Python version | 3.8+ | 3.8+ |
+| Python version | Check selected release metadata | Check selected release metadata |
 | Type codecs | Good | Extensive, binary-level |
 
 ### Which to Choose?
@@ -636,11 +708,11 @@ except asyncpg.PostgresError as e:
 
 **Use asyncpg when:**
 - Pure async application (FastAPI, asyncio)
-- Maximum performance is critical (high-throughput APIs, real-time processing)
+- Your matched workload benchmark favors its API and adaptation costs
 - You want the simplest possible async code without adapting from sync
 - You're doing heavy bulk operations and want binary COPY
 
-**In practice**: asyncpg is slightly faster, psycopg3 is more versatile. Either works well behind SQLAlchemy. For raw driver usage, asyncpg has a cleaner async API.
+**In practice**: psycopg supports both sync and async plus DB-API compatibility; asyncpg supplies an asyncio-native PostgreSQL API. Either works behind SQLAlchemy. Select by required APIs, packaging, deployment constraints, and measured performance, rather than assuming a universal winner. [Psycopg COPY](https://www.psycopg.org/psycopg3/docs/basic/copy.html).
 
 ---
 
@@ -652,9 +724,9 @@ except asyncpg.PostgresError as e:
 | Complex domain model with many relationships | SQLAlchemy ORM |
 | Team prefers Python over SQL | SQLAlchemy ORM |
 | Reporting / analytics queries | Raw SQL via driver |
-| Bulk insert (10k+ rows) | asyncpg `copy_records_to_table` |
+| Bulk insert | Driver COPY after measuring transaction size and conversion cost |
 | Scripting / one-off migrations | psycopg3 or asyncpg directly |
-| Extremely performance-sensitive read endpoints | Raw asyncpg |
+| Performance-sensitive read endpoints | Profile ORM, Core, and raw driver on the same workload |
 | You need maximum control over SQL | Raw driver |
 
 > You don't have to choose one. In a SQLAlchemy app, unwrap the driver connection only inside the
@@ -666,3 +738,21 @@ except asyncpg.PostgresError as e:
 >     asyncpg_connection = adapter.driver_connection
 >     # Driver-only calls belong here; SQLAlchemy still owns commit/rollback and close.
 > ```
+
+### Diagnose psycopg errors after transaction recovery
+
+Psycopg 3 uses `sqlstate`, rather than psycopg2's `pgcode`. Catch a typed error outside the transaction context so rollback has completed before subsequent SQL. This excerpt requires an existing connection and the users schema:
+
+```python
+from psycopg import errors
+
+try:
+    with conn.transaction():
+        conn.execute("INSERT INTO users (email, name) VALUES (%s, %s)",
+                     ("alice@example.com", "Duplicate"))
+except errors.UniqueViolation as exc:
+    print(exc.sqlstate)  # 23505
+    # Map the known constraint to a domain conflict; avoid logging submitted data.
+```
+
+A statement failure leaves an explicit PostgreSQL transaction unusable until rollback. Catching inside the transaction without a savepoint would suppress the signal the context needs for rollback. [Psycopg error diagnostics](https://www.psycopg.org/psycopg3/docs/api/errors.html).

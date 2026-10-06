@@ -8,7 +8,7 @@
 > **Key insight**: Async sessions make hidden I/O invalid, so loading and transaction boundaries
 > must be explicit.
 
-> **Core idea**: SQLAlchemy async is not "sync SQLAlchemy with `await` sprinkled in." It changes how you think about sessions, loading, and object state. For raw performance, asyncpg gives you direct access to PostgreSQL's binary protocol.
+> **Core idea**: SQLAlchemy async is not "sync SQLAlchemy with `await` sprinkled in." It changes how you think about sessions, loading, and object state. Raw asyncpg exposes PostgreSQL directly; benchmark equivalent work before choosing it for performance.
 
 ---
 
@@ -18,7 +18,7 @@ Install `sqlalchemy[asyncio]` and `aiosqlite` (the extra ensures the async bridg
 present), then run this self-contained baseline:
 
 ```bash
-pip install 'sqlalchemy[asyncio]' aiosqlite
+pip install 'sqlalchemy[asyncio]==2.0.54' aiosqlite
 ```
 
 ```python
@@ -93,7 +93,7 @@ Async:  user.posts  →  MissingGreenlet error (cannot do implicit I/O)
 | Lazy loading | May issue blocking SQL | Prefer eager/raise; explicit awaitable access is available |
 | Session scope | Explicit mutable unit of work | Explicit mutable unit of work; one per task |
 | Relationship access | Automatic SQL on attribute access | Must use `selectinload` / `joinedload` |
-| Connection management | Thread pool handles it | Event loop — one connection blocks all if misused |
+| I/O scheduling | Blocking driver calls occupy the calling thread | Awaited driver calls let other tasks run; blocking sync calls in an async handler block its loop |
 | Engine | `create_engine` | `create_async_engine` — wraps an async driver |
 
 ### The Driver Layer
@@ -103,7 +103,7 @@ Async SQLAlchemy does not talk to the database itself. It delegates to an async 
 | Database | Async Driver | Install |
 |----------|-------------|---------|
 | PostgreSQL | `asyncpg` | `pip install asyncpg` |
-| PostgreSQL | `psycopg[async]` | `pip install psycopg[binary]` |
+| PostgreSQL | `psycopg` | `pip install psycopg[binary]` |
 | MySQL | `aiomysql` | `pip install aiomysql` |
 | SQLite | `aiosqlite` | `pip install aiosqlite` |
 
@@ -134,10 +134,10 @@ DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/mydb"
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,          # True logs all SQL — useful for dev, noisy in prod
-    pool_size=5,         # connections held open at steady state
+    pool_size=5,         # retained idle capacity, populated lazily
     max_overflow=10,     # additional connections under load (total max = 15)
     pool_pre_ping=True,  # verify connections are alive before using them
-    pool_recycle=3600,   # recycle connections after 1 hour
+    pool_recycle=3600,   # replace aged connections at their next checkout
 )
 ```
 
@@ -148,7 +148,7 @@ engine = create_async_engine(
 ```python
 async_session = async_sessionmaker(
     engine,
-    expire_on_commit=False,  # critical for async — explained below
+    expire_on_commit=False,  # retain loaded attributes after commit — explained below
 )
 ```
 
@@ -176,7 +176,7 @@ Set `expire_on_commit=False` on your session factory. If you need fresh data aft
 
 ```python
 from datetime import datetime
-from sqlalchemy import String, ForeignKey, func
+from sqlalchemy import DateTime, String, ForeignKey, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -191,10 +191,13 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # Relationship — NEVER access this lazily in async
-    posts: Mapped[list["Post"]] = relationship(back_populates="author", lazy="raise")
+    posts: Mapped[list["Post"]] = relationship(
+        back_populates="author", lazy="raise",
+        cascade="save-update, merge, delete, delete-orphan", passive_deletes=True,
+    )
 
     def __repr__(self) -> str:
         return f"<User id={self.id} email={self.email}>"
@@ -207,7 +210,7 @@ class Post(Base):
     title: Mapped[str] = mapped_column(String(200))
     content: Mapped[str]
     published: Mapped[bool] = mapped_column(default=False)
-    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
 
     author: Mapped["User"] = relationship(back_populates="posts", lazy="raise")
 ```
@@ -236,6 +239,62 @@ user.posts  # raises InvalidRequestError immediately — clear error message
 ```
 
 With `lazy="raise"`, you are forced to explicitly load relationships when you need them. This makes your queries predictable and your bugs obvious.
+
+---
+
+### Eager vs Lazy Loading in Async
+
+Async SQLAlchemy does not support implicit lazy loading. You have three strategies:
+
+**1. `selectinload` — separate SELECT with IN clause (recommended default)**
+
+```python
+stmt = select(User).options(selectinload(User.posts))
+```
+
+Produces:
+
+```sql
+SELECT * FROM users WHERE ...;
+SELECT * FROM posts WHERE author_id IN (1, 2, 3, ...);
+```
+
+Good for: one-to-many, many-to-many. For a nonempty small one-level parent batch, two queries. Larger parent sets are split into key batches; nested relationships add queries.
+
+**2. `joinedload` — single query with JOIN**
+
+```python
+from sqlalchemy.orm import joinedload
+
+stmt = select(User).options(joinedload(User.posts))
+users = (await db.execute(stmt)).unique().scalars().all()
+```
+
+Produces:
+
+```sql
+SELECT * FROM users LEFT OUTER JOIN posts ON posts.author_id = users.id WHERE ...;
+```
+
+Good for: many-to-one, one-to-one. For Alice with two posts, SQL produces two rows for Alice. `unique()` collapses these to one ORM User with both posts; SQLAlchemy requires it for collection joined loading. The outer join also retains users with no posts.
+
+**3. `subqueryload` — separate SELECT with subquery**
+
+```python
+stmt = select(User).options(subqueryload(User.posts))
+```
+
+Good for: complex filters on the parent query. Rarely needed — prefer `selectinload`.
+
+**Comparison:**
+
+| Strategy | Queries | Best for | Pitfall |
+|----------|---------|----------|---------|
+| `selectinload` | Parent SELECT + key batches | One-to-many, many-to-many | Large IN clause with many IDs |
+| `joinedload` | 1 | Many-to-one, one-to-one | Row multiplication on collections |
+| `subqueryload` | 2 | Complex parent filters | Slower than selectinload in most cases |
+| `lazy="raise"` | 0 | Preventing accidental loads | Must always specify eager strategy |
+
 
 ---
 
@@ -338,7 +397,87 @@ app = FastAPI(lifespan=lifespan)
 
 ---
 
-## 5. CRUD Patterns
+## 5. CRUD helpers participate in one service transaction
+
+The following helpers are excerpts using the model and session factory above. They flush when
+needed but never commit: the caller owns the business transaction. A flush sends SQL and obtains
+IDs; another connection still cannot see those writes until the caller commits. Wrap writes in
+`async with db.begin():` before the first query, or use `async_session.begin()` to create both
+session and transaction. Do not call `begin()` after an earlier read has already autobegun one.
+
+### Prove that a failed second write undoes the first
+
+Save this complete SQLite example as `service_transaction.py` and run `python service_transaction.py`
+with the quick-start dependencies. This isolates transaction composition from HTTP and PostgreSQL
+locks. The second insert violates a unique email constraint after the first has flushed.
+
+```python
+import asyncio
+from sqlalchemy import String, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True)
+
+async def add_user(db, email):
+    user = User(email=email)
+    db.add(user)
+    await db.flush()
+    return user
+
+async def main():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        try:
+            async with Session.begin() as db:
+                await add_user(db, "alice@example.com")
+                await add_user(db, "alice@example.com")
+        except IntegrityError:
+            print("second write failed; service rolled back")
+        async with Session() as db:
+            print("persisted users", await db.scalar(select(func.count()).select_from(User)))
+        async def register(email):
+            async with Session.begin() as db:
+                await add_user(db, email)
+        # Each concurrent task creates its own session/transaction.
+        # Run sequentially here: in-memory SQLite shares one physical connection.
+        await register("alice@example.com")
+        await register("bob@example.com")
+        async with Session() as db:
+            print("successful service calls", await db.scalar(select(func.count()).select_from(User)))
+    finally:
+        await engine.dispose()
+
+asyncio.run(main())
+# second write failed; service rolled back
+# persisted users 0
+# successful service calls 2
+```
+
+The first flush assigned an ID and sent an INSERT, but no commit made it durable. The outer context
+rolled back both writes on the second failure. If `add_user` committed internally, the first Alice
+would survive and the count would be one. A new session after the failed service call proves both
+rollback and recovery rather than reading an old identity-map value.
+
+For PostgreSQL concurrent work, `await asyncio.gather(register("a@example.com"),
+register("b@example.com"))` gives each task a session. Passing the same session to both tasks is
+invalid even when both tasks belong to one HTTP request. Their transactions are independent;
+if the two writes must succeed together, keep them sequential inside one service transaction.
+[Async task ownership](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-asyncsession-with-concurrent-tasks).
+
+**Transfer checkpoint:** Change the first insert to Bob and the second to an already-existing
+Alice. Which rows survive? The preexisting Alice survives; both writes in this new service scope
+roll back, so Bob is absent. Rollback only undoes this transaction, not previously committed data.
 
 ### Create
 
@@ -348,8 +487,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 async def create_user(db: AsyncSession, email: str, name: str) -> User:
     user = User(email=email, name=name)
     db.add(user)
-    await db.commit()
-    await db.refresh(user)  # reload to get server-generated fields (id, created_at)
+    await db.flush()
     return user
 ```
 
@@ -396,6 +534,10 @@ async def list_users(
 
 ### Read — With Relationships
 
+For Alice with two posts, `selectinload` returns one User and loads both posts in a separate
+SELECT. For a collection `joinedload`, joined SQL repeats Alice twice and result consumption must
+use `unique()`; see [loading choices](#eager-vs-lazy-loading-in-async).
+
 ```python
 from sqlalchemy.orm import selectinload
 
@@ -420,8 +562,7 @@ async def update_user(db: AsyncSession, user_id: int, **kwargs) -> User | None:
     for key, value in kwargs.items():
         setattr(user, key, value)
 
-    await db.commit()
-    await db.refresh(user)
+    await db.flush()
     return user
 ```
 
@@ -437,11 +578,18 @@ async def deactivate_users(db: AsyncSession, user_ids: list[int]) -> int:
         .values(is_active=False)
     )
     result = await db.execute(stmt)
-    await db.commit()
+    await db.flush()
     return result.rowcount
 ```
 
 ### Delete
+
+This example intentionally deletes a user's posts too: the mapping coordinates ORM delete
+cascade for loaded children with database `ON DELETE CASCADE` for unloaded children and bulk
+DELETE. Apply that FK change through a reviewed migration on an existing database. Without
+a cascade or an explicit child-deletion policy, a user with posts cannot be deleted safely.
+See [cascade ownership](03_sqlalchemy_orm.md) for the synchronous model. SQLite tests must
+enable foreign keys before treating database cascades as verified.
 
 ```python
 async def delete_user(db: AsyncSession, user_id: int) -> bool:
@@ -450,7 +598,7 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
         return False
 
     await db.delete(user)
-    await db.commit()
+    await db.flush()
     return True
 ```
 
@@ -462,7 +610,7 @@ from sqlalchemy import delete
 async def purge_inactive_users(db: AsyncSession) -> int:
     stmt = delete(User).where(User.is_active == False)
     result = await db.execute(stmt)
-    await db.commit()
+    await db.flush()
     return result.rowcount
 ```
 
@@ -481,23 +629,59 @@ async with async_session() as session:
     # new transaction will begin on next operation
 ```
 
-### Explicit Commit and Rollback
+### A balance transfer needs a defined model and concurrent decision
+
+This PostgreSQL excerpt uses integer credits, not floating point amounts. `Account` is a separate
+model registered on the `Base` above; create its table through a reviewed migration. A transfer
+must preserve the total and prevent a negative sender balance. Reading 100 twice and writing 20
+twice would lose a debit, so both rows are locked before making the decision.
 
 ```python
+from sqlalchemy import CheckConstraint, select
+
+class Account(Base):
+    __tablename__ = "accounts"
+    __table_args__ = (CheckConstraint("balance >= 0", name="ck_account_balance"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    balance: Mapped[int] = mapped_column(default=0)
+
 async def transfer_credits(db: AsyncSession, from_id: int, to_id: int, amount: int):
-    sender = await db.get(User, from_id)
-    receiver = await db.get(User, to_id)
-
-    if sender.credits < amount:
+    if amount <= 0 or from_id == to_id:
+        raise ValueError("Positive amount and distinct accounts required")
+    accounts = (await db.scalars(
+        select(Account).where(Account.id.in_([from_id, to_id]))
+        .order_by(Account.id).with_for_update()
+        .execution_options(populate_existing=True)
+    )).all()
+    if len(accounts) != 2:
+        raise ValueError("Account missing")
+    by_id = {account.id: account for account in accounts}
+    sender, receiver = by_id[from_id], by_id[to_id]
+    if sender.balance < amount:
         raise ValueError("Insufficient credits")
+    sender.balance -= amount
+    receiver.balance += amount
+    await db.flush()
 
-    sender.credits -= amount
-    receiver.credits += amount
-
-    await db.commit()  # both changes committed atomically
+# Service boundary: no prior query on this session.
+async def transfer(from_id: int, to_id: int, amount: int):
+    async with async_session.begin() as db:
+        await transfer_credits(db, from_id, to_id, amount)
 ```
 
-If an exception occurs before `commit()`, the session is in a failed state. The `async with async_session()` context manager rolls back automatically on exit.
+With sender=100, two simultaneous transfers of 80 lock the same sender. The first commits
+sender=20; the second acquires the lock afterward, sees 20, and rolls back its insufficient-credit
+attempt. The receiver gains 80 once; the total remains unchanged. PostgreSQL READ COMMITTED
+rechecks the locked row after waiting. SQLite ignores `FOR UPDATE`, so the SQLite wiring example
+cannot establish this concurrency guarantee. `populate_existing=True` refreshes a previously loaded Account from the locked SELECT rather than
+reusing stale identity-map values. Ordered row locking reduces deadlocks; it does not
+cover every resource a trigger or another transaction might lock.
+
+A Python `ValueError` does not itself make the session inactive. A failed database statement can
+abort the PostgreSQL transaction; a failed flush also requires Session rollback before reuse.
+Exiting `async_session.begin()` rolls back on any exception and closes the session. If you catch a
+flush error inside a manually managed session, call `await db.rollback()` before another operation.
+[Session recovery](https://docs.sqlalchemy.org/en/20/orm/session_basics.html#flushing).
 
 ### Manual Rollback
 
@@ -543,6 +727,8 @@ await db.commit()      # both user and post committed atomically
 Use `begin_nested()` to create savepoints inside a transaction. This lets you roll back part of the work without aborting the whole transaction.
 
 ```python
+from sqlalchemy.exc import IntegrityError
+
 async def import_records(db: AsyncSession, records: list[dict]) -> list[str]:
     errors = []
 
@@ -556,48 +742,28 @@ async def import_records(db: AsyncSession, records: list[dict]) -> list[str]:
             # savepoint rolled back, but outer transaction is fine
             errors.append(f"Skipped {record['email']}: {e}")
 
-    await db.commit()  # commit all successful inserts
+    await db.flush()  # the service transaction commits successful inserts
     return errors
 ```
 
-### The `get_db` Dependency — Transaction Strategy
+### Commit before returning HTTP success
 
-Two common strategies:
-
-**Strategy A: Endpoint controls commits (recommended)**
-
-```python
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session() as session:
-        yield session
-        # no auto-commit — endpoint is responsible
-
-@app.post("/users")
-async def create_user(data: UserCreate, db: AsyncSession = Depends(get_db)):
-    user = User(email=data.email, name=data.name)
-    db.add(user)
-    await db.commit()
-    return user
-```
-
-**Strategy B: Auto-commit on success, rollback on exception**
+A yielding dependency owns session cleanup; the service owns commit. Current FastAPI request
+scope runs yield cleanup after the response, so committing there can deliver success before a
+constraint failure. Keep the transaction context inside the endpoint/service and exit it before
+returning the response. [FastAPI yield scope](https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/#early-exit-and-scope).
 
 ```python
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
+@app.post("/users", response_model=UserResponse)
+async def create_user_endpoint(data: UserCreate, db: AsyncSession = Depends(get_db)):
+    async with db.begin():
+        user = await create_user(db, data.email, data.name)
+    return user  # commit has completed; expire_on_commit=False retains loaded fields
 ```
 
-Strategy A is more explicit and gives you finer control. Strategy B is convenient but hides when the commit happens.
+### Deadlocks, complete retries and PostgreSQL row-lock boundaries
 
-### Deadlocks and Lock Escalation
-
-Under concurrency, two transactions can each hold a lock the other needs. PostgreSQL detects this and aborts one with `DeadlockDetected` (`40P01`); the other proceeds. This is not a bug in Postgres — it is Postgres doing its job. The bug is almost always in *your* code: two transactions acquire locks on the same rows in different orders.
+Under concurrency, two transactions can each hold a lock the other needs. PostgreSQL detects this and aborts one with `DeadlockDetected` (`40P01`); the other proceeds. This is not a bug in Postgres — it is Postgres doing its job. A common cause is transactions acquiring rows in different orders; triggers and other resources also contribute.
 
 ```
 T1: UPDATE accounts WHERE id = 1 ... (acquires lock on row 1)
@@ -608,10 +774,10 @@ T2: UPDATE accounts WHERE id = 1 ... (waits for T1 → deadlock)
 
 **Primary mitigations:**
 
-1. **Order operations by primary key.** If every transaction touches rows in ascending `id` order, you cannot deadlock by definition — each transaction is ahead of or behind every other by lock order.
+1. **Order operations by primary key.** Use the same order for all relevant rows and lock modes. This mitigates cycles; triggers, other tables, indexes and lock upgrades can introduce additional dependencies.
 2. **Use `SELECT ... FOR UPDATE` early in the transaction**, not mid-way. Acquiring the locks you'll need upfront makes the lock order explicit.
-3. **Short transactions.** Long transactions hold locks longer; longer hold = bigger window for conflicts.
-4. **Retry on deadlock and serialization failure.** These are signals, not crashes — catch and retry the complete transaction with jitter. Dramatiq / Celery workers should already do this; HTTP handlers should do it once per request.
+3. **Keep transactions short.** Long transactions hold locks longer; longer hold = bigger window for conflicts.
+4. **Retry on deadlock and serialization failure.** These are signals, not crashes — catch and retry the complete transaction with jitter. Bound attempts and backoff by the request deadline. Replay only database work: do not send emails or charge an external API inside a retryable operation.
 
 ```python
 import asyncio
@@ -623,7 +789,14 @@ from sqlalchemy.exc import DBAPIError
 RETRYABLE_TRANSACTION_SQLSTATES = {"40P01", "40001"}
 
 
-async def with_transaction_retry(session_factory, operation, *, max_attempts=3):
+async def with_transaction_retry(session_factory, operation, *, max_attempts=3, timeout=2.0):
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    async with asyncio.timeout(timeout):
+        return await _retry_attempts(session_factory, operation, max_attempts)
+
+
+async def _retry_attempts(session_factory, operation, max_attempts):
     for attempt in range(max_attempts):
         try:
             # Each attempt gets a fresh session and transaction, so rollback/close
@@ -660,7 +833,7 @@ SELECT pid, state, wait_event_type, wait_event, query
  WHERE state = 'active' AND wait_event_type = 'Lock';
 ```
 
-**Lock escalation note:** unlike some databases, PostgreSQL does **not** escalate row locks to table locks. Every locked row is locked individually. That eliminates one class of surprises but means a `DELETE` touching millions of rows holds millions of row locks — still a problem, just a different one (`maintenance_work_mem`, `ShareUpdateExclusiveLock` contention with autovacuum).
+**Lock escalation note:** unlike some databases, PostgreSQL does **not** escalate row locks to table locks. Every locked row is locked individually. That eliminates one class of surprises but means a `DELETE` touching millions of rows holds millions of row locks — still a problem, through WAL volume, dead tuples, conflicts with concurrent row writers and long snapshots delaying vacuum cleanup. Row lock information lives in tuple headers, not one heavyweight memory lock per row; DELETE's RowExclusiveLock is compatible with autovacuum's ShareUpdateExclusiveLock. [PostgreSQL locks](https://www.postgresql.org/docs/current/explicit-locking.html).
 
 ---
 
@@ -741,6 +914,9 @@ else:
 
 ### Common Commands
 
+These command excerpts require an initialized project and disposable database. Production rollout,
+review and recovery belong to [Alembic](06_alembic.md); downgrade can delete schema/data.
+
 ```bash
 # Create a migration from model changes
 alembic revision --autogenerate -m "add users table"
@@ -770,8 +946,10 @@ Alembic autogenerate detects:
 | Table additions/removals | Table renames |
 | Column additions/removals | Column renames |
 | Nullable changes | Enum value changes |
-| Index and unique constraint changes | Changes to CHECK constraints |
+| Index and unique constraint changes | CHECK changes without the version-specific opt-in plugin |
 | Foreign key changes | Custom SQL functions or triggers |
+
+Named CHECK comparison is opt-in through Alembic 1.19.2+ `checkconstraint_byname`; see the canonical [autogenerate configuration](06_alembic.md). Type comparison defaults to enabled since Alembic 1.12.
 
 **Always review generated migrations before running them.** Autogenerate is a starting point, not a finished product.
 
@@ -795,8 +973,8 @@ def upgrade() -> None:
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("email", sa.String(255), nullable=False, unique=True),
         sa.Column("name", sa.String(100), nullable=False),
-        sa.Column("is_active", sa.Boolean(), server_default=sa.text("true")),
-        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now()),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
     )
     op.create_index("ix_users_email", "users", ["email"])
 
@@ -827,8 +1005,7 @@ class UserRepository:
     async def create(self, email: str, name: str) -> User:
         user = User(email=email, name=name)
         self.session.add(user)
-        await self.session.commit()
-        await self.session.refresh(user)
+        await self.session.flush()
         return user
 
     async def get_by_id(self, user_id: int) -> User | None:
@@ -885,214 +1062,73 @@ async def get_user(user_id: int, repo: UserRepository = Depends(get_user_repo)):
     return user
 ```
 
-### Bulk Operations
+### Bound bulk input and result memory
 
-**Bulk insert with `add_all`:**
-
-```python
-async def bulk_create_users(db: AsyncSession, users_data: list[dict]) -> list[User]:
-    users = [User(**data) for data in users_data]
-    db.add_all(users)
-    await db.commit()
-    for user in users:
-        await db.refresh(user)
-    return users
-```
-
-**High-performance bulk insert — skip the ORM for thousands of rows:**
+`add_all` retains ORM objects and is appropriate when object events or relationships matter.
+For ordinary dictionaries, ORM bulk `execute(insert(User), rows)` avoids constructing each object.
+The service still owns commit. This excerpt consumes an iterable in batches of 500; unlike
+`insert(User).values(all_rows)`, it does not intentionally render the entire import as one huge
+VALUES statement. Tune batch size against row width, driver limits and memory.
 
 ```python
+from itertools import islice
 from sqlalchemy import insert
 
-async def bulk_insert_users(db: AsyncSession, users_data: list[dict]) -> None:
-    stmt = insert(User).values(users_data)
-    await db.execute(stmt)
-    await db.commit()
+async def bulk_insert_users(db: AsyncSession, users_data) -> int:
+    source = iter(users_data)
+    total = 0
+    while batch := list(islice(source, 500)):
+        await db.execute(insert(User), batch)
+        total += len(batch)
+    return total
 ```
 
-**`insert().values()` is dramatically faster** for large datasets because it bypasses ORM overhead (identity map tracking, event hooks, etc.).
+One outer transaction makes all batches atomic but holds a connection and transaction throughout.
+For resumable imports, commit each bounded batch through a separate service transaction and persist
+a checkpoint; then partial progress is intentional. Compare methods using the same constraints,
+rows, return values and transaction count; refresh-per-object and inserts returning nothing do
+not perform equivalent work. [ORM bulk DML](https://docs.sqlalchemy.org/en/20/orm/queryguide/dml.html).
 
-| Method | 10k rows (approx.) | Use case |
-|--------|-------------------|----------|
-| `add()` in a loop | ~5-10s | Need ORM events and relationships |
-| `add_all()` | ~3-5s | Batch of ORM objects |
-| `insert().values()` | ~0.1-0.3s | Raw speed, no ORM features needed |
-
-### Eager vs Lazy Loading in Async
-
-Async SQLAlchemy does not support implicit lazy loading. You have three strategies:
-
-**1. `selectinload` — separate SELECT with IN clause (recommended default)**
+`execute()` produces a buffered result: calling `.all()` materializes it. For a large read, use
+an explicit bounded SQL query or streaming and close the cursor even on cancellation:
 
 ```python
-stmt = select(User).options(selectinload(User.posts))
+async def consume_users(db: AsyncSession, consume):
+    result = await db.stream_scalars(select(User).execution_options(yield_per=500))
+    try:
+        async for batch in result.partitions(500):
+            await consume(batch)
+    finally:
+        await result.close()
 ```
 
-Produces:
+Streaming keeps its connection checked out while the consumer runs. Slow external work can turn a
+memory optimization into pool starvation; use bounded pages and release the transaction between
+pages when a stable snapshot is unnecessary. Do not combine collection joined eager loading and
+`yield_per`; its deduplication requires retaining global identity state.
 
-```sql
-SELECT * FROM users WHERE ...;
-SELECT * FROM posts WHERE author_id IN (1, 2, 3, ...);
-```
-
-Good for: one-to-many, many-to-many. Predictable query count: always 2 queries.
-
-**2. `joinedload` — single query with JOIN**
-
-```python
-stmt = select(User).options(joinedload(User.posts))
-```
-
-Produces:
-
-```sql
-SELECT * FROM users JOIN posts ON posts.author_id = users.id WHERE ...;
-```
-
-Good for: many-to-one, one-to-one. Be careful with one-to-many — the JOIN multiplies rows and can return duplicates.
-
-**3. `subqueryload` — separate SELECT with subquery**
-
-```python
-stmt = select(User).options(subqueryload(User.posts))
-```
-
-Good for: complex filters on the parent query. Rarely needed — prefer `selectinload`.
-
-**Comparison:**
-
-| Strategy | Queries | Best for | Pitfall |
-|----------|---------|----------|---------|
-| `selectinload` | 2 | One-to-many, many-to-many | Large IN clause with many IDs |
-| `joinedload` | 1 | Many-to-one, one-to-one | Row multiplication on collections |
-| `subqueryload` | 2 | Complex parent filters | Slower than selectinload in most cases |
-| `lazy="raise"` | 0 | Preventing accidental loads | Must always specify eager strategy |
 
 ---
 
-## 9. Connection Pooling
+## 9. A transaction borrows capacity until it ends
 
-### How the Pool Works
+Creating a session does not check out a connection. The first SQL does; commit/rollback returns
+it, even if the session object continues to exist. A service with two writes holds the same
+checkout through both. Different tasks need different sessions, and may wait for the same pool.
 
-```
-Request arrives
-  → session = async_session()
-  → session executes a statement
-  → pool checks out a connection
-  → SQL runs
-  → session.close() / context manager exit
-  → connection returned to pool
+```text
+Alice: begin → INSERT user → INSERT post fails → rollback → return connection
+Bob:   begin → waits for checkout ----------------------→ INSERT → commit → return
 ```
 
-Connections are not tied to sessions until a statement is actually executed.
-
-### Configuration
-
-```python
-engine = create_async_engine(
-    DATABASE_URL,
-    pool_size=5,          # steady-state connections
-    max_overflow=10,      # burst connections (total max = pool_size + max_overflow)
-    pool_timeout=30,      # seconds to wait for a connection before raising
-    pool_pre_ping=True,   # test connection liveness before checkout
-    pool_recycle=3600,    # recreate connections after N seconds
-)
-```
-
-### What Each Setting Does
-
-| Setting | Default | What it controls |
-|---------|---------|-----------------|
-| `pool_size` | 5 | Persistent connections held open |
-| `max_overflow` | 10 | Extra connections created under load |
-| `pool_timeout` | 30 | Max wait (seconds) when pool is exhausted |
-| `pool_pre_ping` | False | Sends a test query before using a connection |
-| `pool_recycle` | -1 | Recreate connections after N seconds (-1 = never) |
-
-### Sizing the Pool
-
-**Key formula:**
-
-```
-total_max_connections = pool_size + max_overflow
-```
-
-This must be less than your database's `max_connections` divided by the number of app instances.
-
-```
-Database max_connections = 100
-App instances (pods)     = 4
-Per-instance budget      = 100 / 4 = 25
-
-pool_size    = 5    (steady state)
-max_overflow = 15   (burst, total = 20, leaves headroom)
-```
-
-### Production Configurations
-
-**Low-traffic service:**
-
-```python
-create_async_engine(
-    url,
-    pool_size=3,
-    max_overflow=5,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-)
-```
-
-**Medium-traffic API:**
-
-```python
-create_async_engine(
-    url,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
-    pool_recycle=3600,
-)
-```
-
-**High-traffic service:**
-
-```python
-create_async_engine(
-    url,
-    pool_size=20,
-    max_overflow=30,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_timeout=10,  # fail fast under extreme load
-)
-```
-
-### `pool_pre_ping` — Why You Want It
-
-Without `pool_pre_ping`, a connection that was silently closed by the database (idle timeout, server restart, network blip) will cause your next query to fail.
-
-With `pool_pre_ping=True`, SQLAlchemy sends a lightweight `SELECT 1` before each checkout. If the connection is dead, it discards it and creates a new one.
-
-**Cost**: one extra round-trip per checkout.
-**Benefit**: eliminates stale connection errors in production.
-
-Always enable this unless you have a specific reason not to.
-
-### `pool_recycle` — When You Need It
-
-Some databases and proxies (MySQL with `wait_timeout`, PgBouncer, cloud SQL proxies) silently kill connections after a timeout. `pool_recycle` ensures connections are replaced before they hit that limit.
-
-```python
-# MySQL default wait_timeout = 28800 (8 hours)
-# Set recycle well under that
-pool_recycle=3600  # 1 hour
-```
-
----
+A pool limits simultaneous checked-out connections, not the number of sessions or asyncio tasks.
+Keep external HTTP calls outside database transactions to avoid occupying capacity while awaiting
+another service. [Connection pooling](05_connection_pooling.md) owns measured demand, fleet
+budgets, checkout timeouts, reliability boundaries and PgBouncer configuration.
 
 ## 10. Raw asyncpg — When to Skip the ORM
 
-asyncpg is the async PostgreSQL driver that SQLAlchemy uses under the hood. You can also use it **directly**, without SQLAlchemy. This gives you maximum performance at the cost of writing raw SQL.
+asyncpg is the async PostgreSQL driver that SQLAlchemy uses under the hood. You can also use it **directly**, without SQLAlchemy. This avoids ORM mapping work at the cost of writing raw SQL; it does not guarantee faster equivalent queries.
 
 ### When to Use Raw asyncpg vs SQLAlchemy
 
@@ -1103,9 +1139,15 @@ asyncpg is the async PostgreSQL driver that SQLAlchemy uses under the hood. You 
 | Migrations | Manual or separate tool | Alembic integration |
 | Relationships | Manual JOINs | `selectinload`, `joinedload` |
 | Data mapping | Returns `asyncpg.Record` (tuple-like) | Returns ORM objects with attributes |
-| Type safety | None (raw SQL) | Column types validated by ORM |
+| Input validation | Validate request values separately | Mapped annotations describe mapping, not general runtime validation |
 | Complexity | Low (just SQL) | Higher (sessions, models, identity map) |
 | Best for | Bulk operations, read-heavy APIs, performance-critical paths | CRUD apps, complex domain models, teams that prefer Python over SQL |
+
+A `Mapped[int]` declaration does not reject `Account(balance="bad")` at construction. Validate a
+request with Pydantic (for example a strict positive integer amount) before starting the transaction;
+PostgreSQL conversion and `CHECK (balance >= 0)` remain the durable backstop. A negative integer
+can pass Python assignment and then fail the database check at flush, requiring rollback. Neither
+ORM annotations nor raw-driver binding replace boundary validation.
 
 > **Rule of thumb**: Use SQLAlchemy for your application's main data layer. Drop to raw asyncpg for specific hot paths where ORM overhead is measurable — bulk inserts, reporting queries, or read-only endpoints that serve thousands of requests per second.
 
@@ -1119,7 +1161,7 @@ import asyncpg
 # Create a pool (do this once at startup, inside an async context)
 pool = await asyncpg.create_pool(
     dsn="postgresql://user:pass@localhost:5432/mydb",
-    min_size=5,      # minimum idle connections
+    min_size=5,      # initial connections; idle expiry can reduce the count
     max_size=20,     # maximum connections
     command_timeout=30,
 )
@@ -1259,14 +1301,17 @@ async def bulk_import(db: AsyncSession, records: list[tuple]):
         records=records,
         columns=["timestamp", "event_type", "payload"],
     )
-    await db.commit()
+    # Caller owns the enclosing transaction; commit/rollback with the other writes.
 ```
+
+The service invokes this helper inside `async with db.begin():`; COPY participates in that
+same checked-out connection transaction. Do not commit the unwrapped driver independently.
 
 ### asyncpg Pool Settings
 
 | Setting | Default | What it controls |
 |---------|---------|-----------------|
-| `min_size` | 10 | Minimum idle connections |
+| `min_size` | 10 | Initial pool connections; idle expiry can reduce the count |
 | `max_size` | 10 | Maximum total connections |
 | `max_inactive_connection_lifetime` | 300 | Seconds before idle connections are closed |
 | `command_timeout` | None | Default timeout for all queries |
@@ -1279,7 +1324,9 @@ async def bulk_import(db: AsyncSession, records: list[tuple]):
 
 ### Mistake 1: Lazy Loading in Async
 
-This is the most common async SQLAlchemy error.
+With a `lazy="select"` variant, attribute access attempts implicit I/O and can raise
+`MissingGreenlet`; the repository's `lazy="raise"` mapping instead rejects the access immediately
+with `InvalidRequestError`. Detached unloaded select relationships cannot load after close.
 
 ```python
 # ❌ WRONG — lazy loading triggers implicit I/O
@@ -1288,7 +1335,7 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
     user = await db.get(User, user_id)
     return {
         "name": user.name,
-        "posts": user.posts,  # MissingGreenlet or DetachedInstanceError
+        "posts": user.posts,  # InvalidRequestError with this mapping's lazy="raise"
     }
 ```
 
@@ -1392,7 +1439,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 ```
 
-Creating an engine per request means creating a connection pool per request. You lose all the benefits of pooling and leak connections.
+Creating an engine per request loses reuse and adds connection churn. Cleanup above disposes it; missing cleanup can additionally leak resources.
 
 ### Mistake 6: N+1 Query Problem
 
@@ -1407,7 +1454,7 @@ for user in users:
 ```
 
 ```python
-# ✅ CORRECT — 2 queries total
+# ✅ CORRECT — 2 queries for a small one-level parent batch
 stmt = select(User).options(selectinload(User.posts))
 users = (await db.execute(stmt)).scalars().all()
 for user in users:

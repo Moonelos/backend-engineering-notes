@@ -4,7 +4,7 @@
 
 > **Who this is for**: Backend engineers who already use PostgreSQL connections and need to size, operate, and debug application and proxy pools.
 
-> **Why pooling matters**: Opening a PostgreSQL connection takes ~5-50ms and consumes ~5-10MB of server memory. Without a pool, every request would pay this cost and your database would run out of connections under load.
+> **Why pooling matters**: Opening a PostgreSQL connection requires network/authentication work and allocates a server backend; measure its cost in your deployment. Without a pool, every request would pay this cost and your database would run out of connections under load.
 
 > **Key insight**: A pool reuses connections but does not create database capacity; every application and proxy layer must fit inside the same server-side connection budget.
 
@@ -12,18 +12,18 @@
 
 ## 1. What Is a Connection Pool?
 
-A connection pool is a cache of pre-opened database connections. When your code needs a connection, it borrows one from the pool. When done, it returns it — the connection stays open for the next request.
+A connection pool retains database connections created on demand. When your code needs a connection, it borrows one from the pool. When done, it returns it — the connection stays open for the next request.
 
 ```
 Without pool:
-  Request → open connection (5-50ms) → query → close connection → repeat
+  Request → open/authenticate connection → query → close connection → repeat
 
 With pool:
-  App start → open 5 connections → keep them
-  Request → borrow connection (0ms) → query → return to pool → repeat
+  App start → zero connections; first concurrent SQL creates up to the configured capacity
+  Request → borrow available connection or wait → query → return to pool → repeat
 ```
 
-The pool is the single most important performance optimization for database-backed applications.
+Reuse reduces repeated connection setup; query plans and transaction duration still determine useful throughput.
 
 ---
 
@@ -49,7 +49,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 engine = create_async_engine(
     DATABASE_URL,
     # Pool size
-    pool_size=10,          # connections kept open always (steady state)
+    pool_size=10,          # maximum retained idle capacity (created lazily)
     max_overflow=20,       # extra connections created under load
                            # total max = pool_size + max_overflow = 30
     # Timeouts
@@ -66,7 +66,7 @@ engine = create_async_engine(
 
 #### `pool_size`
 
-The number of connections held open at all times. Even with no traffic, the pool keeps `pool_size` connections open.
+The maximum retained idle capacity, populated by demand. A workload that only uses one connection at a time may never create five. It is not a preopened minimum.
 
 ```
 pool_size=5 means:
@@ -82,9 +82,9 @@ Additional connections created when all `pool_size` connections are checked out.
 
 ```
 pool_size=5, max_overflow=10:
-  Connections 1-5: from pool_size (permanent, never closed unless recycled)
+  Connections 1-5: retained capacity (can be invalidated, recycled or disposed)
   Connections 6-15: overflow (created on demand, closed when returned)
-  Connection 16+: caller blocks until pool_timeout, then TimeoutError
+  Connection 16+: async caller awaits capacity until pool_timeout, then TimeoutError
 ```
 
 #### `pool_timeout`
@@ -111,20 +111,15 @@ With pre_ping:
   Stale connection detected → discarded → fresh connection used → query succeeds
 ```
 
-Cost: one extra round-trip per checkout (~0.1ms). Worth it for any production deployment.
+Cost: a liveness round trip, whose latency depends on topology. It handles stale connections at checkout; it cannot recover an already checked-out transaction lost during SQL. Roll back/close after that failure and retry only a replayable whole transaction.
 
 #### `pool_recycle`
 
-Connections are forcibly closed and recreated after this many seconds. Needed for:
-- Cloud SQL proxies that kill long-lived connections
-- PgBouncer session mode (if idle connections time out)
-- Any database with a `idle_in_transaction_session_timeout`
-
-```python
-pool_recycle=1800   # 30 minutes — good default
-pool_recycle=3600   # 1 hour
-pool_recycle=-1     # never recycle (default — dangerous in some environments)
-```
+Connections older than this age are replaced on their **next checkout**. No timer kills an
+active query. Choose an age below a known connection-age policy when that policy warrants it;
+`pool_recycle=-1` disables age recycling. It does not cure idle-in-transaction leaks or cancel
+long queries: statement/lock/idle-transaction timeouts address different boundaries.
+[Pool reliability](https://docs.sqlalchemy.org/en/20/core/pooling.html).
 
 ---
 
@@ -134,91 +129,118 @@ Getting pool size wrong causes two failure modes:
 - **Too small**: requests queue up waiting for connections → high latency
 - **Too large**: exhausts database `max_connections` → connections refused
 
-### The Formula
+### First establish the fleet ceiling
 
-```
-max_connections (PostgreSQL) = pool_size + max_overflow
-total_connections_used       = per_instance_max × number_of_app_instances
+Each engine has a pool **per process**. Four pods with two worker processes have eight pools,
+and rolling deployment can temporarily add more. Include all engines, background workers,
+admin/monitoring clients and reserved server slots before assigning the application budget.
 
-total_connections_used < max_connections × 0.9  (leave 10% headroom)
-```
-
-### Step-by-Step Calculation
-
-**Step 1**: Check your PostgreSQL `max_connections`:
-
-```sql
-SHOW max_connections;  -- default: 100
+```text
+PostgreSQL max_connections = 100
+Reserved/admin/other clients = 20
+Maximum live pods (including rollout) = 5
+Worker processes per pod = 2
+Application budget = 80 / (5 × 2) = 8 per process
+pool_size=6, max_overflow=2 → maximum fleet demand=10 × 8=80
 ```
 
-**Step 2**: Reserve connections for monitoring and admin:
+This is a ceiling, not evidence that eight simultaneous queries improve throughput. If replicas
+increase to eight pods, the same configuration allows 128 app connections and exceeds the budget.
+Reduce per-process maximum to five or change the server/proxy budget before that rollout.
+`SHOW max_connections;` supplies the server limit; inspect reserved-slot policy separately.
 
-```
-Reserved = 5-10 connections (psql access, monitoring agents, etc.)
-Available = 100 - 10 = 90
-```
+### Then measure how many checkouts the workload needs
 
-**Step 3**: Divide by number of app instances:
+Suppose a process completes 100 database units per second and their mean checkout hold time is
+40 ms. Mean occupied connections are approximately arrival rate × hold time = 100 × 0.040 = 4
+(Little's law for a stable workload). Hold time includes all SQL, lock waits and application gaps
+between first SQL and commit; it is not just query execution time. A tail of 400 ms transactions
+can still create queues even with this mean of four.
 
-```
-App instances (pods/workers) = 4
-Per-instance budget = 90 / 4 = 22 connections
-```
+Start a load test with six retained connections and two overflow, within the fleet ceiling above.
+Increase arrival rate to the expected peak and include the slower transaction mix. Record request
+p95/p99, checkout wait p95/p99, hold time, timeout count, PostgreSQL CPU/I/O/lock waits and successful
+throughput. For this example accept p95 request latency <200 ms, checkout p95 <20 ms and fewer than
+0.1% pool timeouts; these are stated service objectives, not universal defaults. Test the maximum
+live fleet, not one worker multiplied from a quiet benchmark.
 
-**Step 4**: Set pool_size and max_overflow:
+If hold time is 40 ms and wait grows while DB CPU remains low, investigate leaks, transaction gaps
+and capacity. If adding connections increases CPU saturation and query latency without throughput,
+the database is already constrained: reduce query cost/admitted concurrency instead. Choose the
+smallest configuration meeting the objectives, repeat the burst/recovery phase, and preserve
+headroom for rollout. Raising overflow adds server pressure and hides queues temporarily.
+
+### Measure acquisition separately from checkout hold time
+
+This excerpt instruments a particular QueuePool-family engine. The timer around `connect()`
+includes queue wait, connection setup and pre-ping; the event interval measures checked-out time.
+Use a histogram exporter in place of `print` and avoid logging SQL or credentials. SQLAlchemy async
+sessions autobegin on first SQL, so trace that acquisition boundary separately when using sessions.
 
 ```python
-pool_size=5      # steady state (comfortable idle)
-max_overflow=15  # burst capacity (total = 20, under the budget of 22)
+from time import monotonic
+from sqlalchemy import event, text
+
+@event.listens_for(engine.sync_engine, "checkout")
+def mark_checkout(dbapi_connection, record, proxy):
+    record.info["checked_out_at"] = monotonic()
+
+@event.listens_for(engine.sync_engine, "checkin")
+def mark_checkin(dbapi_connection, record):
+    started = record.info.pop("checked_out_at", None)
+    if started is not None:
+        print("hold_seconds", monotonic() - started)
+
+async def measured_query():
+    started = monotonic()
+    async with engine.connect() as connection:
+        print("acquire_seconds", monotonic() - started)
+        await connection.execute(text("SELECT 1"))
 ```
 
-### Environment Profiles
+### A reproducible one-connection queue and recovery
 
-**Development (local):**
+With the dependencies from [04](04_async_sqlalchemy.md), save the following as `pool_queue.py`
+and run `python pool_queue.py`. A temporary SQLite file isolates pool scheduling from PostgreSQL
+query tuning; it proves timeout and return behavior, not a production sizing result.
 
 ```python
-create_async_engine(url, pool_size=2, max_overflow=3, pool_pre_ping=True)
+import asyncio
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError
+from sqlalchemy.ext.asyncio import create_async_engine
+
+async def main():
+    with TemporaryDirectory() as directory:
+        database = Path(directory) / "queue.db"
+        engine = create_async_engine(
+            f"sqlite+aiosqlite:///{database}",
+            pool_size=1, max_overflow=0, pool_timeout=0.05,
+        )
+        try:
+            async with engine.connect() as first:
+                await first.execute(text("SELECT 1"))
+                try:
+                    async with engine.connect():
+                        raise AssertionError("second checkout unexpectedly succeeded")
+                except TimeoutError:
+                    print("second checkout timed out")
+            async with engine.connect() as recovered:
+                print("recovered", await recovered.scalar(text("SELECT 1")))
+        finally:
+            await engine.dispose()
+
+asyncio.run(main())
+# second checkout timed out
+# recovered 1
 ```
 
-**Low-traffic service (1-2 instances):**
-
-```python
-create_async_engine(
-    url,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-)
-```
-
-**Standard API (4-8 instances, DB max_connections=100):**
-
-```python
-# Per instance: 100 / 4 instances = 25 max, use 20 for safety
-create_async_engine(
-    url,
-    pool_size=10,
-    max_overflow=10,
-    pool_pre_ping=True,
-    pool_recycle=3600,
-    pool_timeout=30,
-)
-```
-
-**High-traffic API (10+ instances, DB max_connections=500):**
-
-```python
-# Per instance: 500 / 10 = 50, use 40 for safety
-create_async_engine(
-    url,
-    pool_size=15,
-    max_overflow=25,
-    pool_pre_ping=True,
-    pool_recycle=1800,
-    pool_timeout=10,  # fail fast under extreme load
-)
-```
+The timeout rejects the waiting borrower; it does not cancel the first transaction. Returning the
+first checkout restores capacity, so the next request succeeds. More asyncio tasks can wait
+concurrently without adding connections. Bound admitted work and choose pool_timeout inside the
+request deadline, leaving time for error handling; immediate repeated retries amplify overload.
 
 ### Kubernetes Considerations
 
@@ -263,7 +285,7 @@ With PgBouncer:    10 PostgreSQL connections
 | Mode | How it works | Connection overhead | Use case |
 |------|-------------|-------------------|----------|
 | **Transaction** (recommended) | Server connection assigned per transaction | Lowest — reuses aggressively | Most web apps |
-| **Session** | Server connection held for client's lifetime | Moderate | Apps using session-scoped features (advisory locks, SET LOCAL) |
+| **Session** | Server connection held for client's lifetime | Moderate | Apps using session-scoped features (advisory locks, SET SESSION) |
 | **Statement** | Server connection per statement | Lowest overhead | Read-only apps only — no multi-statement transactions |
 
 **Transaction mode** is almost always the right choice. It means 100+ app connections can share 10-20 PostgreSQL connections, as long as they're not all in a transaction simultaneously.
@@ -299,16 +321,16 @@ from sqlalchemy.pool import NullPool
 DATABASE_URL = "postgresql+asyncpg://user:pass@pgbouncer-host:6432/mydb"
 
 # With PgBouncer transaction mode, make two measured choices:
-#   1. Don't double-pool: let PgBouncer be the pool (NullPool, or a tiny QueuePool).
+#   1. Don't double-pool: let PgBouncer be the pool (NullPool, or a small async client pool).
 #   2. Match prepared-statement behavior to PgBouncer's max_prepared_statements setting.
 engine = create_async_engine(
     DATABASE_URL,
     poolclass=NullPool,                       # no internal pool — PgBouncer pools instead
-    connect_args={"statement_cache_size": 0}, # conservative for an unconfigured/older proxy
+    connect_args={"statement_cache_size": 0}, # does not eliminate dialect prepare calls; verify the topology
 )
 
-# Note: NullPool and pool_size/max_overflow are mutually exclusive — NullPool ignores
-# size args. If you prefer a tiny pool instead of NullPool, drop poolclass and use:
+# Note: NullPool and pool_size/max_overflow are mutually exclusive — NullPool rejects
+# size args, so remove them. If you prefer a tiny pool instead of NullPool, drop poolclass and use:
 #     pool_size=2, max_overflow=5, pool_pre_ping=True
 # and verify pool wait/client-connection cost before choosing either topology.
 ```
@@ -340,24 +362,27 @@ In transaction mode, behavior depends on whether state is transaction-local or s
 For prepared statements with asyncpg through PgBouncer:
 
 ```python
-# Conservative option for an older or unconfigured PgBouncer: disable both caches.
+# Cache-control excerpt, not a guarantee of compatibility with an older proxy: SQLAlchemy
+# still calls asyncpg prepare even when its prepared-statement cache is disabled.
 engine = create_async_engine(
     DATABASE_URL + "?prepared_statement_cache_size=0",  # asyncpg dialect DBAPI option
     connect_args={"statement_cache_size": 0},     # asyncpg-level
 )
 ```
 
-Current PgBouncer can track protocol-level named prepared statements when
-`max_prepared_statements` is nonzero. If that feature is enabled, keep caching and use unique
-statement names as required by the SQLAlchemy asyncpg dialect. Verify with repeated transactions
+[PgBouncer](https://www.pgbouncer.org/features.html) can track protocol-level named prepared statements when
+`max_prepared_statements` is nonzero. If that feature is enabled, test caching and statement naming with the SQLAlchemy asyncpg dialect.
+The dialect documents dynamic names and server cleanup requirements; disabling caches alone does
+not remove prepare calls or guarantee compatibility with an unconfigured proxy. Verify with repeated transactions
 through PgBouncer; success is stable execution without `DuplicatePreparedStatementError` or
 `InvalidSQLStatementNameError` after connections are reassigned.
 
-For psycopg3:
+For psycopg3, select its dialect explicitly; `prepare_threshold` is not an asyncpg argument:
 
 ```python
+PSYCOPG_URL = "postgresql+psycopg://user:pass@pgbouncer-host:6432/mydb"
 engine = create_async_engine(
-    DATABASE_URL,
+    PSYCOPG_URL,
     connect_args={"prepare_threshold": None},  # disable auto-prepare
 )
 ```
@@ -371,28 +396,34 @@ asyncpg has its own pool, independent of SQLAlchemy. Use this when you're using 
 ```python
 import asyncpg
 
+# Excerpt: define setup_connection below before constructing this pool.
 pool = await asyncpg.create_pool(
     dsn="postgresql://user:pass@localhost:5432/mydb",
-    min_size=5,                          # always keep this many connections open
+    min_size=5,                          # initial connections; expiry can reduce idle count
     max_size=20,                         # never more than this
     max_inactive_connection_lifetime=300, # close idle connections after 5 min
     command_timeout=30,                  # default timeout for all queries
     max_queries=50000,                   # recycle connection after N queries
-    setup=setup_connection,              # called on each new connection
+    setup=setup_connection,              # called on each acquisition
 )
 ```
 
 ### Per-Connection Setup Hook
 
-Use the `setup` parameter to configure each connection when it's created:
+`init` runs once when a connection is created; `setup` runs on each acquisition. [asyncpg pool lifecycle](https://magicstack.github.io/asyncpg/current/api/index.html#connection-pools). Release resets
+session settings, so reapply them in setup. Register codecs in init:
 
 ```python
+import json
+
 async def setup_connection(conn):
     # Set default timezone
     await conn.execute("SET TIME ZONE 'UTC'")
     # Set statement timeout
     await conn.execute("SET statement_timeout = '30s'")
-    # Register custom type codecs
+
+async def init_connection(conn):
+    # Codec registration belongs to connection creation.
     await conn.set_type_codec(
         "jsonb",
         encoder=json.dumps,
@@ -400,7 +431,7 @@ async def setup_connection(conn):
         schema="pg_catalog",
     )
 
-pool = await asyncpg.create_pool(dsn=DSN, setup=setup_connection)
+pool = await asyncpg.create_pool(dsn=DSN, init=init_connection, setup=setup_connection)
 ```
 
 ---
@@ -434,6 +465,9 @@ def on_invalidate(dbapi_conn, connection_record, exception):
 ```
 
 ### Pool Status
+
+The status methods below apply to QueuePool and AsyncAdaptedQueuePool; NullPool has no
+retained-size/checked-out API. Pool event callbacks on an async engine use its `sync_engine`.
 
 ```python
 # Get pool statistics
@@ -542,7 +576,7 @@ When the server cancels a statement at this boundary, asyncpg surfaces SQLSTATE 
 
 **Cause**: Cloud databases (RDS, Cloud SQL) and proxies silently close idle connections after a timeout.
 
-**Fix**: `pool_pre_ping=True` — always.
+**Fix**: enable checkout pre-ping when stale idle connections are a risk. A disconnect during an active transaction still needs rollback and whole-operation recovery.
 
 ### Connection Leak
 
@@ -594,11 +628,15 @@ Always set timeouts to prevent slow queries from holding connections and blockin
 
 ### PostgreSQL Statement Timeout
 
+These excerpts use `postgresql+asyncpg://`. asyncpg accepts `server_settings`, not libpq
+`options`; the latter belongs to a separately configured `postgresql+psycopg://` engine.
+A server statement cancellation yields SQLSTATE `57014`; rollback before reusing its transaction.
+
 ```python
 # Set per-connection at creation time
 engine = create_async_engine(
     DATABASE_URL,
-    connect_args={"options": "-c statement_timeout=30000"},  # 30 seconds (ms)
+    connect_args={"server_settings": {"statement_timeout": "30000"}},  # asyncpg: ms
 )
 
 # Set per-query via SQL
@@ -614,7 +652,7 @@ Prevent queries from waiting indefinitely for a lock:
 ```python
 engine = create_async_engine(
     DATABASE_URL,
-    connect_args={"options": "-c lock_timeout=5000"},  # 5 seconds
+    connect_args={"server_settings": {"lock_timeout": "5000"}},  # asyncpg: ms
 )
 ```
 
@@ -625,7 +663,7 @@ Prevent transactions from staying open indefinitely (a common connection leak so
 ```python
 engine = create_async_engine(
     DATABASE_URL,
-    connect_args={"options": "-c idle_in_transaction_session_timeout=60000"},  # 60s
+    connect_args={"server_settings": {"idle_in_transaction_session_timeout": "60000"}},
 )
 ```
 
@@ -647,15 +685,15 @@ row = await pool.fetchrow("SELECT * FROM users WHERE id = $1", user_id, timeout=
 
 ```
 Pool Configuration:
-  ✅ pool_pre_ping=True — always, prevents stale connection errors
-  ✅ pool_size + max_overflow < DB max_connections / num_instances
-  ✅ pool_recycle set if using cloud DB, PgBouncer, or proxies
+  ✅ pool_pre_ping evaluated for stale checkouts; in-flight failures still need rollback
+  ✅ All process pools × maximum live fleet fit the available server/client budgets
+  ✅ pool_recycle selected for a known connection-age policy; replaces only at checkout
   ✅ pool_timeout set (prefer fast failure over long queues)
   ✅ statement_timeout set — prevents runaway queries
 
 Code Patterns:
   ✅ Always use context managers for sessions (async with async_session() as s)
-  ✅ One session per request, never shared between requests
+  ✅ One session per concurrent task, including tasks inside one request
   ✅ Engine created once at module level, never per-request
   ✅ engine.dispose() called on shutdown (lifespan context manager)
 
@@ -667,6 +705,6 @@ Monitoring:
 
 PgBouncer (if used):
   ✅ Transaction mode (unless you use session-scoped features)
-  ✅ Prepared statement cache disabled in driver
-  ✅ SQLAlchemy pool minimized (NullPool or pool_size=1-2)
+  ✅ Prepared statements verified against the proxy version, tracking setting and dialect
+  ✅ App client pool and proxy server pool measured separately; budgets cover all DB/user pools
 ```

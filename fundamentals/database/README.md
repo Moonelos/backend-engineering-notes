@@ -1,6 +1,8 @@
 # Database
 
-> Everything you need to work with PostgreSQL in production Python backends — raw SQL, drivers, ORMs, async patterns, and connection pooling.
+> Learn PostgreSQL access in Python backends, from relational rows and transactions through drivers, ORMs, migrations, capacity, recovery and access controls.
+
+Assumed knowledge: basic Python and ordinary command-line use. SQL is taught in 01; async and FastAPI branches require the linked prerequisite lessons. Examples use PostgreSQL 15+ semantics, SQLAlchemy 2.x style, Psycopg 3 and asyncpg. Cluster installation, sharding, HA orchestration and provider-specific failover are outside this collection; production operation still requires tested recovery and access boundaries.
 
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15+-336791.svg?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0+-D71F00.svg)](https://www.sqlalchemy.org)
@@ -20,6 +22,9 @@
 | [05_connection_pooling.md](05_connection_pooling.md) | Connection Pooling | Pool sizing math, SQLAlchemy pool config, PgBouncer, asyncpg pool, failure modes |
 | [06_alembic.md](06_alembic.md) | Alembic Deep-Dive | Data migrations, enum handling, branching/merging, stamping, multi-DB, CI/CD, production deployment, lock-safe patterns |
 | [07_sqlmodel_decision_guide.md](07_sqlmodel_decision_guide.md) | SQLModel Decision Guide | Combined SQLAlchemy/Pydantic models, table vs data roles, and when direct SQLAlchemy is clearer |
+| [08_backup_and_recovery.md](08_backup_and_recovery.md) | Recovery | RPO/RTO, logical and physical backups, PITR, disposable restore rehearsal |
+| [09_postgresql_operations.md](09_postgresql_operations.md) | Operations | MVCC version retention, autovacuum, long transactions, statistics and replica freshness |
+| [10_database_access_security.md](10_database_access_security.md) | Access Security | Runtime versus migration authority, grants, future objects and verified driver TLS |
 
 ---
 
@@ -38,9 +43,9 @@ other abstraction.
 
 **Building a FastAPI app** → Read `03` for models, then `04` for async patterns, then `06` for migrations.
 
-**Performance / production concerns** → Read `05` for connection pooling, check the "raw asyncpg" section in `04`.
+**Performance / production concerns** → Read `05` for measured capacity and overload diagnosis, then `09` for maintenance and replica freshness. Before shipping, follow `06` → `08` → `10` for compatible changes, recovery rehearsal and access controls. Stop when you can explain a pool ceiling, diagnose a retained snapshot, restore a disposable database and verify runtime privileges and TLS.
 
-**Migration workflows** → Read `03` section 7 for basics, then `06` for the full deep-dive (data migrations, CI/CD, production safety).
+**Migration workflows** → Read `03` for mapping and transaction prerequisites, then `06` for setup, reviewed history, data changes, CI/CD and production rollout.
 
 **Something breaking** → Jump to "Common Mistakes" in `04`, "Failure Modes" in `05`, or "Troubleshooting" in `06`.
 
@@ -51,12 +56,12 @@ other abstraction.
 | Question | Answer |
 |----------|--------|
 | PostgreSQL or SQLite? | PostgreSQL for shared/concurrent services and PostgreSQL semantics; SQLite for bounded single-host, low-write, or test workloads |
-| Which async driver? | `asyncpg` (max perf) or `psycopg[async]` (versatile) |
+| Which async driver? | Choose asyncpg or Psycopg 3 for the needed APIs; benchmark equivalent workloads. Psycopg supports sync and async without an `async` extra. |
 | ORM or raw SQL? | SQLAlchemy ORM for app code; raw driver for bulk ops and hot paths |
-| Sync or async SQLAlchemy? | Async for FastAPI. Sync for scripts and CLIs. |
+| Sync or async SQLAlchemy? | Match the I/O stack. FastAPI supports sync endpoints/dependencies and async endpoints; blocking driver calls require a sync execution boundary. |
 | Async relationship loading? | Repository default: eager loading or `lazy="raise"` to expose hidden I/O; use `AsyncAttrs.awaitable_attrs` or explicit `refresh()` only when deliberate per-attribute I/O is clearer. |
-| `expire_on_commit`? | Always `False` for async sessions. |
-| Connection pool size? | `(DB max_connections × 0.9) / app_instances` — see `05` for full formula |
+| `expire_on_commit`? | This collection uses `False` for async response access; load/refresh deliberately when fresh state is required. |
+| Connection pool size? | Budget all live processes and pools plus deployment overlap, then measure checkout demand and waits; see `05`. |
 | PgBouncer? | Use it when you have many app instances and need to limit server connections |
 
 ---

@@ -65,6 +65,107 @@ of work. If the table setup is missing, the first statement fails with `no such 
 Async engines and sessions are a separate implementation path in
 [Async SQLAlchemy](04_async_sqlalchemy.md).
 
+### See add, flush, commit, and rollback as different transitions
+
+Continue the minimal SQLite program above **in the same process**, after its initial commit. Run this extension to observe a failed flush and recovery:
+
+```python
+from sqlalchemy import inspect, func
+from sqlalchemy.exc import IntegrityError
+
+with Session(engine) as session:
+    bob = User(email="bob@example.com")
+    print(inspect(bob).transient, bob.id)  # True None
+    session.add(bob)
+    print(inspect(bob).pending, bob.id)    # True None: no INSERT yet
+    session.flush()
+    print(inspect(bob).persistent, bob.id) # True 2: INSERT, still uncommitted
+    session.add(User(email="alice@example.com"))
+    try:
+        session.flush()                  # duplicate email; transaction fails
+    except IntegrityError:
+        session.rollback()               # undo Bob too; reset Session state
+    print(session.scalar(select(func.count()).select_from(User)))  # 1
+
+with Session(engine) as session:
+    alice1 = session.get(User, 1)
+    alice2 = session.get(User, 1)
+    print(alice1 is alice2)               # True: identity map
+```
+
+`add()` puts a new object in the pending set. `flush()` converts pending changes into SQL inside the current transaction and retrieves generated identifiers. It does not commit: another PostgreSQL connection cannot see that row yet, and rollback removes it even though Python already received an ID. Generated sequence IDs may have gaps after rollback; they are identities, not a count of successful transactions. A failed flush requires `session.rollback()` before the session can execute more work. Catching the exception does not reset transaction state.
+
+| State | Database action | Independent connection sees the new row? |
+|-------|-----------------|------------------------------------------|
+| Transient, before add | None | No |
+| Pending, after add | Queued in session | No |
+| Persistent after flush | INSERT executed inside transaction | No |
+| Committed | Commit makes the transaction durable | Yes, subject to reader snapshot |
+| Rolled back | Uncommitted writes discarded | No |
+| Detached after close | Session no longer manages instance | Only if previously committed |
+
+The identity map keeps one managed object per primary key in a session. It is not a cross-process cache: another session has different Python objects, and outside commits need an explicit refresh or expiration if the current object is stale. By default commit expires attributes; accessing them in an open sync session can SELECT again. After close, expired attributes cannot reload. Extract the response fields you need while the session is open, or intentionally use `expire_on_commit=False` and accept that retained values may be stale. [Session basics](https://docs.sqlalchemy.org/en/20/orm/session_basics.html).
+
+A normal query triggers **autoflush** first, so a new pending user can become visible to that transaction's query without an explicit flush call. With `autoflush=False`, a database query cannot find a still-pending row: flush explicitly before querying it. `commit()` flushes regardless of the autoflush setting. Temporarily use `session.no_autoflush` when assembling an object graph that is not yet valid; it postpones SQL, not constraint enforcement.
+
+### Let one business operation own the transaction
+
+Creating a user and their first post is one operation. If a user helper commits first and a post helper fails next, rollback cannot undo the first commit. Helpers should queue or flush work; their caller commits once. Here is a separate complete SQLite program (save as `atomic_user_post.py`):
+
+```python
+from sqlalchemy import CheckConstraint, ForeignKey, String, create_engine, event, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.exc import IntegrityError
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True)
+
+class Post(Base):
+    __tablename__ = "posts"
+    __table_args__ = (CheckConstraint("length(title) > 0", name="ck_post_title"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+
+engine = create_engine("sqlite+pysqlite:///:memory:")
+@event.listens_for(engine, "connect")
+def enable_foreign_keys(connection, record):
+    connection.execute("PRAGMA foreign_keys=ON")
+Base.metadata.create_all(engine)
+
+def add_user(session: Session, email: str) -> User:
+    user = User(email=email)
+    session.add(user)
+    session.flush()  # get id; caller still owns commit
+    return user
+
+def add_post(session: Session, user: User, title: str) -> None:
+    session.add(Post(author_id=user.id, title=title))
+
+for title in ("", "Hello"):
+    try:
+        with Session(engine) as session, session.begin():
+            user = add_user(session, "alice@example.com")
+            add_post(session, user, title)
+    except IntegrityError:
+        print("rolled back")
+    with Session(engine) as session:
+        print(session.scalar(select(func.count()).select_from(User)),
+              session.scalar(select(func.count()).select_from(Post)))
+# rolled back
+# 0 0
+# 1 1
+```
+
+The empty title fails when the transaction exit flushes, and the exception leaves the `begin()` context, which rolls back the earlier successful user INSERT. The second attempt commits both. Each loop iteration creates a fresh session, so no failed transaction state leaks into the retry. A Session is mutable transaction state: keep one owner per operation; do not share it between threads or concurrent tasks.
+
+**Transfer:** create two posts after flushing the user, with the second title empty. Neither post nor user persists because every flush belongs to the same outer transaction. If a helper commits after the first post, the user and first post survive the second failure. A savepoint can intentionally isolate a recoverable optional step, but creates a different business guarantee; teach it as a deliberate policy rather than silently swallowing failure.
+
 ### ORM Trade-offs
 
 | Benefit | Cost |
@@ -112,17 +213,62 @@ Async driver selection, `MissingGreenlet`, and explicit relationship loading bel
 
 ---
 
-## 3. SQLAlchemy 2.0 Declarative Style
+## 3. Sync SQLAlchemy — Engine and Session
+
+The lifecycle above works with a real PostgreSQL connection too. An installed psycopg3 driver needs the explicit `postgresql+psycopg://` scheme; bare `postgresql://` can select psycopg2 and fail with ModuleNotFoundError when only psycopg3 was installed. This configuration excerpt requires psycopg and a supplied DATABASE_URL. It uses the richer mapping reference below for later CRUD and loading snippets; finish that mapping before executing those snippets:
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+
+DATABASE_URL = "postgresql+psycopg://user:pass@localhost:5432/mydb"
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    echo=False,  # True logs SQL
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=True,  # queries flush pending changes; flush is still not commit
+    expire_on_commit=True,  # sync: True is fine (lazy reloads work)
+)
+```
+
+### Using Sync Sessions
+
+```python
+# Context manager (always use this)
+with SessionLocal() as session:
+    user = session.get(User, 1)
+    print(user.email)
+
+# Or manually
+session = SessionLocal()
+try:
+    user = session.get(User, 1)
+    session.commit()
+finally:
+    session.close()
+```
+
+## 4. SQLAlchemy 2.0 Declarative Style
 
 SQLAlchemy 2.0 (released 2023) introduced a cleaner, type-annotated style. Always use this for new projects.
 
 ### Defining Models
 
+This larger mapping is a separate program from the minimal examples: define a fresh Base and use its complete schema. Persisted creation times explicitly use `DateTime(timezone=True)` for PostgreSQL instants. Ordinary declarative `default=True` runs at INSERT/flush, so `User(...).is_active` is initially None unless the constructor supplies a value; after flush it is True. SQLite does not fully model PostgreSQL timezone storage; use PostgreSQL to verify aware datetime round trips.
+
 ```python
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
-from sqlalchemy import String, Text, ForeignKey, Numeric, func
+from sqlalchemy import String, Text, ForeignKey, Numeric, DateTime, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -138,11 +284,17 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(100))
     is_active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     # Relationships
-    posts: Mapped[list["Post"]] = relationship(back_populates="author", lazy="raise")
-    profile: Mapped[Optional["Profile"]] = relationship(back_populates="user", lazy="raise")
+    posts: Mapped[list["Post"]] = relationship(
+        back_populates="author", cascade="all, delete-orphan",
+        passive_deletes=True, lazy="raise",
+    )
+    profile: Mapped[Optional["Profile"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan",
+        passive_deletes=True, lazy="raise",
+    )
 
     def __repr__(self) -> str:
         return f"<User id={self.id} email={self.email}>"
@@ -156,11 +308,11 @@ class Post(Base):
     content: Mapped[str] = mapped_column(Text)
     published: Mapped[bool] = mapped_column(default=False)
     author_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     author: Mapped["User"] = relationship(back_populates="posts", lazy="raise")
     tags: Mapped[list["Tag"]] = relationship(
-        secondary="post_tags", back_populates="posts", lazy="raise"
+        secondary="post_tags", back_populates="posts", passive_deletes=True, lazy="raise"
     )
 
 
@@ -168,7 +320,7 @@ class Profile(Base):
     __tablename__ = "profiles"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
     bio: Mapped[Optional[str]] = mapped_column(Text)
     avatar_url: Mapped[Optional[str]] = mapped_column(String(500))
 
@@ -181,8 +333,8 @@ from sqlalchemy import Table, Column
 post_tags = Table(
     "post_tags",
     Base.metadata,
-    Column("post_id", ForeignKey("posts.id"), primary_key=True),
-    Column("tag_id", ForeignKey("tags.id"), primary_key=True),
+    Column("post_id", ForeignKey("posts.id", ondelete="CASCADE"), primary_key=True),
+    Column("tag_id", ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
 )
 
 
@@ -193,7 +345,7 @@ class Tag(Base):
     name: Mapped[str] = mapped_column(String(50), unique=True)
 
     posts: Mapped[list["Post"]] = relationship(
-        secondary="post_tags", back_populates="tags", lazy="raise"
+        secondary="post_tags", back_populates="tags", passive_deletes=True, lazy="raise"
     )
 ```
 
@@ -217,11 +369,11 @@ id: Mapped[int] = mapped_column(primary_key=True)
 # String with max length
 email: Mapped[str] = mapped_column(String(255))
 
-# Python-side default (evaluated when Python creates the object)
+# Python-side INSERT default (applied during flush if no value was supplied)
 is_active: Mapped[bool] = mapped_column(default=True)
 
 # Server-side default (SQL expression, evaluated when row is inserted)
-created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 # Unique constraint
 email: Mapped[str] = mapped_column(unique=True)
@@ -275,16 +427,21 @@ price: Mapped[Decimal] = mapped_column(Numeric(10, 2))
 ```python
 from sqlalchemy import UniqueConstraint, Index, text
 
+# Extension to the complete mapping above; define the referenced table too.
+class Team(Base):
+    __tablename__ = "teams"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+
 class Membership(Base):
     __tablename__ = "memberships"
     __table_args__ = (
         # Composite unique constraint
         UniqueConstraint("user_id", "team_id", name="uq_membership_user_team"),
-        # Partial index (wrap the predicate in text() — a bare string is
-        # deprecated in SQLAlchemy 2.0 and triggers a coercion warning)
+        # Partial index: represent the SQL predicate explicitly with text().
         Index("ix_active_memberships", "user_id", postgresql_where=text("is_active = TRUE")),
         # Multi-column index
-        Index("ix_posts_author_created", "author_id", "created_at"),
+        Index("ix_memberships_team_user", "team_id", "user_id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -295,7 +452,7 @@ class Membership(Base):
 
 ---
 
-## 4. Relationship Types
+## 5. Relationship Types
 
 ### One-to-Many
 
@@ -361,72 +518,21 @@ class Tag(Base):
 | `"dynamic"` | Returns a Query object (legacy; not supported on async) | ❌ Don't use |
 | `"write_only"` | Write-only relationship | ✅ For large collections |
 
-**For async: always use `lazy="raise"`** as the default. Load explicitly with `selectinload()` or `joinedload()` when needed.
+The mapping below deliberately uses `lazy="raise"` to expose unexpected I/O. In a synchronous session `lazy="select"` can issue SQL on access; under ordinary async attribute access that implicit I/O cannot be awaited. [04](04_async_sqlalchemy.md) owns the async loading choices. Load explicitly with `selectinload()` or `joinedload()` when needed.
 
-### Cascade Options
+### Coordinate ORM deletion with database deletion
 
-```python
-# Delete posts when user is deleted
-posts: Mapped[list["Post"]] = relationship(
-    back_populates="author",
-    cascade="all, delete-orphan",  # Python-side cascade
-    lazy="raise",
-)
+The complete model uses both `ForeignKey(..., ondelete="CASCADE")` and `relationship(cascade="all, delete-orphan", passive_deletes=True)`. These configure different actors. ORM delete cascade deletes loaded child objects when `session.delete(user)` is flushed. Database CASCADE deletes matching rows even when a raw SQL client deletes the parent. `passive_deletes=True` lets the database handle **unloaded** collections instead of loading them or assigning NULL to a required foreign key. It does not disable ORM work for loaded children.
 
-# Or at the DB level (more reliable)
-author_id: Mapped[int] = mapped_column(
-    ForeignKey("users.id", ondelete="CASCADE")
-)
-```
+Without ORM delete cascade, SQLAlchemy normally tries to detach child rows by setting their foreign keys to NULL, which violates this model's NOT NULL author_id. An ON DELETE clause alone does not prevent that ORM action. Profile uses the same coordinated policy; deleting posts also deletes association rows, but must not delete shared Tag objects. Bidirectional delete cascade across many-to-many relationships could traverse and delete an entire graph, so the association foreign keys cascade without cascading deletion of the tags themselves.
 
-`cascade="all, delete-orphan"` means: when you delete a User, SQLAlchemy will also delete all their Posts (via Python). Combined with `ON DELETE CASCADE` at the DB level, you get double protection.
+`delete-orphan` also marks a child deleted when it is removed from its owning collection. Use it when the child's lifetime belongs to exactly one parent. Soft deletion needs a different policy: changing a deleted flag is an UPDATE, so neither ORM delete cascade nor database ON DELETE fires. SQLite tests must enable foreign keys; PostgreSQL enforces them by default. [SQLAlchemy cascades](https://docs.sqlalchemy.org/en/20/orm/cascades.html).
 
 ---
 
-## 5. Sync SQLAlchemy — Engine and Session
-
-For scripts, background jobs, or services that don't need async:
-
-```python
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-
-DATABASE_URL = "postgresql://user:pass@localhost:5432/mydb"
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    echo=False,  # True logs SQL
-)
-
-SessionLocal = sessionmaker(
-    bind=engine,
-    autocommit=False,
-    autoflush=False,
-    expire_on_commit=True,  # sync: True is fine (lazy reloads work)
-)
-```
-
-### Using Sync Sessions
-
-```python
-# Context manager (always use this)
-with SessionLocal() as session:
-    user = session.get(User, 1)
-    print(user.email)
-
-# Or manually
-session = SessionLocal()
-try:
-    user = session.get(User, 1)
-    session.commit()
-finally:
-    session.close()
-```
-
 ### Sync CRUD
+
+These helpers participate in the caller's transaction and never commit it. A service calls them inside `with SessionLocal.begin() as session:`; one successful exit commits every change, and an exception rolls them all back. Returning an ORM object does not itself make it durable.
 
 ```python
 from typing import Optional
@@ -436,8 +542,7 @@ from sqlalchemy import select
 def create_user(session: Session, email: str, name: str) -> User:
     user = User(email=email, name=name)
     session.add(user)
-    session.commit()
-    session.refresh(user)
+    session.flush()  # retrieve generated values without ending the caller transaction
     return user
 
 # Read by primary key (checks identity map first)
@@ -460,7 +565,6 @@ def deactivate_user(session: Session, user_id: int) -> bool:
     if not user:
         return False
     user.is_active = False
-    session.commit()
     return True
 
 # Delete
@@ -469,7 +573,6 @@ def delete_user(session: Session, user_id: int) -> bool:
     if not user:
         return False
     session.delete(user)
-    session.commit()
     return True
 ```
 
@@ -478,7 +581,7 @@ def delete_user(session: Session, user_id: int) -> bool:
 ```python
 from sqlalchemy.orm import selectinload, joinedload
 
-# selectinload (2 queries, recommended for collections)
+# selectinload (one parent query plus batched child queries; two for this one-user case)
 def get_user_with_posts(session: Session, user_id: int) -> Optional[User]:
     stmt = (
         select(User)
@@ -543,362 +646,27 @@ session.commit()
 
 ---
 
-## 7. Alembic — Database Migrations
+## Migrations and application integration continue separately
 
-Alembic manages schema changes over time. It generates Python migration scripts that you can apply, roll back, and version control.
+`Base.metadata.create_all()` creates missing tables for the disposable examples; it does not evolve an existing deployed schema. [Alembic](06_alembic.md) owns versioned schema changes, autogenerate review, sync/async env.py, and safe nullable-column/backfill/constraint rollout. Keep named constraints and ensure every model module is imported before Alembic reads `Base.metadata`. CHECK comparison behavior depends on the Alembic version and opt-in extension; use the documented configuration in 06 rather than assuming every named CHECK is detected by default.
 
-### Setup
-
-```bash
-alembic init -t async alembic  # async template
-# or
-alembic init alembic           # sync template
-```
-
-This creates:
-
-```
-alembic/
-    env.py          ← configure DB connection and metadata
-    script.py.mako  ← migration file template
-    versions/       ← generated migration files
-alembic.ini         ← alembic configuration
-```
-
-### Configure `alembic.ini`
-
-```ini
-# alembic.ini
-# Leave sqlalchemy.url empty — we'll set it in env.py from app config
-sqlalchemy.url =
-```
-
-### Configure `env.py` (Sync)
-
-```python
-# alembic/env.py
-from logging.config import fileConfig
-from alembic import context
-from sqlalchemy import engine_from_config, pool
-
-from app.models import Base  # import all models so Alembic sees the metadata
-from app.config import settings
-
-config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
-
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-
-target_metadata = Base.metadata
-
-
-def run_migrations_offline() -> None:
-    context.configure(
-        url=settings.database_url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-    )
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-def run_migrations_online() -> None:
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
-    with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
-        with context.begin_transaction():
-            context.run_migrations()
-
-
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()
-```
-
-### Configure `env.py` (Async)
-
-```python
-# alembic/env.py — async version
-import asyncio
-from logging.config import fileConfig
-from alembic import context
-from sqlalchemy.ext.asyncio import create_async_engine
-
-from app.models import Base
-from app.config import settings
-
-config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
-
-target_metadata = Base.metadata
-
-
-def run_migrations_offline() -> None:
-    context.configure(
-        url=settings.database_url,
-        target_metadata=target_metadata,
-        literal_binds=True,
-    )
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-def do_run_migrations(connection):
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-async def run_async_migrations() -> None:
-    engine = create_async_engine(settings.database_url)
-    async with engine.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-    await engine.dispose()
-
-
-def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
-
-
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()
-```
-
-### Key Alembic Commands
-
-```bash
-# Generate a migration from model changes (autogenerate)
-alembic revision --autogenerate -m "add users and posts tables"
-
-# Apply all pending migrations
-alembic upgrade head
-
-# Apply one migration forward
-alembic upgrade +1
-
-# Roll back one migration
-alembic downgrade -1
-
-# Roll back to a specific revision
-alembic downgrade a1b2c3d4
-
-# Roll back everything
-alembic downgrade base
-
-# See current state
-alembic current
-
-# See migration history
-alembic history --verbose
-
-# Generate empty migration (for custom SQL)
-alembic revision -m "add full text search index"
-
-# Show the SQL Alembic would run, without running it
-alembic upgrade head --sql
-```
-
-### What a Migration Looks Like
-
-```python
-"""add users and posts tables
-
-Revision ID: a1b2c3d4e5f6
-Revises:
-Create Date: 2024-01-15
-"""
-from alembic import op
-import sqlalchemy as sa
-
-revision = "a1b2c3d4e5f6"
-down_revision = None  # None = first migration
-branch_labels = None
-depends_on = None
-
-
-def upgrade() -> None:
-    op.create_table(
-        "users",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("email", sa.String(255), nullable=False),
-        sa.Column("name", sa.String(100), nullable=False),
-        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
-        sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.func.now()),
-        sa.UniqueConstraint("email", name="uq_users_email"),
-    )
-    op.create_index("ix_users_email", "users", ["email"])
-
-    op.create_table(
-        "posts",
-        sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("title", sa.String(200), nullable=False),
-        sa.Column("content", sa.Text(), nullable=False),
-        sa.Column("published", sa.Boolean(), nullable=False, server_default=sa.text("false")),
-        sa.Column("author_id", sa.Integer(), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
-        sa.Column("created_at", sa.TIMESTAMP(timezone=True), server_default=sa.func.now()),
-    )
-    op.create_index("ix_posts_author_id", "posts", ["author_id"])
-
-
-def downgrade() -> None:
-    op.drop_index("ix_posts_author_id")
-    op.drop_table("posts")
-    op.drop_index("ix_users_email")
-    op.drop_table("users")
-```
-
-### Adding a Column to an Existing Table
-
-```python
-"""add last_login to users
-
-Revision ID: b2c3d4e5f6a7
-Revises: a1b2c3d4e5f6
-"""
-from alembic import op
-import sqlalchemy as sa
-
-revision = "b2c3d4e5f6a7"
-down_revision = "a1b2c3d4e5f6"
-
-
-def upgrade() -> None:
-    op.add_column("users", sa.Column(
-        "last_login",
-        sa.TIMESTAMP(timezone=True),
-        nullable=True,  # nullable so existing rows don't violate NOT NULL
-    ))
-
-
-def downgrade() -> None:
-    op.drop_column("users", "last_login")
-```
-
-### Autogenerate Limitations
-
-Alembic detects:
-
-| Detected | Not Detected |
-|----------|-------------|
-| Table additions/removals | Table renames |
-| Column additions/removals | Column renames |
-| Nullable changes | Enum value additions |
-| Index changes | Custom SQL functions/triggers |
-| FK changes | CHECK expression changes (named additions/removals are detected) |
-| Unique constraint changes | Sequence changes |
-
-**Always review autogenerated migrations before running.** They are a starting point, not a finished product.
-Explicitly named CHECK constraints can be detected when added or removed, but Alembic compares their
-names rather than proving two expressions are semantically equivalent.
-
-### Production Migration Strategy
-
-```bash
-# 1. Review the generated SQL before running in production
-alembic upgrade head --sql > migration_preview.sql
-
-# 2. Run with a transaction (Alembic wraps each migration in a transaction by default)
-alembic upgrade head
-
-# 3. For large tables: add columns as nullable first, backfill, then add NOT NULL
-# Step 1: nullable column (fast, no table rewrite)
-op.add_column("users", sa.Column("tier", sa.String(20), nullable=True))
-# Step 2: backfill (can run concurrently in production)
-op.execute("UPDATE users SET tier = 'free' WHERE tier IS NULL")
-# Step 3: add NOT NULL constraint
-op.alter_column("users", "tier", nullable=False)
-```
+[Async SQLAlchemy](04_async_sqlalchemy.md) owns the FastAPI lifespan, async session dependency, and async repository integration. For a synchronous application, keep one engine/session factory in `database.py`, mappings in `models/`, and transaction-owning business operations outside reusable CRUD helpers. Importing a model module registers its Table in metadata; a model that has never been imported cannot appear in autogenerate's comparison. Migration implementation remains a separate learning path so it does not interrupt understanding session state.
 
 ---
 
-## 8. Project Structure
-
-```
-app/
-├── __init__.py
-├── main.py              # FastAPI app, lifespan, router includes
-├── config.py            # settings (from env vars)
-├── database.py          # engine, session factory, get_db
-├── models/
-│   ├── __init__.py      # imports all models (so Alembic sees them)
-│   ├── base.py          # DeclarativeBase
-│   ├── user.py
-│   ├── post.py
-│   └── tag.py
-├── schemas/             # Pydantic models (request/response)
-│   ├── user.py
-│   └── post.py
-├── repositories/        # database access layer
-│   ├── user_repo.py
-│   └── post_repo.py
-├── routers/
-│   ├── users.py
-│   └── posts.py
-alembic/
-├── env.py
-├── versions/
-│   └── a1b2c3_initial.py
-alembic.ini
-```
-
-**`database.py`:**
-
-```python
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from typing import AsyncGenerator
-from app.config import settings
-
-engine = create_async_engine(
-    settings.database_url,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-)
-
-async_session = async_sessionmaker(engine, expire_on_commit=False)
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with async_session() as session:
-        yield session
-```
-
-**`models/__init__.py`** — critical for Alembic:
-
-```python
-# Import all models here so Alembic's target_metadata sees them all
-from app.models.base import Base
-from app.models.user import User
-from app.models.post import Post
-from app.models.tag import Tag
-
-__all__ = ["Base", "User", "Post", "Tag"]
-```
-
-If a model isn't imported before Alembic reads `Base.metadata`, it won't generate migrations for that table. This `__init__.py` is the one place you guarantee all models are imported.
-
----
-
-## 9. Common ORM Pitfalls
+## 7. Common ORM Pitfalls
 
 ### The N+1 Problem
 
+If a mapping instead uses `lazy="select"`, selecting N users and then accessing each unloaded posts collection emits an extra SELECT per user: 1 + N queries. The guard used here prevents that pattern before it silently grows. To measure the contrast, use a separate fresh session for each query and temporarily set the demonstration mapping to `lazy="select"`; a previously loaded collection would hide the extra queries.
+
 ```python
-# ❌ N+1 — fetches all users, then 1 query per user for posts
+# With this note's lazy="raise" mapping, unloaded access fails immediately.
 users = session.execute(select(User)).scalars().all()
 for user in users:
-    print(user.posts)  # 1 query here × N users
+    print(user.posts)  # InvalidRequestError: explicitly load the relationship
 
-# ✅ 2 queries total
+# Two queries for one relationship and one parent-key batch; larger sets batch.
 users = session.execute(
     select(User).options(selectinload(User.posts))
 ).scalars().all()
@@ -920,14 +688,14 @@ This is efficient (no redundant queries) but can cause confusion if you expect t
 
 ### Detached Instance Error
 
-Accessing a lazy-loaded attribute after the session is closed:
+With `lazy="select"`, an unloaded relationship needs the owning session and raises DetachedInstanceError after close. With this note's `lazy="raise"` guard, the failure is InvalidRequestError even while the session is open. Closing also detaches objects; already loaded, unexpired data remains ordinary Python data. The following snippets assume user 1 exists:
 
 ```python
 # ❌ Session closed before accessing relationship
 with SessionLocal() as session:
     user = session.get(User, 1)
 
-print(user.posts)  # DetachedInstanceError — session is closed, can't load
+print(user.posts)  # InvalidRequestError with lazy="raise": unloaded access is forbidden
 
 # ✅ Load everything you need within the session
 with SessionLocal() as session:
