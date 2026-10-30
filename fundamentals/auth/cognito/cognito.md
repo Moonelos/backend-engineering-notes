@@ -38,7 +38,7 @@ through AWS Security Token Service (STS).
 
 Use this only when your frontend needs to call AWS services directly — like uploading to S3 from a browser. If all your AWS calls go through your own backend, you don't need an Identity Pool.
 
-**In most web/mobile apps, you only need a User Pool.**
+Choose a User Pool when the application needs managed user authentication; add an Identity Pool only when clients need AWS credentials.
 
 ---
 
@@ -71,9 +71,9 @@ claims = validate_token(token)
 groups = claims.get("cognito:groups", [])
 
 if "admin" in groups:
-    # show all invoices
+    return_all_invoices_for_authorized_tenant()
 elif claims["sub"] == requested_user_id:
-    # show only their own
+    return_invoices_for_user(claims["sub"])
 else:
     raise PermissionError("Forbidden")
 ```
@@ -90,7 +90,7 @@ Frontend  →  User Pool JWT  →  Identity Pool  →  STS  →  temporary AWS c
                                                      frontend calls S3 directly with those creds
 ```
 
-### The bottom line
+### Choose the policy boundary
 
 | Scenario | Where policies live | Needs Identity Pool? |
 |----------|--------------------|--------------------|
@@ -117,7 +117,7 @@ If all AWS calls go through your backend, the user never needs IAM credentials. 
 │             │         │  ├── john@example.com                │
 │             │         │  └── ...                             │
 │             │◀──────  │                                      │
-│  JWT tokens │         │  Returns: IdToken, AccessToken,      │
+│  Tokens     │         │  Returns: IdToken, AccessToken,      │
 │             │         │           RefreshToken               │
 └─────────────┘         └──────────────────────────────────────┘
        │
@@ -132,7 +132,7 @@ If all AWS calls go through your backend, the user never needs IAM credentials. 
 1. User enters email + password in your app
 2. Your app calls Cognito with: `client_id` + credentials
 3. Cognito checks: valid client? valid credentials? MFA required?
-4. Cognito returns three JWT tokens
+4. Cognito returns two JWTs (ID and access) plus an opaque refresh token
 5. Your app stores these tokens (memory, cookies, secure storage)
 6. On every API request, your app sends: `Authorization: Bearer <AccessToken>`
 7. Your API validates the token's signature against Cognito's public keys
@@ -244,20 +244,23 @@ For JWT theory and OAuth concepts, see the parent folder:
 
 ## Pricing & Free Tier (Plan This Early)
 
-Cognito pricing scales per **Monthly Active User (MAU)**, not per request. A user is "active" if any auth operation happens on them in the month (login, token refresh, sign-up, etc.).
+For user authentication, model monthly active users by feature plan and federation category.
+Lite covers basic authentication, Essentials adds capabilities such as Managed Login customization,
+and Plus adds threat protection. Do not budget Essentials as though it includes Plus threat
+protection. Free allowances and graduated regional rates belong in a dated cost worksheet, not a
+single permanent per-user estimate. [AWS pricing, checked 2026-10-30](https://aws.amazon.com/cognito/pricing/).
 
-As of August 2026, user pools come in three feature tiers, each priced differently. Pick the tier that matches the features you need — advanced security and managed-login branding require Essentials or Plus:
+Machine-to-machine authorization has a different unit: **successful token responses**. The current
+pricing page explicitly has no additional charge for registered app clients. Thus the planning
+model is successful token responses multiplied by the applicable rate, plus other selected features;
+it is not an old per-client hourly formula. If ten services each request 500 tokens monthly, the
+billing input is 5,000 token responses. Cache tokens within their lifetime and measure issuance per
+client, while choosing lifetime from the acceptable credential exposure window.
 
-- **Lite** — basic auth. **10,000 direct/social MAU free**, then roughly **$0.0055/MAU** for the first paid band, cheaper at scale.
-- **Essentials** — adds managed login branding, advanced threat protection options, etc. **10,000 MAU free**, then ~**$0.015/MAU**.
-- **Plus** — adds full advanced security (compromised-credential checks, adaptive auth). **Charges from the first MAU**, highest per-MAU rate.
-
-Always confirm current rates and tier features at <https://aws.amazon.com/cognito/pricing/> — these numbers move.
-
-- **SAML / OIDC federation** users are priced separately: only **50 MAU free**, then ~$0.015/MAU above that.
-- **Machine-to-machine tokens** (client_credentials) are priced per token request, not per MAU, since there's no "user" to be monthly-active.
-
-For planning: a 100k-MAU app on the **Lite** tier has about 90,000 billable MAUs after the current free allowance. At a hypothetical flat `$0.0055/MAU`, that would be `90,000 × $0.0055 ≈ $495/month`; the real bill must use AWS's current graduated rates. The same app on Essentials/Plus costs substantially more — size the tier *and* the volume before the invoice appears.
+Add costs for SMS/email, Lambda triggers and optional multi-Region replication where applicable.
+Failover capacity and feature-tier prerequisites must be included before adopting replication;
+[the configuration continuation](user-pool.md#client-secret-rotation-and-recovery-changes) explains
+its limitations.
 
 ---
 
@@ -329,3 +332,21 @@ Browser  →  ALB (authenticates via Cognito)  →  Your FastAPI pod
 **Cons:** browser-centric — API clients (mobile, CLI, S2S) still need direct Cognito tokens. Only one Cognito configuration per listener rule — multi-tenant setups with per-tenant Cognito pools don't fit cleanly.
 
 When ALB-Cognito fits (web-only SaaS with one Cognito pool), it's genuinely less code to maintain.
+
+
+## Retention and decision practice
+
+**Recap:** User Pools authenticate users and issue application tokens; Identity Pools issue
+short-lived AWS credentials. Your API still decides tenant ownership and business permissions.
+
+**Check yourself:** a mobile user uploads through your API, which then writes to S3. Does the mobile
+app need an Identity Pool?
+<details><summary>Answer</summary>No. The API authorizes the user and uses its own narrowly scoped
+IAM role. A presigned upload is another bounded design; neither requires giving the user general
+AWS credentials.</details>
+
+**Try it:** your primary Cognito Region fails and the product promises that new users can register
+in the replica. Assess that promise against the current MRR contract.
+<details><summary>Answer</summary>The promise is unsupported: the secondary serves supported
+existing-user authentication, while user creation and password/profile changes remain primary
+operations. Design a degraded UI and test each MFA method; see the [recovery continuation](user-pool.md#client-secret-rotation-and-recovery-changes).</details>

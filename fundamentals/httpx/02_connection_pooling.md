@@ -194,7 +194,7 @@ async def call_api2(path: str):
         return await client.get(f"https://api2.example.com{path}")
 ```
 
-The semaphore does **not** replace the HTTPX pool — it sits in front of it and ensures no single API's slowness can consume all 100 pool slots. Set each semaphore to your target per-API concurrency (informed by the API's rate limit; see `safe_and_scalable_api_calls/01_core_concepts.md` for the `rate × call_timeout` bound).
+The semaphore does **not** replace the HTTPX pool — it sits in front of it and ensures no single API's slowness can consume all 100 pool slots. Set each semaphore to your target per-API concurrency (informed by the API's rate limit; see `safe_and_scalable_api_calls/01_core_concepts.md` for arrival-rate, measured duration and admission budgeting).
 
 ---
 
@@ -202,7 +202,7 @@ The semaphore does **not** replace the HTTPX pool — it sits in front of it and
 
 ### Keep-Alive Protocol
 
-HTTP/1.1 uses `Connection: keep-alive` header (default).
+HTTP/1.1 connections are persistent by default when message framing permits reuse and neither side requests closure. `Connection: keep-alive` is not required; `Connection: close` ends persistence. See [RFC 9112 §9.3](https://httpwg.org/specs/rfc9112.html#persistence).
 
 ```
 Client → Server: GET /data HTTP/1.1
@@ -212,7 +212,7 @@ Server → Client: HTTP/1.1 200 OK
                  Connection: keep-alive
 ```
 
-Both sides agree to keep the socket open.
+The explicit keep-alive headers above are unnecessary for ordinary HTTP/1.1 persistence. Reuse still requires an available compatible connection and fully consumed or closed response.
 
 ### When Connections Close
 
@@ -310,7 +310,7 @@ limits = httpx.Limits(max_connections=5)
 
 ```python
 limits = httpx.Limits(max_connections=1000)
-# Opens 1000 connections to vendor → they rate limit you
+# Allows up to 1000 connections under demand; it does not eagerly open them.
 ```
 
 **Fix**: Match pool size to what downstream can handle.
@@ -322,10 +322,13 @@ limits = httpx.Limits(
     max_connections=100,
     max_keepalive_connections=100
 )
-# Keeps all connections open forever
+# Retains at most 100 idle connections, each subject to keepalive_expiry (default 5s).
 ```
 
-**Fix**: Keepalive should be a fraction of max.
+**Fix**: Choose idle count and `keepalive_expiry` separately from active capacity. An idle
+count of 100 does not disable expiry; retaining all idle connections may be appropriate
+for a steady workload. [HTTPX limits](https://www.python-httpx.org/advanced/resource-limits/)
+(checked 2026-10-30).
 
 ### ❌ No Pool Timeout
 
@@ -358,3 +361,19 @@ upstream still has capacity; reduce it when open connections rise without improv
 ---
 
 **Next**: [Timeouts](03_timeouts.md) — phase-based timeout configuration
+
+## Check your understanding
+
+Socket count, idle retention and waiting-task admission have separate owners. Tune them against measured upstream capacity.
+
+**Prediction:** PoolTimeout rises when upstream latency doubles but sockets remain at their ceiling. Must the ceiling increase?
+
+<details><summary>Answer</summary>
+No. Requests retain slots longer. More concurrency can overload the dependency. Inspect admission, service latency and pool wait before changing capacity.
+</details>
+
+**Diagnosis:** Does max_keepalive_connections=100 keep idle sockets forever?
+
+<details><summary>Answer</summary>
+No. It caps retained idle count; keepalive_expiry independently limits idle lifetime, five seconds by default in this HTTPX baseline.
+</details>

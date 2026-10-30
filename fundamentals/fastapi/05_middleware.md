@@ -87,34 +87,17 @@ app.add_middleware(MyMiddleware)
 
 This is the raw ASGI protocol. No abstractions, no wrappers.
 
-### Comparison
+### Choose the interface by the boundary you need
 
-| Feature | `@app.middleware("http")` | Pure ASGI Middleware |
-|---------|--------------------------|----------------------|
-| Complexity | Low | High |
-| Access to `Request`/`Response` objects | Yes (built-in) | Manual (must construct) |
-| Performance | Slower (reads entire body into memory) | Faster (streams bytes) |
-| WebSocket support | No | Yes |
-| Streaming response support | Problematic (buffers body) | Full support |
-| Use case | Simple request/response logging | High-performance, streaming, WebSockets |
+| Feature | `@app.middleware("http")` / BaseHTTPMiddleware | Pure ASGI middleware |
+|---|---|---|
+| Interface | `Request`, `call_next`, returned response | `scope`, `receive`, `send` |
+| Body forwarding | Incremental unless your middleware explicitly collects it | Incremental unless your wrapper collects it |
+| Protocol scope | HTTP | HTTP and WebSocket if the wrapper handles both |
+| Task/context boundary | Downstream app runs in a separate task; ContextVar updates do not propagate upward | Can preserve the same task when it directly awaits the app |
+| Timing boundary | Around `call_next`: downstream headers become available | Can observe response start, each body and final body separately |
 
-### The Recommendation
-
-> **Prefer pure ASGI middleware for production.** `@app.middleware("http")` and `BaseHTTPMiddleware` are convenient, but they have architectural limitations that matter under production load — buffered bodies, an extra Task per request, broken streaming, no WebSocket support. Section 9 walks through the mechanics; the guidance below tells you when each is actually the right pick.
-
-**Use `@app.middleware("http")` / `BaseHTTPMiddleware` when:**
-
-- You are prototyping or learning the middleware layer
-- Your endpoints never stream (no SSE, no large file downloads, no WebSockets)
-- The per-request overhead is acceptable for your throughput target
-
-**Use pure ASGI middleware (recommended) when:**
-
-- You are writing production code
-- You handle streaming responses (SSE, file downloads)
-- You use WebSockets
-- You care about performance and memory usage
-- You need correct client disconnect handling
+Choose BaseHTTPMiddleware for request/response-oriented behavior whose task/context semantics fit. It can forward streaming bodies. Choose pure ASGI when you need direct message ownership, WebSockets, precise body-completion timing or same-task context propagation. Measure overhead for the actual stack; neither interface guarantees constant memory if application code retains chunks. See the full message trace in Section 9.
 
 ---
 
@@ -122,7 +105,7 @@ This is the raw ASGI protocol. No abstractions, no wrappers.
 
 Every production service needs request tracing. Inject a unique ID into every request and propagate it to logs, downstream services, and the response.
 
-> **Note**: The examples in Sections 3-5 use `BaseHTTPMiddleware` for clarity. For production, use the pure ASGI versions shown in Section 12.
+> **Note**: Sections 3–5 use `BaseHTTPMiddleware`; Section 12 supplies pure ASGI alternatives when direct message/context ownership is needed. Test the selected interface against your response lifetimes.
 
 ### Implementation
 
@@ -134,7 +117,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Use incoming header if present (from API gateway / load balancer)
-        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        candidate = request.headers.get("X-Request-ID", "")
+        request_id = candidate if (1 <= len(candidate) <= 64 and candidate.isascii()
+            and all(c.isalnum() or c in "_-" for c in candidate)) else str(uuid.uuid4())
 
         # Store in request state for access in route handlers
         request.state.request_id = request_id
@@ -181,7 +166,9 @@ class RequestIDFilter(logging.Filter):
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        candidate = request.headers.get("X-Request-ID", "")
+        request_id = candidate if (1 <= len(candidate) <= 64 and candidate.isascii()
+            and all(c.isalnum() or c in "_-" for c in candidate)) else str(uuid.uuid4())
         request.state.request_id = request_id
         token = request_id_ctx.set(request_id)
         try:
@@ -277,7 +264,7 @@ class PrometheusTimingMiddleware(BaseHTTPMiddleware):
 
         REQUEST_DURATION.labels(
             method=request.method,
-            path=request.url.path,
+            path=getattr(request.scope.get("route"), "path", "unmatched"),
             status=response.status_code,
         ).observe(duration)
 
@@ -359,7 +346,9 @@ Every error response has the same shape:
 
 ### Anti-Patterns
 
-```python
+The following are isolated exception clauses illustrating anti-patterns, not standalone Python programs:
+
+```text
 # ❌ Leaking implementation details to clients
 except Exception as exc:
     return JSONResponse(
@@ -372,14 +361,15 @@ except Exception:
     return JSONResponse(status_code=500, content={"error": "error"})
     # No logging! You will never know what went wrong.
 
-# ❌ Re-raising after sending a response
+# ❌ Constructing a response and discarding it
 except Exception as exc:
     response = JSONResponse(status_code=500, content={"error": "failed"})
-    raise exc  # Response already sent, this causes a secondary error
+    raise exc  # Construction did not send headers; this response object is discarded.
 ```
 
-```python
-# ✅ Log everything server-side, return safe message to client
+Inside a `try/except` boundary before response start, log the exception and return a safe public message. Avoid logging credentials or raw request bodies. Clause excerpt:
+
+```text
 except Exception as exc:
     logger.error("Unhandled exception", exc_info=True)
     return JSONResponse(
@@ -395,7 +385,9 @@ except Exception as exc:
 
 ## 6. CORS Middleware
 
-Cross-Origin Resource Sharing controls which frontend origins can call your API.
+Cross-Origin Resource Sharing controls which cross-origin responses browser JavaScript may
+read. A disallowed safelisted request can still reach the server and change state; CORS
+is not authentication, authorization or a replacement for CSRF defenses.
 
 ### Basic Configuration
 
@@ -611,50 +603,39 @@ class MyMiddleware(BaseHTTPMiddleware):
 app.add_middleware(MyMiddleware, custom_value="production")
 ```
 
-### Why You Should Avoid BaseHTTPMiddleware in Production
+### Choose middleware from its actual ASGI boundaries
 
-`BaseHTTPMiddleware` has fundamental architectural problems, not just edge-case limitations. Understanding **how** it works makes the problems obvious.
+`BaseHTTPMiddleware` exposes a request/response interface and runs the downstream app in
+a separate task. After receiving `http.response.start`, `call_next` returns a streaming
+response whose body forwards downstream messages. It does **not** inherently buffer the
+whole body or wait for an infinite SSE stream to finish. A middleware that explicitly
+reads and collects the body can introduce buffering, but that is a different operation.
 
-#### How `call_next()` Actually Works
-
-When you call `await call_next(request)`, BaseHTTPMiddleware:
-
-1. **Spawns a new `asyncio.Task`** to run the rest of the middleware chain + your endpoint
-2. The endpoint writes its response into an **in-memory byte buffer** (not to the client)
-3. Only after the endpoint **finishes completely** does `call_next()` return
-4. The entire response body is now **held in memory**
-5. Your middleware reads the buffered response and sends it to the client
-
-```
-BaseHTTPMiddleware flow:
-  request → dispatch() → call_next() → [spawns Task] → endpoint runs
-                                        → body buffered in memory
-                                        → Task completes
-                         ← Response (full body in memory)
-  ← sends buffered body to client
-
-Pure ASGI flow:
-  request → __call__() → app(scope, receive, send_wrapper)
-                          → endpoint runs
-                          → each chunk streams directly to client via send_wrapper
-  (no buffering, no extra Task)
+```mermaid
+sequenceDiagram
+ participant M as dispatch middleware
+ participant A as Downstream app task
+ participant C as Client
+ M->>A: call_next starts app
+ A-->>M: http.response.start
+ M->>C: Forward response headers
+ A-->>M: Body A with more_body true
+ M->>C: Forward A before B exists
+ A-->>M: Body B with more_body false
+ M->>C: Forward B and finish
 ```
 
-#### The Concrete Problems
+A generator can send A and then wait on an event before B; pass-through middleware still
+forwards A. `call_next` duration therefore measures time until the response starts, not
+necessarily body completion. Measure total duration at the final ASGI body message if
+that is the metric you intend.
 
-1. **Response body buffered in memory.** A 500MB file download? The entire file sits in RAM before a single byte reaches the client. SSE streams? The connection hangs until the stream "ends" (which for SSE may be never).
-
-2. **Extra `asyncio.Task` per request.** Every request creates an additional Task. Under high load, this means thousands of extra Tasks competing for the event loop — measurable overhead.
-
-3. **Broken streaming.** `StreamingResponse` and SSE rely on sending chunks incrementally. BaseHTTPMiddleware collects all chunks into a buffer first, then sends them all at once. Your "streaming" endpoint becomes a regular endpoint that blocks until all data is generated.
-
-4. **Client disconnect not propagated.** When a client disconnects mid-request, the spawned Task doesn't know. Your endpoint keeps running, burning CPU and I/O on a response nobody will receive. In pure ASGI, the `receive` callable signals disconnect immediately.
-
-5. **WebSocket incompatible.** BaseHTTPMiddleware only handles `http` scope. WebSocket connections bypass it entirely, meaning your logging/timing/error-handling middleware doesn't apply to WebSocket endpoints.
-
-#### The Performance Impact
-
-BaseHTTPMiddleware adds **measurably higher latency** and **higher memory usage** than pure ASGI middleware, even when the middleware itself does nothing but add a header. The overhead comes from three sources: spawning an `asyncio.Task` per request, buffering the full response body in memory, and an extra copy of that body as it's drained from the buffer. Magnitude depends on response size and traffic shape — benchmark your own workload rather than quoting a single number.
+The important limitation is task context: ContextVar changes made downstream do not
+propagate back upward through the task boundary. BaseHTTPMiddleware also operates on HTTP,
+so WebSockets bypass its dispatch method. Pure ASGI middleware gives explicit scope/message
+ownership and can support both protocols. Neither style makes disconnect observation
+instantaneous or proves cleanup without tests. Benchmark overhead on the actual workload.
+[Starlette middleware behavior](https://starlette.dev/middleware/) (checked 2026-10-30).
 
 ### Pure ASGI Middleware
 
@@ -720,19 +701,17 @@ app.add_middleware(PureASGITimingMiddleware)
 
 ### BaseHTTPMiddleware vs Pure ASGI
 
-| Aspect | BaseHTTPMiddleware | Pure ASGI |
-|--------|-------------------|-----------|
-| Ease of writing | Simple -- `dispatch(request, call_next)` | More code -- raw `scope`/`receive`/`send` |
-| Response body | Buffered entirely in memory | Streamed chunk-by-chunk |
-| WebSocket support | No | Yes |
-| Streaming support | No (silently breaks streaming) | Full support |
-| Client disconnect | Not propagated to endpoint | Propagated immediately |
-| Memory usage | Entire response body in RAM | Constant (streaming) |
-| Performance overhead | Measurably higher latency | Baseline |
-| Extra Tasks per request | 1 additional `asyncio.Task` | None |
-| When to use | Prototyping, learning | Production |
+The choice is about message and task ownership. BaseHTTPMiddleware receives the downstream
+`response.start` through its internal channel and returns a streaming response to `dispatch`.
+The outer client has not yet received that returned response: dispatch may still add headers or
+change its status before returning it. Body forwarding then proceeds incrementally.
 
-> **Use pure ASGI for production middleware.** The code is more verbose, but you write middleware once and it runs on every request for the life of the service. The investment in learning the ASGI interface pays for itself immediately. The examples in Section 12 show production-ready pure ASGI versions of every common middleware.
+A pure ASGI wrapper can intercept the actual outgoing `response.start` immediately before
+`await send(message)`. After that send succeeds, its status and headers are committed.
+Disconnect observation depends on the server, receive/send path and transport; neither style
+can detect a disappeared peer instantaneously. Always test your chosen server/framework versions
+with a stalled body and a disconnect. [The runtime regression](./examples/test_runtime_contracts.py)
+proves pass-through BaseHTTPMiddleware forwards body A before the producer releases body B.
 
 ---
 
@@ -855,23 +834,25 @@ class GoodMiddleware(BaseHTTPMiddleware):
         return response
 ```
 
-### Mistake 2: Modifying Response After It Is Sent
+### Mistake 2: Confusing the internal header event with the outgoing one
+
+Changing a response after `call_next` is valid in BaseHTTPMiddleware because `dispatch` still
+owns the returned response before it is sent to the caller:
 
 ```python
-# ❌ Trying to modify status code after call_next
-class BadMiddleware(BaseHTTPMiddleware):
+class HeaderMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         response = await call_next(request)
-        response.status_code = 200  # May not work -- headers already sent
+        response.headers["X-Example"] = "present"
         return response
 ```
 
-With `BaseHTTPMiddleware`, this may appear to work because the body is buffered. With pure ASGI, the status code is sent in `http.response.start` before the body -- modifying it afterward has no effect.
-
-```python
-# ✅ If you need to transform responses, do it before sending
-# Or use pure ASGI middleware and intercept http.response.start
-```
+This does not depend on buffering the body. Changing `response.status_code` here also changes
+the outgoing status, although arbitrarily converting errors to 200 would break the API contract.
+In pure ASGI middleware, change a copy of `http.response.start` **before** forwarding it to `send`.
+Changing an old message or constructing another response after the actual start was sent cannot
+replace the public status. The irreversible boundary is the outgoing ASGI event, not the return
+from `call_next` inside dispatch.
 
 ### Mistake 3: Creating Resources Per Request in Middleware
 
@@ -1018,7 +999,10 @@ class RequestIDMiddleware:
 
         # Extract or generate request ID
         headers = dict(scope.get("headers", []))
-        request_id = headers.get(b"x-request-id", b"").decode() or str(uuid.uuid4())
+        raw_id = headers.get(b"x-request-id", b"")
+        allowed = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        request_id = (raw_id.decode("ascii") if 1 <= len(raw_id) <= 64
+                      and all(byte in allowed for byte in raw_id) else str(uuid.uuid4()))
 
         # Store in scope state so route handlers can access it
         scope.setdefault("state", {})["request_id"] = request_id
@@ -1134,6 +1118,8 @@ class ErrorHandlingMiddleware:
                     "type": "http.response.body",
                     "body": body,
                 })
+            else:
+                raise  # The started response cannot be replaced; preserve server failure reporting.
 
 
 # --- Application Setup ---
@@ -1141,8 +1127,10 @@ class ErrorHandlingMiddleware:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.http_client = httpx.AsyncClient(timeout=30.0)
-    yield
-    await app.state.http_client.aclose()
+    try:
+        yield
+    finally:
+        await app.state.http_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1166,18 +1154,21 @@ app.add_middleware(                             # Rejects bad hosts
 app.add_middleware(GZipMiddleware, minimum_size=1000)  # Outermost: compresses final response
 ```
 
-### Why This Is Better
+### What this ASGI stack makes explicit
 
-Compared to the BaseHTTPMiddleware version:
+| Concern | Boundary to test |
+|---|---|
+| Streaming | Forward each body message without collecting the whole body |
+| Context | Bind/reset request context in the scope owner |
+| WebSockets | Handle the WebSocket scope explicitly where needed |
+| Request IDs | Validate bounded ASCII before reflecting/logging caller data |
+| Total timing | Observe final body, not only response start |
+| Post-start errors | Log and re-raise; never send a second response start |
 
-| Concern | BaseHTTPMiddleware | This Pure ASGI Stack |
-|---------|-------------------|---------------------|
-| Streaming | Broken (body buffered) | Works (chunks flow through) |
-| WebSockets | Skipped entirely | Handled (request ID works on WS too) |
-| Memory | Entire response in RAM | Constant (pass-through) |
-| Tasks per request | 3 extra (one per middleware) | 0 extra |
-| Client disconnect | Not propagated | Propagated immediately |
-| Error after headers sent | Crashes | Handled gracefully (`response_started` check) |
+Constructing `JSONResponse` alone sends nothing. The irreversible boundary is the actual
+`http.response.start` event, after which status and headers cannot be replaced. Even a
+middleware that handles a pre-start error safely must preserve a post-start failure so
+the server can abort/report the incomplete response.
 
 ---
 
@@ -1199,7 +1190,32 @@ Compared to the BaseHTTPMiddleware version:
 
 1. **Middleware is for cross-cutting concerns** -- things that apply to every request. Use dependencies for per-route logic.
 2. **Order matters** -- register innermost first, outermost last. The last `add_middleware` call is the outermost layer.
-3. **Use pure ASGI middleware in production** -- `BaseHTTPMiddleware` buffers entire response bodies in memory, breaks streaming, ignores WebSockets, spawns extra Tasks per request, and doesn't propagate client disconnects. It is fine for prototyping but should not be in your production stack.
+3. **Choose the needed message/context boundary** -- BaseHTTPMiddleware streams but creates a task-context boundary and dispatches only HTTP; pure ASGI gives explicit scope and send/receive control.
 4. **Never block the event loop** -- all I/O in middleware must be async.
 5. **Keep middleware lightweight** -- it runs on every request, including health checks and preflight requests.
 6. **Use contextvars for request-scoped data** -- this propagates context to all code in the request without manual passing.
+
+## Check your understanding
+
+ASGI response.start commits status and headers. Body messages can follow incrementally; timing call_next normally measures header arrival.
+
+**Prediction:** The generator sends A and waits before B. Must BaseHTTPMiddleware collect B before A reaches the client?
+
+<details><summary>Answer</summary>
+No. Its message channel forwards a streaming response after response.start. The separate task boundary has real ContextVar implications, but does not imply whole-body buffering.
+</details>
+
+**Diagnosis:** An exception occurs after response.start. Can middleware return a replacement 500?
+
+<details><summary>Answer</summary>
+No. Preserve observability and propagate the failure. A second response start violates the response protocol.
+</details>
+
+
+**Try it:** Instrument the final-body boundary in an ASGI send wrapper. Start with `if message["type"] == "http.response.body" and ...:` and leave the completion condition blank. Record header time separately on response.start.
+
+Hint: The final message omits more_body or sets it false.
+
+<details><summary>Solution</summary>
+`not message.get("more_body", False)` identifies the final body. Record duration after successfully awaiting the wrapped send. A failure before that point belongs in aborted-stream metrics; a header-time measurement cannot stand in for total stream duration.
+</details>

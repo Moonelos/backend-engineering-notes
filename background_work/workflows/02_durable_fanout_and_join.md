@@ -271,4 +271,35 @@ Do not use durable fan-out for a small in-process calculation whose entire retry
 
 ---
 
+## Recap and check yourself
+
+- Persist the expected child set before treating completion as a join.
+- Only a child winning its pending-to-terminal transition may change the group count.
+- The serialized final transition creates aggregation once, and replay still needs effect idempotency.
+
+**Two copies of child a finish before b and c. Should remaining drop twice?**
+
+<details><summary>Answer</summary>
+
+No. Only the winning PENDING-to-SUCCEEDED update feeds the counter. The duplicate changes zero rows; otherwise aggregation could begin with unfinished children.
+
+</details>
+
+**An extra child is discovered after the group was sealed. Append it silently?**
+
+<details><summary>Answer</summary>
+
+No. The expected set defines the join contract. Create an explicit new group/version or reopen under a defined transition before accepting new members.
+
+</details>
+
+**Try it:** Start with children a,b,c and remaining=3. Complete a twice, then b. Fill remaining after each call.
+
+<details><summary>Hint and worked solution</summary>
+
+Only one terminal transition per child feeds the counter. 2, 2, 1. The aggregate is still not eligible until c completes; duplicate a does not stand in for c.
+
+</details>
+
+
 **Next**: [Production Operations](../operations/README.md)

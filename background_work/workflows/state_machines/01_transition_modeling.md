@@ -100,6 +100,18 @@ Use this form while the complete graph fits in one function and every transition
 
 The hardened version makes `(from_state, event)` the lookup key and keeps guards in normal functions. The registry is declarative; command creation remains executable code.
 
+The registry below owns these edges. Cancellation is legal in three nonterminal states; approval has one source and requires reviewer evidence.
+
+```mermaid
+stateDiagram-v2
+    NEW --> CANCELLED: cancel
+    WAITING_FOR_HUMAN_REVIEW --> GENERATION_QUEUED: approve with reviewer and reason
+    WAITING_FOR_HUMAN_REVIEW --> CANCELLED: cancel
+    GENERATION_QUEUED --> CANCELLED: cancel
+```
+
+An omitted edge is rejected, not inferred from an enum order. In particular, approve from NEW has no registry entry. Persistence will commit the chosen edge with its dependent work in the next lesson.
+
 ```python
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -281,6 +293,18 @@ if __name__ == "__main__":
     print("leaf and inherited transitions passed")
 ```
 
+The lookup path starts at the leaf. Only absence of a matching edge moves it to a parent.
+
+```mermaid
+flowchart TD
+    L[ACTIVE.RESEARCH.WAITING_FOR_HUMAN_REVIEW] -->|approve found here| G[ACTIVE.GENERATION.QUEUED]
+    L -->|cancel absent| R[ACTIVE.RESEARCH]
+    R -->|cancel absent| A[ACTIVE]
+    A -->|cancel found| C[CANCELLED]
+```
+
+The child-specific approval wins before parent fallback is considered. Adding a child-specific cancel edge would override the inherited one in this implementation; tests must make that precedence intentional.
+
 A production statechart library also defines entry/exit actions, history states, parallel regions, and event ordering. Adopt those semantics deliberately and test them; do not grow this compact lookup into a home-made statechart runtime.
 
 ⚠️ An entry action that performs external I/O may run again during recovery. Return a durable command and execute it through an idempotent worker instead.
@@ -288,5 +312,28 @@ A production statechart library also defines entry/exit actions, history states,
 Do not use state objects for a data-only graph, or hierarchy for a flat lifecycle. Once guards, transitions, and commands no longer fit on one inspectable page, prefer a mature statechart library or a workflow engine over adding implicit conventions.
 
 ---
+
+## Recap and check yourself
+
+- Named events and explicit allowed edges make the lifecycle inspectable.
+- A registry suits data-driven transitions; state objects suit substantial behavior variation.
+- Hierarchy earns its complexity when parent behavior truly applies across children.
+
+**Six leaf states repeat cancel but have no distinct methods. Should every state become a class?**
+
+<details><summary>Answer</summary>
+
+No. A registry can remain clear. A shared parent cancellation rule may justify hierarchy if duplication becomes material; state objects solve behavior variation, not a data-only graph.
+
+</details>
+
+**A parent cancel rule and a child-specific rule both match. What must the model make explicit?**
+
+<details><summary>Answer</summary>
+
+Which rule wins and whether guards alter that choice. Test the child exception and parent fallback separately instead of assuming the library selects the desired business meaning.
+
+</details>
+
 
 **Next**: [Relational Current-State Persistence](persistence/01_relational_current_state.md)

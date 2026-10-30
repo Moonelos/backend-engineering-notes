@@ -147,4 +147,29 @@ Avoid choosing it by default for a greenfield web or mobile API when ordinary HT
 
 ---
 
+
+## Recap
+
+- The provider’s WSDL and schema determine the operation and message shape.
+- Envelope headers can impose mandatory processing independently of the body.
+- Fault handling must inspect the SOAP fault and the HTTP transport outcome.
+
+## Check yourself
+
+**The service cannot process pay:RequestContext marked mustUnderstand=true; should it ignore it and return pay_123?**
+
+<details><summary>Reasoned answer</summary>
+
+No. A targeted SOAP node must process that header or fault. Silently ignoring it breaks the SOAP processing contract explained at line 73.
+
+</details>
+
+**Can you change an XML namespace while preserving the same local element name?**
+
+<details><summary>Reasoned answer</summary>
+
+Not without a contract change: the namespace is part of the expanded element identity used by the schema and service.
+
+</details>
+
 **Next**: [GraphQL Overview](05_graphql_overview.md)

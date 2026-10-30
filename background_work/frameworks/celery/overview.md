@@ -88,6 +88,25 @@ Do not block on `result.get()` in a normal API request; return a domain `job_id`
 
 ---
 
+## Run the production continuation against a real broker
+
+The [shared lab](../../examples/durable_job/celery_tasks.py) connects the existing durable parse job to Celery. It retains the job schema, HTTP contract and worker claim from [minimal durable task](../../foundations/03_minimal_durable_task.md#run-one-job-before-studying-the-schema); only delivery changes. The deterministic local parser stands in for a provider, so you can prove DB/broker failure boundaries without credentials.
+
+From the initialized `background_work/examples/durable_job` directory:
+
+```bash
+.venv/bin/python -m pip install -r requirements-brokers.txt
+docker compose -p background-job-lab --profile broker up -d redis
+export REDIS_URL=redis://127.0.0.1:56379/0
+.venv/bin/python -m celery -A celery_tasks worker -Q parse.celery --pool=solo --loglevel=WARNING
+```
+
+In a second terminal with the same `DATABASE_URL` and `REDIS_URL`, run `.venv/bin/python publisher.py celery`. In a third, run `.venv/bin/python broker_smoke.py`. The bounded check submits the same logical request twice, reads the authoritative DB result and prints `one durable job, words=3, status=SUCCEEDED`. Stop the publisher and worker before choosing a different runtime for the same outbox. The `solo` pool is only the small local wiring baseline; use a production pool appropriate to the workload below.
+
+`publisher.py` commits confirmation only after publication. A send/commit crash can therefore duplicate delivery. `store.execute()` claims the job, and the database owns attempt/deadline exhaustion; broker retries cannot accidentally reset that budget. Expired claims and missing hints are repaired by the publisher's bounded reconciliation pass. The four lifecycle tests separately inject worker-process loss and prove stale completions affect zero rows. The broker smoke proves actual publication and consumption, not HA failover.
+
+The next adapter shows how that ownership protocol extends to a workflow step and remote provider. It is an **application integration excerpt**, not a second standalone app: `repository` owns the run/step schema, lease renewal, retry budget and provider-effect evidence described below. Preserve the runnable lab as the baseline while implementing these contracts.
+
 ## 4. A hardened task carries IDs and explicit failure policy
 
 ```python
@@ -132,7 +151,7 @@ def generate_report(self, workflow_run_id: str, step_id: str, idempotency_key: s
                 response.raise_for_status()
             except HTTPStatusError as exc:
                 if 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
-                    repository.fail_permanently(run.id, step_id, attempt_token, str(exc))
+                    repository.fail_permanently(run.id, step_id, attempt_token, type(exc).__name__)
                     return  # Validation/auth failures do not improve with retries.
                 raise
     except (TransportError, HTTPStatusError):
@@ -151,7 +170,7 @@ def generate_report(self, workflow_run_id: str, step_id: str, idempotency_key: s
     )
 ```
 
-⚠️ **`autoretry_for` does not know about your domain state.** It sees an exception, schedules a redelivery, and marks the task `RETRY` — the workflow row is entirely Celery's blind spot. Every path out of the task body must leave the step either terminal or releasable, or the retry cannot re-acquire what the previous attempt abandoned. The three places above are the complete set: permanent failure, transient release, success.
+⚠️ **`autoretry_for` does not know about your domain state.** It sees an exception, schedules a redelivery, and marks the task `RETRY` — the workflow row is entirely Celery's blind spot. Every path out of the task body must leave the step either terminal or releasable, or the retry cannot re-acquire what the previous attempt abandoned. The normal paths are permanent failure, transient release and success; abrupt process loss requires the lease recovery path below. The repository must also mark its own retry budget exhausted even if Celery stops delivering. The shared lab demonstrates that budget explicitly.
 
 ⚠️ **`acks_late=True` plus a hard worker loss skips your `except` blocks entirely.** `SIGKILL`, OOM, or a node dying runs no Python at all, so the step stays `RUNNING` with a live-looking token forever. Only a **time-bounded lease** plus a reconciler that reclaims expired ones recovers that case, which is why `claim_step` below matches on lease expiry rather than on status alone.
 
@@ -239,13 +258,15 @@ celery -A app worker -Q blocking_io --pool=threads --concurrency=32
 
 Celery’s [task API](https://docs.celeryq.dev/en/stable/reference/celery.app.task.html) documents that `acks_late` acknowledges after execution and that a task may then execute twice after a worker crash.
 
-⚠️ **On the Redis broker, "unacknowledged delivery returns" is driven by a timer, not by worker loss.** Redis has no native acknowledgement, so Celery emulates it with a `visibility_timeout` that **defaults to one hour**. Any task still unacknowledged after that window is redelivered *while the original worker is healthy and still working on it* — and the Celery docs state such a task "will be executed again, and again in a loop." The same applies to any task whose ETA or countdown exceeds the timeout.
+⚠️ **On the Redis broker, "unacknowledged delivery returns" is driven by a timer, not by worker loss.** Celery’s Redis list transport has no native list acknowledgement, so Kombu emulates it with a `visibility_timeout` that **defaults to one hour**. Any task still unacknowledged after that window is redelivered *while the original worker is healthy and still working on it* — and the Celery docs state such a task "will be executed again, and again in a loop." The same applies to any task whose ETA or countdown exceeds the timeout.
 
 This is exactly the shape of §4's `generate_report`: a long provider call, `acks_late=True`, and therefore no acknowledgement until it finishes. On Redis with defaults, a report that takes 70 minutes is not a slow report — it is an infinite loop of duplicate reports. Three remedies, in order of preference:
 
 ```python
 # worker_settings.py — raise the window above the longest task on this broker
-broker_transport_options = {"visibility_timeout": 6 * 3600}   # 6 hours
+broker_transport_options = {"visibility_timeout": 6 * 3600}   # seconds
+result_backend_transport_options = {"visibility_timeout": 6 * 3600}
+visibility_timeout = 6 * 3600
 ```
 
 - **Raise `visibility_timeout` above your longest task**, remembering it must also exceed the longest ETA/countdown you schedule.
@@ -318,52 +339,28 @@ beat_schedule = {
 }
 ```
 
-The task turns that into a durable job under a unique constraint and no-ops if the row already exists. Beat firing once is not the business guarantee — the unique row is.
+That schedule sends a wake-up message. It does not carry a trustworthy logical occurrence: `now()` inside a worker or a custom Beat publisher describes when code ran, which can be later than the due slot. Truncating the current minute does not recover a missed 03:00 firing at 03:04.
 
-⚠️ **`schedule_key` alone is not a firing identity, and deriving the date inside the task moves the bug rather than fixing it.** `f"{schedule_key}:{date.today()}"` is computed on the *worker*, at *delivery* time — so a message that sits in the queue past midnight, or is redelivered the next morning after a worker loss, derives a different key and runs the same nightly cleanup twice. Worse, two workers processing a duplicate publication either side of midnight both succeed. The firing identity has to come from the component that decided the firing happened:
+For business-critical periodic work, persist the calendar cursor and use Beat only to wake a scanner. The scanner loads due occurrences, resolves the configured DST/misfire policy, and commits one firing plus job/outbox per stored UTC instant. The [scheduler fixture](../../examples/durable_job/test_scheduler.py) contains the full atomic statement, schema and two-replica race; [the scheduling lesson](../../execution/03_scheduling_and_periodic_work.md) explains the calendar choices. Advancing the cursor after that commit is replay-safe because the unique firing key already exists.
 
-```python
-# beat_scheduler.py
-import copy
+The clock trigger and the execution lease guard different transitions.
 
-from celery.beat import PersistentScheduler
-
-
-class StampedScheduler(PersistentScheduler):
-    """Stamp every published message with the slot beat fired it for."""
-
-    def apply_async(self, entry, producer=None, advance=True, **kwargs):
-        entry = self.reserve(entry) if advance else entry
-        # Truncated to the minute — crontab's own granularity — so one entry can
-        # never produce two slots for one firing, and a redelivery six hours
-        # later still carries the ORIGINAL slot.
-        slot = entry.schedule.now().replace(second=0, microsecond=0)
-        entry = copy.copy(entry)
-        entry.kwargs = {**entry.kwargs, "firing_slot": slot.isoformat()}
-        # advance=False: we already reserved above; reserving twice skips a firing.
-        return super().apply_async(entry, producer=producer, advance=False, **kwargs)
+```mermaid
+sequenceDiagram
+    participant B as Beat
+    participant S as Due scanner
+    participant D as Database
+    participant W as Celery worker
+    B->>S: Wake scanner at 03:04
+    S->>D: Load stored due instant 03:00
+    S->>D: Commit firing 03:00, job-42 and outbox
+    W->>D: Claim job-42 with token A
+    Note over W: Process crashes
+    S->>D: Recover expired job, publish new hint
+    W->>D: Claim token B and complete
 ```
 
-```bash
-celery -A app beat --scheduler beat_scheduler:StampedScheduler
-```
-
-```python
-# app/tasks.py
-@app.task
-def cleanup(schedule_key: str, firing_slot: str) -> None:
-    # firing_slot came from beat, so every delivery and redelivery of this
-    # firing agrees on the key no matter when the worker gets to it.
-    if not repository.claim_firing(f"{schedule_key}:{firing_slot}"):
-        return  # already claimed by an earlier delivery
-    do_cleanup()
-```
-
-`claim_firing` is an `INSERT ... ON CONFLICT DO NOTHING` against a table with `UNIQUE (firing_key)`, returning whether a row was actually inserted.
-
-**How you know it worked:** exactly one row per scheduled slot in that table, and `firing_slot` values that land on the schedule (`03:00`) rather than on whenever the worker happened to run.
-
-⚠️ Verify against your Celery version before relying on it — `apply_async` and `reserve` are `celery.beat.Scheduler` internals, not a documented extension point. Checked against [`celery/beat.py` v5.5.3](https://github.com/celery/celery/blob/v5.5.3/celery/beat.py). If you would rather not subclass, publish from your own scheduler process instead and put the slot in the message yourself.
+A permanent `INSERT claimed_firing` before the effect would lose the job at the crash shown. Keep the firing immutable, but give execution an expiring token-bound lease, a terminal retry budget and a reconciler. A finished job returns without doing the effect again; an expired unfinished job can be reclaimed. For remote effects, use stable business identity at the provider as well.
 
 Use APScheduler when timing is needed without the rest of Celery. Use engine timers when the timer is part of one durable workflow’s state.
 
@@ -423,7 +420,7 @@ The three things to get right:
 
 Celery ships `task_always_eager`, which runs tasks inline in the caller. It is convenient and it is explicitly not the recommended testing tool — the docs state it is "by definition not suitable for unit tests" because it *emulates* execution rather than executing through a worker, so it exercises none of the serialization, routing, acknowledgement, or retry behavior that actually breaks.
 
-Use the pytest plugin instead. `celery.contrib.pytest` (or the standalone `pytest-celery` package) provides `celery_app` and `celery_worker` fixtures that start a real worker in-process:
+Use `celery.contrib.pytest` for the in-process `celery_app` and `celery_worker` fixtures below; enable it with `pytest_plugins = ("celery.contrib.pytest",)` in `conftest.py`. The separately named `pytest-celery` plugin uses Docker-based smoke infrastructure and has an incompatible API. See [Celery testing](https://docs.celeryq.dev/en/v5.6.0/userguide/testing.html), checked 2026-10-30. These excerpts assume the application `repository` and provider fixture; the complete real-broker check is the shared lab above.
 
 ```python
 # conftest.py
@@ -518,5 +515,36 @@ Source: [Celery testing guide](https://docs.celeryq.dev/en/stable/userguide/test
 ⚠️ Canvas graphs can become an implicit workflow that is hard to reconcile with domain state. Keep business progression explicit or move it to a durable workflow engine.
 
 ---
+
+## Recap and check yourself
+
+- Celery transports messages and executes tasks; domain state owns user-visible recovery.
+- Late acknowledgement allows redelivery, so effects need durable business identity.
+- Beat wake time is not a missed logical occurrence; a persisted scanner supplies stable firing keys.
+
+**An effect commits, then the connection dies before acknowledgement. Does acks_late prevent repeating the effect?**
+
+<details><summary>Answer</summary>
+
+No. It enables redelivery. Durable effect identity and outcome lookup make the repeated task safe.
+
+</details>
+
+**Beat wakes at 03:04 for a 03:00 occurrence. Is truncating now to a minute a correct key?**
+
+<details><summary>Answer</summary>
+
+No. It labels the delay as a new occurrence. Read the persisted due instant and create its firing/job atomically.
+
+</details>
+
+**Try it:** Extend the broker smoke scaffold with a second delivery of the completed job ID, then fill the expected attempt count.
+
+<details><summary>Hint and worked solution</summary>
+
+A terminal job is ineligible for a new claim even if the broker accepts a message. It stays at 1 in the no-failure run. Inspect the database result, not Celery’s transport return value.
+
+</details>
+
 
 **Next**: [Dramatiq](../dramatiq/overview.md)

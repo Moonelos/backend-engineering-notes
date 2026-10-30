@@ -46,7 +46,7 @@ Orchestrator ◄── response ────────┘
 ```
 
 **Advantages:**
-- Zero dispatch latency
+- No worker polling interval before dispatch
 - Orchestrator has direct control over which worker gets which task
 
 **Disadvantages:**
@@ -66,8 +66,8 @@ Queue: new message arrives
 ```
 
 **Advantages:**
-- Zero-config autoscaling (Lambda) or managed consumer groups (Kafka)
-- No polling overhead
+- Managed polling/scaling machinery, subject to configured quotas and concurrency
+- Polling is owned by the integration rather than application code
 
 **Disadvantages:**
 - Less control over concurrency (need explicit limits like Lambda reserved concurrency, ESM MaximumConcurrency)
@@ -159,15 +159,21 @@ Where does the worker put the result when it's done?
 Worker POSTs the result directly to the orchestrator or a result endpoint.
 
 ```python
-async def complete_task(orchestrator_url: str, job_id: str, result: dict):
-    async with httpx.AsyncClient() as client:
-        await client.post(
+async def complete_task(orchestrator_url: str, job_id: str, generation: int, result: dict):
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
             f"{orchestrator_url}/jobs/{job_id}/complete",
-            json={"status": "succeeded", "result": result},
+            json={"state": "succeeded", "generation": generation, "result": result},
         )
+        response.raise_for_status()
 ```
 
-**Best for:** Small results (< 1 MB), when the orchestrator needs to react immediately.
+The caller persists a pending completion delivery before attempting HTTP and retains it on timeout
+or non-2xx. The receiver atomically checks job/owner/generation and stores the result; retries of
+the same accepted result are idempotent. HTTP success acknowledges durable intake, not an unrelated
+remote side effect. The signed durable delivery pattern is in [client delivery](03_client_delivery_patterns.md#pattern-5-webhook-client-callback).
+
+**Best for:** Bounded small results when the orchestrator needs to react promptly.
 
 ### Write to Shared Store (Decoupled)
 
@@ -188,10 +194,14 @@ s3.put_object(Bucket="results", Key=f"{job_id}.json", Body=json.dumps(result))
 Worker updates the job record directly.
 
 ```python
-await db.execute(
-    "UPDATE jobs SET status = 'succeeded', result = $1, completed_at = NOW() WHERE id = $2",
-    json.dumps(result), job_id,
+accepted = await db.fetchval(
+    "UPDATE jobs SET status = 'succeeded', result = $1, completed_at = NOW() "
+    "WHERE id = $2 AND generation = $3 AND status = 'running' "
+    "AND lease_expires_at > clock_timestamp() RETURNING id",
+    json.dumps(result), job_id, generation,
 )
+if accepted is None:
+    raise LeaseRenewalFailed(job_id)
 ```
 
 **Best for:** Simple architectures where the job table is the single source of truth.
@@ -249,18 +259,22 @@ Worker: *crashes*
 
 ```python
 async def run_task(job_id: str, task_token: str):
-    heartbeat_task = asyncio.create_task(heartbeat_loop(job_id, task_token))
-    try:
-        result = await do_inference(job_id)
-        await send_task_success(task_token, result)        # graceful success
-    except Exception as e:
-        await send_task_failure(task_token, error=str(e))  # graceful failure
-    finally:
-        heartbeat_task.cancel()
-    # If the process is killed before reaching here:
-    # - Heartbeat stops → orchestrator detects ungraceful failure
-    # - Message visibility timeout expires → task re-enqueued (if queue-based)
+    async with asyncio.TaskGroup() as group:
+        heartbeat = group.create_task(heartbeat_loop(job_id, task_token))
+        try:
+            async with asyncio.timeout(600):
+                result = await do_inference(job_id)
+                await send_task_success(task_token, result)
+        finally:
+            heartbeat.cancel()  # TaskGroup awaits cancellation before exiting
 ```
+
+`heartbeat_loop` must raise on lost authority; TaskGroup then cancels and awaits inference.
+The work must cooperate with cancellation and bound its own blocking I/O. The coordinator handles
+the resulting exception group and persists retry/failure state. Do not convert a lost success
+response into a contradictory failure: reconcile the token/result before retrying. A remote request
+already sent cannot be undone by cancellation; fence it or give it a stable idempotency key.
+
 
 ---
 
@@ -357,33 +371,79 @@ after `SET NX` and every retry will skip an effect that never happened. Use a `c
 record with an expiring lease, and couple `complete` to the durable business effect in one database
 transaction whenever both live in the same store.
 
+The claim row has a unique `task_id`, `state`, `generation BIGINT NOT NULL`, and
+`lease_expires_at TIMESTAMPTZ NOT NULL`. This excerpt uses one asyncpg connection; the effect must
+use that same connection and contain only local transactional writes.
+
 ```python
 async def process_if_claimed(db, task_id: str, task_data: dict):
-    claimed = await db.fetchval(
+    generation = await db.fetchval(
         """
-        INSERT INTO task_effects (task_id, state, lease_expires_at)
-        VALUES ($1, 'claimed', now() + interval '2 minutes')
+        INSERT INTO task_effects (task_id, state, generation, lease_expires_at)
+        VALUES ($1, 'claimed', 1, clock_timestamp() + interval '2 minutes')
         ON CONFLICT (task_id) DO UPDATE
-          SET state = 'claimed', lease_expires_at = EXCLUDED.lease_expires_at
+          SET state = 'claimed', generation = task_effects.generation + 1,
+              lease_expires_at = EXCLUDED.lease_expires_at
         WHERE task_effects.state <> 'complete'
-          AND task_effects.lease_expires_at < now()
-        RETURNING true
-        """,
-        task_id,
+          AND task_effects.lease_expires_at < clock_timestamp()
+        RETURNING generation
+        """, task_id,
     )
-    if not claimed:
-        return  # another live claimant, or the effect is already complete
-
+    if generation is None:
+        return False
     async with db.transaction():
-        # This write and the completion marker commit together. A crash rolls
-        # both back, so a later claimant can safely retry.
-        await apply_business_effect(db, task_id, task_data)
-        await db.execute(
-            "UPDATE task_effects SET state = 'complete' "
-            "WHERE task_id = $1 AND state = 'claimed'",
-            task_id,
+        current = await db.fetchrow(
+            "SELECT state, generation, lease_expires_at > clock_timestamp() AS live "
+            "FROM task_effects WHERE task_id=$1 FOR UPDATE", task_id,
         )
+        if (current["state"] != "claimed" or current["generation"] != generation
+                or not current["live"]):
+            return False
+        await apply_business_effect(db, task_id, task_data)
+        completed = await db.fetchval(
+            "UPDATE task_effects SET state='complete' "
+            "WHERE task_id=$1 AND generation=$2 AND state='claimed' RETURNING task_id",
+            task_id, generation,
+        )
+        if completed is None:
+            raise RuntimeError("lost claim")  # rolls the effect back too
+    return True
 ```
+
+Here is the race that the row lock closes:
+
+```mermaid
+sequenceDiagram
+    participant A as Worker A generation 1
+    participant D as task_effects row
+    participant B as Worker B generation 2
+    A->>D: Claim then pause beyond lease
+    B->>D: Reclaim, generation becomes 2
+    A->>D: Lock and check generation 1
+    D-->>A: Current generation 2, reject before effect
+    B->>D: Lock, validate 2, effect plus complete
+    D-->>B: Commit together
+```
+
+If A instead locks and validates while its lease is live, B's reclaim waits for that transaction;
+after A commits `complete`, B's predicate refuses it. Keep this transaction short. The lock orders
+local effects; it does not fence a remote service. The complete protocol and recovery tests belong
+in the [lease/fencing path](../../background_work/reliability/README.md).
+
+
+The local integration fixture extracts the exact function above, creates two PostgreSQL connections,
+forces A to resume after B reclaims, and injects a failure before the completion marker:
+
+```bash
+python -m pip install asyncpg==0.32.0
+python architecture/long_running_tasks/examples/verify_claim_transaction.py
+```
+
+Run from repository root with Docker available. The fixture publishes only a random loopback port,
+uses a unique disposable container, and removes it afterward. Expected output is `PASS generation 1
+resumes after generation 2; only B's effect commits` and `PASS failure before completion rolls the
+local effect back`. These checks verify local PostgreSQL effects; remote fencing remains a separate
+receiver contract.
 
 When the effect belongs to a remote service, use that service's idempotency key if available and
 persist the returned operation ID. No local Redis flag can atomically prove an unrelated remote

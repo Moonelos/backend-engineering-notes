@@ -271,10 +271,8 @@ def alert_ops(message_data: dict, retry_data: dict):
         extra={
             "actor": message_data["actor_name"],
             "message_id": message_data["message_id"],
-            "args": message_data["args"],
             "retries": retry_data["retries"],
             "max_retries": retry_data["max_retries"],
-            "traceback": message_data["options"].get("traceback"),
         },
     )
 
@@ -298,12 +296,10 @@ class DeadLetterMiddleware(dramatiq.Middleware):
             "max_retries", actor.options.get("max_retries", 20)
         )
         failed_msg = {
+            "message_id": message.message_id,
             "actor": message.actor_name,
-            "args": message.args,
-            "kwargs": message.kwargs,
             "retries": message.options.get("retries", 0),
             "max_retries": max_retries,
-            "traceback": message.options.get("traceback"),
         }
         logger.error(f"Dead letter: {failed_msg}")
         db.dead_letters.insert_one(failed_msg)
@@ -442,7 +438,7 @@ WINDOW_LIMITER = WindowRateLimiter(
     rate_limit_backend,
     "api-window-limiter",
     limit=100,
-    window=60_000,  # 60 seconds
+    window=60,  # seconds; this API does not use milliseconds
 )
 
 @dramatiq.actor
@@ -503,11 +499,13 @@ Chain actors together — each step's result feeds into the next.
 import dramatiq
 
 @dramatiq.actor(store_results=True)
-def download(url: str) -> bytes:
-    return requests.get(url).content
+def download(url: str) -> str:
+    response = requests.get(url, timeout=(3, 10))
+    response.raise_for_status()
+    return response.text  # JSON-serializable text; keep payload size bounded
 
 @dramatiq.actor(store_results=True)
-def parse(raw: bytes) -> dict:
+def parse(raw: str) -> dict:
     return json.loads(raw)
 
 @dramatiq.actor(store_results=True)
@@ -549,7 +547,7 @@ group = dramatiq.group([
 group.run()
 
 # Wait for all results
-results = group.get_results(block=True, timeout=60_000)
+results = list(group.get_results(block=True, timeout=60_000))
 print(results)  # ["img_123_thumbnail.jpg", "img_123_medium.jpg", "img_123_large.jpg"]
 ```
 
@@ -575,6 +573,19 @@ g = dramatiq.group([process_item.message(item) for item in items])
 g.add_completion_callback(aggregate_results.message())
 g.run()
 ```
+
+The barrier is the owner of the callback decision; the business database still owns whether aggregation is legal.
+
+```mermaid
+flowchart LR
+    G[group.run] --> A[process_item A]
+    G --> B[process_item B]
+    A --> C[GroupCallbacks barrier]
+    B --> C
+    C -->|last child completes| R[aggregate_results message]
+```
+
+The last child reaching the barrier releases the callback. A callback retry can repeat aggregation, so a stable aggregate identity and conditional durable completion remain necessary. The barrier is not a business transaction spanning all children.
 
 ⚠️ Calling `run()` after `add_completion_callback()` **without** the `GroupCallbacks` middleware registered raises `RuntimeError`. The middleware uses a distributed barrier in the rate-limiter backend to detect the last child finishing, which is why it needs a backend and is not enabled by default.
 
@@ -664,7 +675,7 @@ class TimingMiddleware(dramatiq.Middleware):
         when SkipMessage is raised, which retry exhaustion never does."""
         logger.error(
             f"Message permanently failed: actor={message.actor_name} "
-            f"message_id={message.message_id} args={message.args} "
+            f"message_id={message.message_id} "
             f"retries={message.options.get('retries', 0)}"
         )
 ```
@@ -910,17 +921,14 @@ The fix is to make the *set of intents* durable in the same transaction as the s
 def on_user_signup(user_id: str):
     """Durable fan-out: one transaction records every child that must happen."""
     with db.begin() as tx:                       # single atomic write
-        tx.execute(
-            insert(outbox),
-            [
-                # (user_id, step) is UNIQUE — a redelivery of on_user_signup
-                # re-inserts nothing instead of duplicating the work
-                {"user_id": user_id, "step": "welcome_email"},
-                {"user_id": user_id, "step": "default_workspace"},
-                {"user_id": user_id, "step": "admin_notification"},
-                {"user_id": user_id, "step": "onboarding_sequence"},
-            ],
-        ).on_conflict_do_nothing()
+        from sqlalchemy.dialects.postgresql import insert
+        statement = insert(outbox).values([
+            {"user_id": user_id, "step": "welcome_email"},
+            {"user_id": user_id, "step": "default_workspace"},
+            {"user_id": user_id, "step": "admin_notification"},
+            {"user_id": user_id, "step": "onboarding_sequence"},
+        ]).on_conflict_do_nothing(index_elements=["user_id", "step"])
+        tx.execute(statement)
 ```
 
 A separate publisher polls unpublished outbox rows, `.send()`s each one, and marks it published; each child actor is idempotent on `(user_id, step)`. Now a crash anywhere leaves a recoverable state: either the rows exist and will be published, or the transaction rolled back and the signup did not happen. See [queue and worker architectures §3](../../execution/01_queue_and_worker_architectures.md) for the publisher, and [idempotency and external effects](../../reliability/03_idempotency_and_external_effects.md) for the per-child idempotency.
@@ -1040,39 +1048,41 @@ for message_id in r.zrange("dramatiq:default.XQ", 0, -1):
     payload = r.hget("dramatiq:default.XQ.msgs", message_id)
     if payload:
         m = Message.decode(payload)
-        print(m.message_id, m.actor_name, m.args, m.options.get("traceback", "")[-200:])
+        print(m.message_id, m.actor_name)  # inspect payload only through an authorized redacted tool
 
-# Step 2: redrive an explicitly chosen set, recording the action before enqueueing.
-SELECTED_IDS = [b"a3f1...", b"b7c2..."]   # pasted from step 1, reviewed by a human
+# Step 2: persist selected redrive intents, not permanent "already sent" flags.
+# Integration excerpt: redrives has UNIQUE(message_id), payload bytes,
+# operator, reason, created_at and nullable published_at columns.
+from sqlalchemy.dialects.postgresql import insert
 
+SELECTED_IDS = [b"a3f1...", b"b7c2..."]  # reviewed message IDs
 for message_id in SELECTED_IDS:
     payload = r.hget("dramatiq:default.XQ.msgs", message_id)
     if payload is None:
         continue
     message = Message.decode(payload)
-
-    # Durable record of the redrive, written BEFORE the enqueue. The unique
-    # constraint on message_id makes rerunning this script a no-op instead of
-    # a second delivery.
+    replay = message.copy(queue_name="default", options={"retries": 0})
     with db.begin() as tx:
-        inserted = tx.execute(
-            insert(redrives)
-            .values(
-                message_id=message.message_id,
-                actor_name=message.actor_name,
-                operator=os.environ["OPERATOR"],
-                reason="upstream outage resolved",
-            )
-            .on_conflict_do_nothing()
-        )
-        if inserted.rowcount == 0:
-            log.info("already_redriven", message_id=message.message_id)
-            continue
+        tx.execute(insert(redrives).values(
+            message_id=message.message_id,
+            payload=replay.encode(),
+            operator=os.environ["OPERATOR"],
+            reason="upstream outage resolved",
+        ).on_conflict_do_nothing(index_elements=["message_id"]))
 
-    # copy() preserves args/kwargs — and therefore the business idempotency key
-    # the actor dedups on, so a redrive of already-completed work is a no-op.
-    broker.enqueue(message.copy(queue_name="default"))
+# Separate relay: lock one unpublished intent, enqueue, then mark and commit.
+# If enqueue succeeds and this transaction dies, replay repeats safely.
+with db.begin() as tx:
+    row = tx.execute(select(redrives)
+        .where(redrives.c.published_at.is_(None))
+        .with_for_update(skip_locked=True).limit(1)).mappings().first()
+    if row:
+        broker.enqueue(Message.decode(row["payload"]))
+        tx.execute(update(redrives).where(redrives.c.message_id == row["message_id"])
+                   .values(published_at=func.now()))
 ```
+
+A crash before enqueue leaves an unpublished row for the relay; a crash after enqueue may repeat the delivery. The business key remains unchanged, so the actor must still deduplicate effects. Retain operator/reason evidence and verify the original failure is repaired before admission.
 
 ⚠️ **`copy()` keeps the original `message_id` and merges options over the existing ones — including `"retries"`.** A message that dead-lettered with `retries: 20` is re-enqueued still holding that counter, so the `Retries` middleware fails it again on the very first exception. To give the redriven copy a fresh retry budget, override it: `message.copy(queue_name="default", options={"retries": 0})`.
 

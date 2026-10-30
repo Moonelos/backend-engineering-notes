@@ -214,5 +214,29 @@ Webhooks and a read API complement each other: push gives low-latency hints; pul
 
 ---
 
-**Next**: [Webhook Producer Design](02_producer_design.md)
 
+## Recap
+
+- An event is a durable business fact; delivery and attempt IDs serve different retry boundaries.
+- A successful HTTP receipt transfers processing responsibility to the consumer.
+- Durable consumer state must survive work failing after acknowledgement.
+
+## Check yourself
+
+**evt_1 reaches subscription A, whose worker fails after returning 204; does the producer retry?**
+
+<details><summary>Reasoned answer</summary>
+
+Not merely because that worker failed: 204 completed the producer delivery contract, so the consumer must retry processing from its durable inbox. A provider retry caused by a lost response is a different event and must be deduplicated.
+
+</details>
+
+**A producer retries after losing the 204. Should it invent a new event ID?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Preserve the event identity so the consumer can recognize the already accepted fact.
+
+</details>
+
+**Next**: [Webhook Producer Design](02_producer_design.md)

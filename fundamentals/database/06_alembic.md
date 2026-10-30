@@ -191,7 +191,7 @@ selects the synchronous driver used here.
 > from .post import Post
 > from .tag import Tag
 > ```
-> If a model isn't imported here, Alembic won't see it and autogenerate will skip it.
+> If a model is not imported, its table is absent from `target_metadata`. A new table may be omitted; an existing database table can instead be interpreted as removed and produce `DROP TABLE`. Import all intended models, constrain comparison scope deliberately, and review every unexpected removal before executing a generated revision. [Alembic autogenerate](https://alembic.sqlalchemy.org/en/latest/autogenerate.html).
 
 ---
 
@@ -1105,6 +1105,19 @@ alembic current
 alembic check
 ```
 
+Two independently created revisions share a predecessor. A merge revision depends on both:
+
+```mermaid
+flowchart TD
+ P[Common predecessor] --> A[a1b2c3 developer A]
+ P --> B[d4e5f6 developer B]
+ A --> M[m1n2o3 merge revision]
+ B --> M
+ M --> H[Single head after both parents]
+```
+
+The two-parent `down_revision` does not discard either branch or reconcile conflicting DDL automatically. Review the parent operations and write conflict resolution when their schema changes cannot coexist; a graph merge alone is not a data migration.
+
 ### "Multiple heads"
 
 ```bash
@@ -1115,7 +1128,7 @@ ERROR: Multiple head revisions are present
 **Fix:**
 
 ```bash
-alembic merge -m "merge heads"
+alembic merge -m "merge heads" heads
 alembic upgrade head
 ```
 

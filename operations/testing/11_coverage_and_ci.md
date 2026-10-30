@@ -6,7 +6,7 @@
 > **Key insight**: Coverage locates unobserved execution paths; it cannot establish whether
 > assertions protect the right behavior.
 
-Coverage is a proxy metric — 100% coverage does not mean "well tested", it means "every line was executed at least once". Low coverage, though, is a reliable red flag: a file at 20% almost certainly has broken paths no one has seen fail.
+Coverage is a proxy metric — 100% coverage does not mean "well tested", it means "every line was executed at least once". Low coverage identifies missing execution evidence. It does not prove those paths contain bugs: prioritize missing authorization-denial tests over an equally uncovered formatting helper.
 
 ---
 
@@ -28,13 +28,13 @@ Configure defaults in `pyproject.toml`:
 
 ```toml
 [tool.pytest.ini_options]
-addopts = "--cov=app --cov-report=term-missing --cov-fail-under=80"
+addopts = ["--strict-markers", "-m", "not integration and not e2e and not live",
+           "--cov=app", "--cov-report=term-missing", "--cov-fail-under=80"]
 
 [tool.coverage.run]
 branch = true               # count branch coverage, not just line
 source = ["app"]
 omit = [
-    "app/migrations/*",     # alembic versions — not meaningful to cover
     "app/__main__.py",
     "*/tests/*",
 ]
@@ -67,7 +67,7 @@ app/routers/admin.py          22     10      6      1    56%   18-27, 31->exit
 - `BrPart` — branches partially covered (one side taken, not both).
 - `Missing` — line numbers; `48->52` means the branch from line 48 to line 52 was never taken.
 
-Focus on `BrPart` columns, not overall percentage. A file at 95% with several partial branches hides more bugs than a file at 85% with all branches fully covered.
+Inspect `BrPart` and the assertions guarding each risky decision. A 100%-executed tenant check with no cross-tenant denial assertion may be weaker than an 85%-covered module whose security branches have adversarial tests. Conversely, uncovered formatting code may be low risk. Percentages alone cannot rank actual bugs.
 
 ---
 
@@ -75,7 +75,10 @@ Focus on `BrPart` columns, not overall percentage. A file at 95% with several pa
 
 Coverage should reflect code you *want* tested. Exclude:
 
-- Generated code (Alembic migrations, protobuf stubs).
+- Mechanically generated artifacts, where their source contract is tested (for example protobuf stubs).
+  Alembic autogeneration still requires review; schema and data migrations are executable behavior.
+  Test upgrades and mixed-version compatibility on a disposable production-dialect database even
+  if your reporting policy excludes migration boilerplate.
 - `if __name__ == "__main__":` guards.
 - Abstract methods / Protocols (`...`).
 - Debug helpers guarded by `if DEBUG:`.
@@ -126,7 +129,10 @@ pytest -n auto --dist loadfile # group tests by file
 
 - Tests must be isolated. Shared DBs, shared temp dirs, shared `app.dependency_overrides` — all break.
 - Session-scoped fixtures run **per worker**, not once total. A testcontainer (see [08](08_database_testing.md)) spun up per worker is fine; one per process is expensive.
-- Combine with `--cov` using `pytest-cov`'s `--cov-append` or `COVERAGE_RUN_PARALLEL=1` + `coverage combine` in CI.
+- For one xdist run, use `pytest -n 4 --cov=app`; pytest-cov combines worker data.
+  `--cov-append` is for intentionally accumulating separate runs and can retain stale evidence.
+  Separate CI jobs need unique data artifacts and an explicit later combine step.
+  [pytest-cov](https://pytest-cov.readthedocs.io/en/latest/readme.html), checked 2026-10-30.
 
 ---
 
@@ -173,7 +179,7 @@ jobs:
       - name: Run disposable Postgres integration profile
         env:
           DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/postgres
-        run: pytest -m integration
+        run: pytest -m "integration and not e2e and not live" --no-cov
 
       - uses: codecov/codecov-action@v5
         with:
@@ -261,7 +267,7 @@ def test_full_cron_cycle():
 ```
 
 ```bash
-pytest -m "not slow"           # dev default
+pytest -m "not slow and not integration and not e2e and not live"  # dev profile
 pytest                         # CI default
 ```
 
@@ -270,3 +276,35 @@ pytest                         # CI default
 ## Next
 
 - [12 — Common Mistakes](12_common_mistakes.md) — the recurring bugs that bite every pytest project eventually.
+
+## Recap and retrieval
+
+- Coverage records execution paths, not whether assertions detect a wrong outcome.
+- Hermetic profile selection must survive additions to coverage and CI configuration.
+- xdist worker data belongs to one run; combine separate jobs explicitly without stale append state.
+
+**A tenant predicate executes in every test and still permits another tenant. Can 100% coverage certify it?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Assert cross-tenant denial and check that a targeted incorrect predicate causes a failure. Executing a line is not an oracle for its result.
+
+</details>
+
+**A later integration command inherits XML coverage output. What could it overwrite?**
+
+<details><summary>Reasoned answer</summary>
+
+The earlier hermetic report. Disable coverage for the separate check or give each job unique data/report paths and deliberately combine compatible runs.
+
+</details>
+
+**Try it:** Split hermetic and integration CI commands while keeping the first XML report intact.
+
+Hint: A later command can inherit addopts.
+
+<details><summary>Worked solution</summary>
+
+Run the hermetic command with its own XML path; run the integration profile with --no-cov or a separate report/data file. Never upload a filename whose producer is ambiguous.
+
+</details>

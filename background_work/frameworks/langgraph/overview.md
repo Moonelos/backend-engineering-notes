@@ -95,6 +95,40 @@ Success is a first invocation containing `__interrupt__` and a second invocation
 
 `InMemorySaver` disappears with the process and is suitable only for tests. Use a supported database-backed checkpointer or the managed Agent Server persistence path, configure retention/encryption, and test restart against the actual store.
 
+### Restart a paused thread in a second process
+
+The [complete persisted example](../../examples/langgraph/approval.py) keeps the same graph and replaces only the saver, adding a tiny durable effect record for generation. Start PostgreSQL using the [job lab](../../foundations/03_minimal_durable_task.md#run-one-job-before-studying-the-schema). From the repository root:
+
+```bash
+cd background_work/examples/langgraph
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+export DATABASE_URL=postgresql://lab:lab@127.0.0.1:56432/jobs
+.venv/bin/python approval.py pause editorial-run-42
+.venv/bin/python approval.py resume editorial-run-42
+```
+
+The first process prints `paused ('review',)` and exits completely. The second recreates the graph against PostgreSQL, verifies that its next node is `review`, and prints `resumed final:verified research draft`. No original input is resubmitted. Use a fresh thread ID for another experiment; a completed thread is not a waiting approval.
+
+The checkpointer's `setup()` creates its schema in this lab. Production migration permissions should be separate from the runtime role. A `graph_effects` row is keyed by `thread_id:generate:v1`; its request hash prevents reusing the same operation for changed input. This is a local transactional effect fixture. A remote provider needs the external-effects protocol, including recovery when provider success and local recording are separated by a crash.
+
+The state belongs to PostgreSQL across process boundaries; resuming still reruns the interrupted node.
+
+```mermaid
+sequenceDiagram
+    participant A as Process A
+    participant D as PostgreSQL saver
+    participant B as Process B
+    A->>D: Save draft and review interrupt for run-42
+    Note over A: Process exits
+    B->>D: get_state thread run-42
+    D-->>B: next = review
+    B->>B: Restart review node with resume decision
+    B->>D: Save generation effect and completed checkpoint
+```
+
+The draft checkpoint avoids repeating preparation. Code before `interrupt()` in `review` would run again; keep it pure or idempotent. [PostgresSaver setup and lifecycle](https://github.com/langchain-ai/langgraph/blob/main/libs/checkpoint-postgres/README.md), checked 2026-10-30.
+
 The persisted contract includes:
 
 - Stable `thread_id` mapped to the business workflow/run.
@@ -169,5 +203,36 @@ Do not use a checkpointer as the only record of a payment, email, or domain enti
 **How you know it is working**: stop the runtime at an interrupt and mid-graph, restart it against the durable store, resume the same thread, and assert one effect per operation key. Monitor checkpoint-write failures, interrupted/error thread age, state size, replayed node count, and graph-version compatibility.
 
 ---
+
+## Recap and check yourself
+
+- A stable thread ID plus durable checkpointer preserves graph progress across processes.
+- Resume restarts the interrupted node, so preceding code may execute again.
+- Graph compatibility and external-effect identity require policies beyond checkpoint persistence.
+
+**send_email runs before interrupt. How many sends can occur after resume?**
+
+<details><summary>Answer</summary>
+
+At least two across the first run and resume, because the node restarts. Place the effect after approval or use a stable operation key and durable result reconciliation.
+
+</details>
+
+**An old thread waits at review, but the deployment renames that node. Why is keeping the saved data insufficient?**
+
+<details><summary>Answer</summary>
+
+The saved cursor refers to a node in the graph. Keep a compatible routing shim or migrate the thread explicitly; data persistence does not provide code compatibility.
+
+</details>
+
+**Try it:** Move a notification before `interrupt()` in a scratch graph. Replace it with `load_or_create_effect(operation_key=...)`; fill the key from the state/thread context.
+
+<details><summary>Hint and worked solution</summary>
+
+The key describes the business notification, not this node invocation. Use a stable thread ID plus notification purpose and definition version, and compare the request hash. Resume can call it again but returns the recorded outcome. A real provider also needs ambiguity reconciliation.
+
+</details>
+
 
 **Next**: [Part 9: Decision Guide](../00_system_selection.md)

@@ -133,4 +133,41 @@ destructive replay or region game days against production without an approved, b
 
 ---
 
+## Recap
+
+- A fault test names the exact durable boundary where the child stops.
+- Restart evidence includes broker output, offsets and effect-store state.
+- Mocks exercise logic but cannot certify broker acknowledgement or process-loss recovery.
+
+## Check yourself
+
+**Q: A test raises an exception after mock produce in the same process. Has it proven crash recovery?**
+
+<details><summary>Answer</summary>
+
+No. It did not lose process memory/sockets or establish broker acknowledgement and offset state. Terminate a child at an explicit boundary and inspect durable stores after restart.
+
+</details>
+
+**Q: The final count is one but the event identity differs from the intended input. Is that a pass?**
+
+<details><summary>Answer</summary>
+
+No. Count alone can hide loss plus a different extra event. Compare expected event IDs, business values and checkpoints.
+
+</details>
+
+## Try it
+
+Add a fault after database effect commit but before offset commit to the harness.
+
+Hint: Keep the same consumer identity and database across the restart.
+
+<details><summary>Worked solution</summary>
+
+Require redelivery of the same event, one durable effect and an eventually advanced group offset. Recreating the database between attempts invalidates this test.
+
+</details>
+
+
 **Next**: [Kafka Operations](../operations/README.md)

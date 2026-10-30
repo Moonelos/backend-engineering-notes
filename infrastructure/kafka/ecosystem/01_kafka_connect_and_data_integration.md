@@ -41,4 +41,29 @@ service or workflow engine with explicit domain state.
 
 ---
 
+## Recap
+
+- A connector moves data and checkpoints progress while workers own its lifecycle.
+- A successful destination write can precede the checkpoint, so retries need idempotency.
+- Connector configuration loads privileged code and requires deployment and access controls.
+
+## Check yourself
+
+**Q: A sink writes a row then crashes before storing its offset. What makes restart safe?**
+
+<details><summary>Answer</summary>
+
+A stable record key and idempotent or transactional destination write. The checkpoint may cause the same record to be delivered again, so a plain increment can apply twice.
+
+</details>
+
+**Q: The worker process is healthy but one task is failed. Is replication healthy?**
+
+<details><summary>Answer</summary>
+
+No. Worker liveness does not prove task progress. Compare the task state, source position and destination freshness before declaring recovery.
+
+</details>
+
+
 **Next**: [Stream Processing](02_stream_processing.md)

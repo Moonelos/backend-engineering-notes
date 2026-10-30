@@ -42,7 +42,7 @@ def heavy(n: int) -> float:
 def main() -> None:
     inputs = [300_000, 350_000, 400_000, 450_000]
 
-    with ProcessPoolExecutor() as ex:
+    with ProcessPoolExecutor(max_workers=2) as ex:
         futures = [ex.submit(heavy, n) for n in inputs]
         for fut in as_completed(futures):
             print(fut.result())
@@ -54,6 +54,23 @@ if __name__ == "__main__":
 The `__main__` guard prevents child imports from starting another pool. It is required for safe importing with the `spawn` and `forkserver` start methods, which cover every platform's modern default. Process pools also do not work reliably from an interactive interpreter because worker processes must import the main module.
 
 ---
+
+Track the owner on each side of the serialization boundary:
+
+```mermaid
+sequenceDiagram
+ participant A as Async caller
+ participant P as Pool owner
+ participant W as Child process
+ A->>P: Submit compute with scalar inputs
+ P->>W: Pickled callable and arguments
+ W->>W: Work in private memory
+ Note over A: Caller deadline ends wait
+ W-->>P: Later pickled result
+ P->>P: Release actual-work permit
+```
+
+The deadline sends no termination to a running child. The owner still owes admission accounting and shutdown until actual completion.
 
 ## 3. Design an Importable, Picklable Boundary
 
@@ -102,6 +119,22 @@ def main():
 Importability is separate from serialization. A top-level function can still fail if its module performs side effects during import, and a serializable object can still be too large to transfer efficiently.
 
 ---
+
+### Carry the same four inputs through the lifecycle lab
+
+The complete [pool_lifecycle.py](examples/pool_lifecycle.py) keeps one owner around four integer inputs, batching, caller timeout, failed initialization and shutdown. Run from the repository root with **Python 3.14+** (needed only for its final emergency-kill experiment):
+
+```bash
+python3.14 fundamentals/concurrency/processes/examples/pool_lifecycle.py
+```
+
+First, two workers return squares 1, 4, 9, 16 with their process IDs. The lab then batches the same four inputs into two dispatches and asserts the same values. It prints dispatch counts rather than promising batching is faster on every machine. Two large batches reduce IPC but can delay a short result behind a long item; measure both throughput and tail latency.
+
+Next, two 400ms calls occupy both admitted slots. A 30ms caller wait expires; the completion marker is absent and a third submission is rejected. Later the marker appears and the owner releases both permits. `submit()` exposes only a shielded caller view; the internal accounting future stays private to the owner. A second probe directly cancels an awaiting task while its process is still running and proves the replacement remains rejected. Completion callbacks observe errors on both futures even when the caller has left. Fail-fast admission means there is no hidden application waiting queue; choose an explicit bounded queue if waiting is required.
+
+Finally, a deliberately failing initializer breaks its pool. The owner discards it, fixes the configured cause and creates exactly one replacement; a successful square of 7 proves recovery. Recreating the same broken configuration repeatedly would amplify the failure. Shutdown stops admission, waits within a drain budget, and only then uses pool-wide `kill_workers()` for an overdue **pure-compute** fixture. This may skip child cleanup; production jobs with effects require durable identity/reconciliation before that policy is safe.
+
+Expected final line: `PASS: bounded admission, late completion, one recovery and pool-wide shutdown escalation`. The deliberately broken initializer also prints its diagnostic traceback. These are temporary local marker files, not a demonstration of crash-safe business persistence. Use this owner in an application lifespan, call its `call()` from handlers, and close it after intake stops. A request timeout must not create a new pool or release its permit early.
 
 ## 4. Choose `submit()` or `map()`
 
@@ -366,5 +399,42 @@ lifecycle or upstream queues are part of the deployment.
 - [`multiprocessing.shared_memory`](https://docs.python.org/3/library/multiprocessing.shared_memory.html)
 
 ---
+
+
+## Recap
+
+- Serialization and dispatch costs must be repaid by useful CPU work.
+- Admission follows actual Future completion; timeout only ends a caller wait.
+- Broken pools need cause repair and bounded recreation; emergency termination affects all workers.
+
+## Check yourself
+
+**Q: The caller timed out and the marker is absent. May replacement work reuse its permit?**
+
+<details><summary>Answer</summary>
+
+No. The child may still be running. The shielded accounting future releases capacity only at actual completion.
+
+</details>
+
+**Q: Does chunksize=500 with buffersize=20 cap input elements at 20?**
+
+<details><summary>Answer</summary>
+
+No. A process work item can contain a 500-element chunk. Budget chunked inputs, serialization bytes and consumer-held results, not just the buffer number.
+
+</details>
+
+## Try it
+
+In the lab change the two long tasks from 400ms to 800ms while retaining the 30ms caller deadline. Predict permit occupancy and the final marker.
+
+Hint: The caller budget and work duration have different owners.
+
+<details><summary>Worked solution</summary>
+
+Both permits remain charged after timeout; replacement is rejected. The marker appears later at actual completion. A shutdown budget shorter than the work switches to the explicit pool-wide escalation policy.
+
+</details>
 
 **Next**: [Background Work and Durable Jobs](../../../background_work/README.md)

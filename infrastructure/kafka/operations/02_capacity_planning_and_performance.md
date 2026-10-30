@@ -67,4 +67,29 @@ capacity. More shards cannot parallelize one dominant key.
 
 ---
 
+## Recap
+
+- Storage includes record bytes, retention and replication, plus operational headroom.
+- Recovery throughput must drain backlog while keeping up with new arrivals.
+- The largest bottleneck across storage, network and handlers determines useful capacity.
+
+## Check yourself
+
+**Q: Live input is 20 MB/s and backlog is 72 GB. At 4 MB/s per partition, what lower bound meets a 15-minute recovery?**
+
+<details><summary>Answer</summary>
+
+The backlog requires 72,000/900 = 80 MB/s; add 20 MB/s live input for 100 MB/s. ceil(100/4)=25 partitions before skew and failure headroom. The four-partition write minimum does not dominate.
+
+</details>
+
+**Q: Will 25 partitions suffice if one key carries 30 MB/s?**
+
+<details><summary>Answer</summary>
+
+Not with a 4 MB/s serial handler for that key. Aggregate arithmetic assumes useful distribution; partitioning cannot split a strict same-key sequence automatically.
+
+</details>
+
+
 **Next**: [Observability and Incident Response](03_observability_and_incident_response.md)

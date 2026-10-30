@@ -40,10 +40,10 @@ That's it. Where the data comes from depends on the callable's signature — the
 
 There are no special rules for dependencies. A dependency's parameters follow the exact same mapping:
 
-- No default → path or query
-- Has default → query
-- Pydantic model → body
-- Explicit annotation → that source
+- A route-placeholder name → required path value; otherwise an unmarked scalar → query
+- Has default, and is not a route placeholder → optional query
+- An unmarked Pydantic model → body; `Depends(Model)` instead constructs a dependency from its callable signature
+- Explicit annotation → that supported source; conflicting path/query declarations are invalid
 
 ---
 
@@ -93,7 +93,7 @@ Result:
 {"page": 3, "limit": 20}
 ```
 
-The dependency's parameters (`page`, `limit`) are resolved as query parameters because they have defaults.
+The dependency's scalar parameters (`page`, `limit`) are not route placeholders, so they bind query values. Defaults make those inputs optional.
 
 ---
 
@@ -115,11 +115,11 @@ def endpoint(p: Pagination = Depends()):
 
 FastAPI interprets this as:
 
-```python
-Pagination(page=?, limit=?)
+```text
+Pagination(page=<resolved query value>, limit=<resolved query value>)
 ```
 
-Since the fields have defaults → query parameters.
+These scalar constructor parameters do not match route placeholders, so they are query inputs; their defaults make them optional.
 
 Request:
 
@@ -142,7 +142,9 @@ Pagination(page=2, limit=20)
 
 The same model with `Depends()` behaves completely differently than without.
 
-**Validation failure behaviour.** When a required field is missing or the wrong type, FastAPI surfaces it as a **422 Unprocessable Entity** with a Pydantic-style error body (same shape as if it were a regular query parameter validation error) — **not** as a DI resolution error. The model is constructed by FastAPI's parameter-binding layer, so validation happens there and clients see a normal request-validation response. If a field genuinely has no way to be populated from the request (e.g. the name does not match any known source and has no default), that surfaces at app startup as a `FastAPIError` from the dependency resolver rather than at request time.
+**Validation has two boundaries.** FastAPI first extracts and validates declared request parameters: an absent required scalar or invalid scalar type normally produces 422. A scalar whose name is not a path placeholder is ordinarily a required query parameter, not an unresolvable startup dependency. Unsupported declarations can fail during route registration, but lack of a default alone is valid.
+
+FastAPI then calls the dependency, including a model constructor used through `Depends(Model)`. A `pydantic.ValidationError` raised inside that callable by a model validator is not automatically the same as a `RequestValidationError` from extraction; without an explicit mapping it can become a server error. Prefer an explicit query-parameter model for request validation, or a small dependency function that validates and translates expected client errors deliberately. Do not expose every internal model failure as client fault. The [runtime tests](./examples/test_runtime_contracts.py) distinguish missing query input from a validator failure inside a constructor.
 
 ---
 
@@ -155,7 +157,7 @@ from fastapi import Header
 
 def get_context(
     user_id: int,                    # path parameter (if in route)
-    token: str = Header(...)         # header
+    token: str = Header(..., alias="Authorization")  # extraction, not authentication
 ):
     return {"user_id": user_id, "token": token}
 
@@ -535,3 +537,43 @@ Think of dependencies as **request-scoped wiring**:
 - Cleanup happens automatically
 
 You describe *what you need* — FastAPI handles *how and when* it's provided.
+
+## Choose the cleanup boundary explicitly
+
+A dependency that yields a database session has two possible cleanup boundaries in current FastAPI. `Depends(get_db, scope="function")` exits after the path operation returns, before response transmission. `scope="request"` exits after the response finishes. Request scope is the default for yield dependencies; function scope is useful when the endpoint has fully materialized its result and no later response code needs the resource. See [dependencies with yield](https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/) (checked 2026-10-30).
+
+For a CSV stream, closing the cursor immediately after constructing `StreamingResponse` would break later iteration. Keep request scope or make the response own a dedicated cursor. For a fully materialized JSON result, function scope can return a scarce connection before a slow client finishes downloading. Never defer a transaction commit that must affect the public success status until after response start.
+
+```mermaid
+sequenceDiagram
+ participant D as Yield dependency
+ participant E as Endpoint
+ participant R as Response stream
+ D->>E: Yield session
+ E->>E: Build response
+ alt Function scope
+ E->>D: Cleanup before response
+ E->>R: Send body without needing closed session
+ else Request scope
+ E->>R: Iterate body while resource remains owned
+ R->>D: Cleanup after response ends
+ end
+```
+
+The [runtime tests](./examples/test_runtime_contracts.py) record `open, endpoint, close, body` for function scope and `open, endpoint, body, close` for request scope. This is a resource lifetime choice, not a way to make background work durable. Subdependencies must have a lifetime compatible with the dependent cleanup that still uses them.
+
+## Check your understanding
+
+Dependencies form one request graph. Per-request result caching and lifespan-owned pools solve different ownership problems.
+
+**Prediction:** Two dependencies require get_db in one request, then another request starts. How many sessions are created with normal dependency caching?
+
+<details><summary>Answer</summary>
+One shared result within the first graph, then a new result in the second request. A global engine/pool is separate; use_cache=False changes repeated dependency evaluation.
+</details>
+
+**Diagnosis:** Can function-scoped cleanup close a cursor that a response generator still needs?
+
+<details><summary>Answer</summary>
+No. Function scope exits before response transmission. Use request scope or make the response explicitly own that resource until the stream ends.
+</details>

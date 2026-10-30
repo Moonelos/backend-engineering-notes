@@ -24,6 +24,50 @@ OWASP's API Security Top 10 puts broken object-level authorization, broken authe
 
 This guide complements [04 - Authentication & Security](04_authentication.md). That chapter covers JWTs, OAuth2, CORS, API keys, password hashing, and headers. This chapter covers the production layer around them.
 
+
+## First result: one ticket mutation with recoverable evidence
+
+Start with [auth_ticket_service.py](examples/auth_ticket_service.py), a complete SQLite/FastAPI lab,
+and run the [shared local regression command](04_authentication.md#first-result-a-complete-local-boundary).
+It creates ticket `42`, tenant `acme`, owner `alice` and a mutation budget of two. The authenticated
+principal resolver is injected: chapter 04 tests credential validation, while this fixture changes
+principals explicitly to test authorization without making fake headers into authentication.
+
+Bob has `ticket:read:any`, `ticket:read` and `ticket:write`. Reading Alice's ticket succeeds, but
+changing it returns 404 because Bob lacks write-any. Alice in another tenant also receives 404.
+Alice in `acme` can update the title; attempting to send `owner` fails model validation. A later
+principal refresh with no write capability returns 403. The resolver must derive current policy
+from trusted state; if production caches token capabilities, define revocation latency explicitly.
+
+```mermaid
+flowchart LR
+    P[Trusted Alice principal] --> A[Require ticket write]
+    A --> Q[Tenant acme and owner Alice predicate]
+    Q --> T[Transaction locks state]
+    T --> B[Reserve one mutation credit]
+    B --> M[Update allowed title]
+    M --> O[Insert pending audit event]
+    O --> C[Commit both]
+    C --> R[Relay can recover event after restart]
+    A --> D[403 when capability absent]
+    Q --> N[404 when object not authorized]
+    B --> E[429 when budget exhausted]
+```
+
+The actual fixture holds one SQLite write transaction across authorization, budget decrement,
+mutation and outbox insertion. A crash before commit leaves none of them changed. A crash after
+commit loses the HTTP response but leaves the title and pending event recoverable in a new database
+connection. The tests verify both cases; they do not claim an external broker delivered the event.
+A relay retries using the stable event ID and the consumer deduplicates it. Add an idempotency key
+before automatic client retries of a mutation, otherwise a lost response can consume another
+credit. This budget counts committed mutations; external paid work instead needs reservation and
+reconciliation of actual usage, with its own idempotent recovery protocol.
+
+The remaining sections derive this operation's gates and then cover conditional browser, network,
+webhook and upload integrations. SQLite's serialized writer is a local teaching boundary; a
+production database needs equivalent row locks/conditional updates and the documented isolation
+level, with policy revocation and concurrent membership updates tested explicitly.
+
 ---
 
 ## 1. The Security Decision Stack
@@ -228,26 +272,35 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def get_visible_ticket(
+async def get_ticket_for_action(
     db: AsyncSession,
     *,
     ticket_id: str,
     principal: Principal,
+    action: str,  # server-selected "read" or "write", never taken from the request
 ) -> Ticket | None:
-    if principal.tenant_id is None:
+    if action not in {"read", "write"}:
+        raise ValueError("unsupported ticket action")
+    if principal.tenant_id is None or not principal.has(f"ticket:{action}"):
         return None
 
     stmt = select(Ticket).where(
         Ticket.id == ticket_id,
         Ticket.tenant_id == principal.tenant_id,
     )
-    if not principal.has("ticket:read:any"):
+    if not principal.has(f"ticket:{action}:any"):
         stmt = stmt.where(Ticket.owner_id == principal.id)
 
     return await db.scalar(stmt)
 ```
 
-Then the endpoint has one boring decision:
+The action is part of the scope: `ticket:read:any` expands visibility within the tenant but grants
+no mutation or upload privilege. A write needs `ticket:write` and either ownership or the separate
+`ticket:write:any`. Tenant boundaries still apply to both. If ownership/state can change during a
+write, lock the row or put the authorization predicate into the mutation transaction and check its
+row count; a stale earlier read is not a permanent grant.
+
+Then the endpoint has one decision:
 
 ```python
 @router.get("/tickets/{ticket_id}", response_model=TicketRead)
@@ -256,7 +309,7 @@ async def read_ticket(
     principal: Annotated[Principal, Depends(require_capability("ticket:read"))],
     db: AsyncSession = Depends(get_db),
 ):
-    ticket = await get_visible_ticket(db, ticket_id=ticket_id, principal=principal)
+    ticket = await get_ticket_for_action(db, ticket_id=ticket_id, principal=principal, action="read")
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return ticket
@@ -417,7 +470,7 @@ async def patch_ticket(
     principal: Annotated[Principal, Depends(require_capability("ticket:write"))],
     db: AsyncSession = Depends(get_db),
 ):
-    ticket = await get_visible_ticket(db, ticket_id=ticket_id, principal=principal)
+    ticket = await get_ticket_for_action(db, ticket_id=ticket_id, principal=principal, action="write")
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
 
@@ -443,9 +496,15 @@ class TicketRead(BaseModel):
 
 
 @router.get("/tickets/{ticket_id}", response_model=TicketRead)
-async def read_ticket(ticket_id: str):
-    ticket = await load_ticket(ticket_id)
-    return ticket  # FastAPI filters to TicketRead fields
+async def read_ticket(
+    ticket_id: str,
+    principal: Annotated[Principal, Depends(require_capability("ticket:read"))],
+    db: AsyncSession = Depends(get_db),
+):
+    ticket = await get_ticket_for_action(db, ticket_id=ticket_id, principal=principal, action="read")
+    if ticket is None:
+        raise HTTPException(404, "Ticket not found")
+    return ticket  # FastAPI projects only the declared public fields.
 ```
 
 Response models are a safety net, not a substitute for correct queries. Do not query columns the caller should never touch if you can avoid it.
@@ -600,78 +659,53 @@ Rules:
 - Set short timeouts and small response-size limits.
 - Use network egress controls so the app cannot reach metadata services or private networks even if code misses something.
 
-Application-layer validation:
+### Validate at the socket boundary
+
+Resolving a hostname, checking the result, then calling ordinary HTTPX with the original hostname
+is insufficient: the HTTP client can resolve it again and connect to a different address. That
+check/connect gap is DNS rebinding. Blocking `socket.getaddrinfo` also must not run directly on the
+async event loop.
+
+The complete [auth_egress.py](examples/auth_egress.py) uses HTTPCore 1.0.9's network-backend hook.
+It resolves asynchronously inside `connect_tcp`, rejects the entire answer set if any address is
+non-public, and passes an approved **numeric IP** to the real backend. HTTPCore retains the
+original URL hostname for TLS SNI, certificate validation and the HTTP Host header. There is no
+second hostname lookup between the check and connection. [HTTPCore network backends](https://www.encode.io/httpcore/network-backends/).
 
 ```python
-import ipaddress
-import socket
-from urllib.parse import urlparse
+from auth_egress import fetch_import_source
 
-from fastapi import HTTPException, status
-
-
-ALLOWED_FETCH_HOSTS = {"api.github.com", "example-cdn.com"}
-
-
-def validate_fetch_url(raw_url: str) -> str:
-    parsed = urlparse(raw_url)
-    if parsed.scheme != "https":
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Only https URLs are allowed")
-
-    if not parsed.hostname:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "URL host is required")
-
-    hostname = parsed.hostname.lower()
-    if hostname not in ALLOWED_FETCH_HOSTS:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "URL host is not allowed")
-
-    try:
-        addresses = socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-    except socket.gaierror:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "URL host could not be resolved")
-
-    for family, _, _, _, sockaddr in addresses:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, "URL resolves to a blocked network")
-
-    return raw_url
+body = await fetch_import_source(
+    "https://api.github.com/repos/encode/httpcore",
+    allowed_hosts={"api.github.com"},
+)
 ```
 
-HTTP call:
+Copy the local module beside the importer. It rejects userinfo, non-443 ports, unapproved hosts and
+fragments, preserves TLS verification, follows no redirects, applies a ten-second total deadline
+plus phase timeouts, accepts identity encoding only, and enforces a one-megabyte body budget.
+The one-address strategy fails closed if that address cannot connect; an availability enhancement
+can try other **already checked** addresses within the same total budget. Recheck policy on each
+new connection; a connection pool is not a license to reuse a connection after policy changes.
 
-```python
-import httpx
-
-
-async def fetch_import_source(raw_url: str) -> bytes:
-    url = validate_fetch_url(raw_url)
-    async with httpx.AsyncClient(
-        follow_redirects=False,
-        timeout=httpx.Timeout(connect=2.0, read=5.0, write=2.0, pool=2.0),
-    ) as client:
-        async with client.stream("GET", url) as response:
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > 1_000_000:
-                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Response too large")
-                chunks.append(chunk)
-            return b"".join(chunks)
+```mermaid
+sequenceDiagram
+    participant App
+    participant DNS
+    participant Socket
+    App->>DNS: Resolve approved provider once for this connection
+    DNS-->>App: Public addresses
+    App->>App: Reject any non-public address
+    App->>Socket: Connect to checked numeric IP
+    App->>Socket: TLS using original provider hostname
+    Socket-->>App: Verified provider certificate and bounded response
 ```
 
-For larger imports, stream into object storage or a temp file instead of joining chunks in memory.
-
-SSRF is defense-in-depth territory. App validation helps; egress firewall rules, cloud metadata protections, and outbound proxies are the controls of record.
+The numeric connect closes the race; TLS still proves the provider identity. Production also needs
+egress policy denying internal/metadata destinations, a trusted resolver, request and decompression
+budgets, and authorized interpretation of fetched data. The local fixture tests DNS changes and
+connection arguments without contacting providers; it does not certify the deployment firewall or
+live certificate chain. Rehearse those integration boundaries in the deployed environment.
 
 ---
 
@@ -695,6 +729,7 @@ Generic HMAC verifier:
 import hashlib
 import hmac
 import time
+import re
 
 from fastapi import Header, HTTPException, Request, status
 
@@ -717,15 +752,21 @@ async def verify_webhook(
     if not x_webhook_signature or not x_webhook_timestamp:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing webhook signature")
 
-    try:
-        timestamp = int(x_webhook_timestamp)
-    except ValueError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook timestamp")
+    if (not re.fullmatch(r"[0-9]{1,12}", x_webhook_timestamp)
+            or not re.fullmatch(r"sha256=[0-9a-f]{64}", x_webhook_signature)):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Malformed webhook signature")
+    timestamp = int(x_webhook_timestamp)
 
     if abs(time.time() - timestamp) > MAX_SKEW_SECONDS:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Webhook timestamp is too old")
 
-    body = await request.body()
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 1_000_000:
+            raise HTTPException(413, "Webhook body too large")
+        chunks.append(chunk)
+    body = b"".join(chunks)
     expected = _expected_signature(x_webhook_timestamp, body)
     if not hmac.compare_digest(expected, x_webhook_signature):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid webhook signature")
@@ -733,30 +774,71 @@ async def verify_webhook(
     return body
 ```
 
-Endpoint:
+### Commit durable acceptance before acknowledging
+
+The authenticated event ID lives **inside the signed body**. A record-once flag followed by a
+separate broker enqueue loses work if the process crashes between them: retry sees the flag and
+never enqueues. Make the inbox row itself durable pending work, or insert inbox plus outbox in one
+database transaction.
+
+The local [auth_inbox.py](examples/auth_inbox.py) provides an actual SQLite pending inbox. Initialize
+its schema once at startup on durable storage; a separate worker polls/claims pending rows:
 
 ```python
-import json
+import os
 from typing import Annotated
-
 from fastapi import Depends
+from pydantic import BaseModel, Field, ValidationError
+from auth_inbox import admit, initialize
+
+INBOX_PATH = os.environ["WEBHOOK_INBOX_PATH"]
+initialize(INBOX_PATH)  # application startup; use migrations for a production database
+
+
+class EventIdentity(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
 
 
 @router.post("/webhooks/acme", status_code=202)
-async def receive_acme_webhook(
-    body: Annotated[bytes, Depends(verify_webhook)],
-    db: AsyncSession = Depends(get_db),
-):
-    payload = json.loads(body)
-    event_id = payload["id"]
-
-    inserted = await record_webhook_event_once(db, provider="acme", event_id=event_id)
-    if not inserted:
-        return {"status": "duplicate"}
-
-    await enqueue_webhook_job(provider="acme", event_id=event_id, payload=payload)
-    return {"status": "accepted"}
+def receive_acme_webhook(body: Annotated[bytes, Depends(verify_webhook)]):
+    try:
+        event = EventIdentity.model_validate_json(body)
+    except ValidationError:
+        raise HTTPException(400, "Invalid event envelope") from None
+    try:
+        inserted = admit(INBOX_PATH, "acme:configured-account", event.id, body)
+    except ValueError:
+        raise HTTPException(409, "Event identity conflicts with stored body") from None
+    return {"status": "accepted" if inserted else "duplicate"}
 ```
+
+The synchronous route runs SQLite outside the event loop. Scope the provider/account key from the
+verified signing registration, not a caller-selected tenant header. Uniqueness plus a body digest
+rejects the same authenticated ID with conflicting content. A duplicate pending row remains work;
+202 means committed acceptance, not completed business processing. Before commit, a crash rolls
+back and the provider can retry. After commit, a lost response produces a safe duplicate. Worker
+claims, retries and completion must be durable, with idempotent effects or an outbox when delivery
+crosses another system; see [long-running task recovery](../../architecture/long_running_tasks/05_advanced_patterns.md).
+
+```mermaid
+sequenceDiagram
+    participant Provider
+    participant API
+    participant DB as Durable inbox
+    participant Worker
+    Provider->>API: Signed raw event e1
+    API->>DB: Insert e1 body digest and pending state
+    DB-->>API: Commit
+    API-->>Provider: 202 may be lost
+    Provider->>API: Retry e1
+    API->>DB: Same ID and digest already pending
+    API-->>Provider: 202 duplicate
+    Worker->>DB: Claim pending e1 and persist completion after effect
+```
+
+The worker does not depend on the HTTP process surviving after commit. The
+[local regression command](04_authentication.md#first-result-a-complete-local-boundary) injects a crash before
+commit, reopens the database, retries, and checks that only one pending row survives.
 
 Rules:
 
@@ -820,7 +902,7 @@ async def upload_attachment(
     principal: Annotated[Principal, Depends(require_capability("ticket:write"))],
     db: AsyncSession = Depends(get_db),
 ):
-    ticket = await get_visible_ticket(db, ticket_id=ticket_id, principal=principal)
+    ticket = await get_ticket_for_action(db, ticket_id=ticket_id, principal=principal, action="write")
     if ticket is None:
         raise HTTPException(404, "Ticket not found")
 
@@ -1165,3 +1247,21 @@ Use this before merging a new endpoint:
 - [07 - Error Responses](07_error_handling.md) - consistent error envelopes.
 - [10 - API Design Conventions](10_api_design.md) - HTTP shape, pagination, and OpenAPI hygiene.
 - [Safe API Calls / 11 - Idempotency Keys](safe_and_scalable_api_calls/11_idempotency.md) - safe retries for mutating operations.
+
+
+## Retention and transfer
+
+**Recap:** a trusted principal is the beginning of the decision. Bind function, action, tenant,
+object, writable fields and cost before executing, then project the response and record evidence.
+Network destination checks and durable acceptance must hold at the boundary where the effect occurs.
+
+**Check yourself:** support has `ticket:read:any` and `ticket:write`. Can it attach a file to another
+user's ticket in the same tenant?
+<details><summary>Answer</summary>No. Read-any expands visibility only. Mutation needs ownership or
+`ticket:write:any`, as well as base write authority; the tenant predicate still applies.</details>
+
+**Try it:** the provider received no 202 after your database committed the event. Design what the
+retry and worker see, then explain why an in-memory queue changes the answer.
+<details><summary>Answer</summary>The retry finds the same ID/digest and acknowledges existing
+pending work; the worker recovers it from the database. An in-memory queue can vanish after commit,
+so a deduplication flag alone cannot guarantee processing.</details>

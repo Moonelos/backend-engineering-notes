@@ -176,4 +176,41 @@ consumer-group membership. Deploy a separate worker when scaling and failure dom
 
 ---
 
+## Recap
+
+- produce queues locally; delivery callbacks report the broker handoff.
+- A consumer effect precedes the next-offset commit; a crash between them can replay.
+- Bounded flush and close expose unfinished work at shutdown.
+
+## Check yourself
+
+**Q: produce returns, then the process dies before its callback. Is the event known durable?**
+
+<details><summary>Answer</summary>
+
+No. The local enqueue succeeded, but the publisher did not observe broker acknowledgement. Retry the persisted event identity and make the consumer idempotent.
+
+</details>
+
+**Q: The callback reports success but the consumer has not run. Is the business effect complete?**
+
+<details><summary>Answer</summary>
+
+No. Broker acceptance and consumer completion are different checkpoints. Inspect the consumer effect ledger or business result, not just publisher metrics.
+
+</details>
+
+## Try it
+
+Keep the round-trip code, but publish two distinct event IDs and fill in the expected delivery and consumption counts.
+
+Hint: Count callback outcomes separately from handler completions.
+
+<details><summary>Worked solution</summary>
+
+Require two successful delivery callbacks and two consumer observations within the deadline. Flush reporting zero buffered messages alone does not prove callbacks had no errors.
+
+</details>
+
+
 **Next**: [Processing Loops, Backpressure, and Shutdown](03_processing_loops_backpressure_and_shutdown.md)

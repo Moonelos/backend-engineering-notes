@@ -107,4 +107,29 @@ stream. Split audit events from disposable jobs even if both originate in the sa
 
 ---
 
+## Recap
+
+- Subjects route publications; a stream selects and retains matching subjects.
+- Retention policy controls when data becomes eligible for removal.
+- Age and byte/message caps combine; the first reached cap determines available history.
+
+## Check yourself
+
+**Q: Traffic doubles with the same 100 MB cap and one-hour max age. Is an hour of replay guaranteed?**
+
+<details><summary>Answer</summary>
+
+No. DiscardOld may evict messages earlier when the byte cap fills. DiscardNew rejects new publications instead. Observe oldest retained timestamp and publish rejection.
+
+</details>
+
+**Q: A subject filter changes which records a consumer sees. Does it create another stored copy?**
+
+<details><summary>Answer</summary>
+
+No. The consumer is a view and progress record over the same retained stream; the stream storage policy remains separate.
+
+</details>
+
+
 **Next**: [Consumers, Acknowledgments, and Flow](03_consumers_acknowledgments_and_flow.md)

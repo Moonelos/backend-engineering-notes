@@ -102,32 +102,31 @@ The inbox unique constraint deduplicates event receipt, but downstream effects n
 
 ```sql
 BEGIN;
-
-INSERT INTO processed_provider_events (producer, event_id, processed_at)
-VALUES (:producer, :event_id, now())
-ON CONFLICT DO NOTHING
-RETURNING event_id;
-
--- Only continue when the INSERT returned a row.
-UPDATE invoices
-SET provider_status = :status,
-    provider_version = :version
-WHERE provider_invoice_id = :invoice_id
-  AND provider_version < :version;
-
+WITH admitted AS (
+    INSERT INTO processed_provider_events (producer, event_id, processed_at)
+    VALUES (:producer, :event_id, now())
+    ON CONFLICT DO NOTHING
+    RETURNING event_id
+), advanced AS (
+    UPDATE invoices
+    SET provider_status = :status, provider_version = :version
+    WHERE tenant_id = :authorized_tenant_id
+      AND provider_invoice_id = :invoice_id
+      AND provider_version < :version
+      AND EXISTS (SELECT 1 FROM admitted)
+    RETURNING id
+)
 INSERT INTO notification_outbox (
     id, event_type, source_event_id, payload, created_at
-) VALUES (
-    :notification_id,
-    'invoice.payment_recorded',
-    :event_id,
-    CAST(:notification_payload AS jsonb),
-    now()
 )
+SELECT :notification_id, 'invoice.payment_recorded', :event_id,
+       CAST(:notification_payload AS jsonb), now()
+FROM advanced
 ON CONFLICT (source_event_id) DO NOTHING;
-
 COMMIT;
 ```
+
+Here a notification means a projection actually advanced. Both a duplicate admission and stale v10 after v11 produce zero `advanced` rows and therefore no notification. Validate the supported event, authorized account and existing invoice before this transaction; an unknown invoice requires retry or quarantine, not a silently consumed receipt.
 
 The notification is also written to an outbox so a worker crash cannot update the invoice without eventually sending the intended local notification.
 

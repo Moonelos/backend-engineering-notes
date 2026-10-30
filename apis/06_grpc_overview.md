@@ -12,6 +12,9 @@ The [quick-start files](examples/grpc_quickstart/) contain one `.proto` contract
 Python server, and generated-stub client. From that directory, generate the bindings and run them:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install grpcio grpcio-tools
 python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. orders.proto
 python server.py
 ```
@@ -31,7 +34,10 @@ order ord_42: shipped
 The `.proto` file is the input, `grpc_tools.protoc` produces `orders_pb2.py` and
 `orders_pb2_grpc.py`, server registration binds the generated service interface, and the client
 stub serializes `GetOrderRequest` over the channel. Missing generated modules fail at import;
-starting the client before the server produces an unavailable-channel error instead of the result.
+starting the client before the server produces `UNAVAILABLE` or `DEADLINE_EXCEEDED` within
+the RPC's two-second budget. The client calls the stub directly: an earlier unbounded
+`channel_ready()` wait would happen outside that budget. If readiness is checked separately,
+give that wait its own explicit deadline.
 
 > **Production:** The example is deliberately restricted to loopback and uses plaintext only for
 > that local proof. A deployed channel requires verified TLS or mutual TLS, application
@@ -138,6 +144,25 @@ Automatic retry requires an explicit service policy and safe operation semantics
 
 ---
 
+A deadline can expire after the business effect has committed.
+
+```mermaid
+sequenceDiagram
+ participant C as Client stub
+ participant S as Server handler
+ participant DB as Payment store
+ C->>S: ChargeCard with 2s deadline
+ S->>DB: commit charge
+ DB-->>S: committed
+ Note over C: deadline expires before response
+ C--xS: cancellation
+ Note over DB: committed charge remains
+```
+
+Cancellation stops waiting and asks the handler to stop remaining work. It cannot erase the committed charge; retry the same business operation identity or reconcile its outcome.
+
+---
+
 ## 5️⃣ Compatibility Rules
 
 Safe Protobuf evolution commonly includes adding a new field. Old readers preserve or ignore unknown fields depending on the operation and runtime; new readers see a default/unset value from old writers.
@@ -202,5 +227,38 @@ Prefer REST when broad third-party accessibility, ordinary browser tooling, CDN 
 - [gRPC-Web](https://grpc.io/docs/platforms/web/)
 
 ---
+
+
+## Recap
+
+- The proto generates types and stubs while the server still implements behavior.
+- A deadline bounds the RPC wait, including connection progress when no unbounded readiness wait precedes it.
+- Committed effects survive cancellation and need idempotent recovery.
+
+## Check yourself
+
+**ChargeCard commits before a 2s deadline expires, but the response is lost. Does DEADLINE_EXCEEDED prove no charge?**
+
+<details><summary>Reasoned answer</summary>
+
+No; the client stopped waiting, while commit is already durable. Retry requires the same business idempotency identity, not a new charge.
+
+</details>
+
+**A retired field number is reused for a different meaning. Can old binary clients safely ignore the change?**
+
+<details><summary>Reasoned answer</summary>
+
+No. They still interpret that tag using its previous type and semantics. Reserve removed field numbers instead.
+
+</details>
+
+**Try it:** Stop the local server and run client.py. Then change its RPC timeout to 0.2 seconds and call a server handler that sleeps one second. Leave the elapsed-time and status assertions blank.
+
+Hint: Channel creation is not a successful RPC, and a missing peer differs from a slow accepted RPC.
+
+<details><summary>Solution</summary>
+The absent peer fails UNAVAILABLE (or DEADLINE_EXCEEDED under a different readiness policy) within its bound; the slow handler exceeds the 0.2-second RPC deadline. Keep the deadline on the RPC and measure elapsed time; do not reintroduce an unbounded channel_ready before it.
+</details>
 
 **Next**: [RESTful APIs](restful/README.md)

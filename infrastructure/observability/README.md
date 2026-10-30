@@ -16,11 +16,19 @@
 | [02 — Python SDK Setup](02_python_sdk.md) | TracerProvider, MeterProvider, instruments, auto-instrumentation, FastAPI integration |
 | [03 — Metrics Export Methods](03_metrics_export_methods.md) | Three ownership models: OTel → Prometheus scrape, OTel → OTLP Collector, Prometheus-native with OTel traces only |
 | [04 — OTel Collector Config](04_collector_config.md) | Collector YAML anatomy, receivers / processors / exporters / pipelines explained, where it runs and why |
+| [05 — Alerting and SLOs](05_alerting_and_slos.md) | User outcomes, error budgets, burn rates, dashboards and owned alerts |
 
 ---
 
 ## Prerequisites
 
-- [Structured Logging Guide](../../fundamentals/core_concepts/structlog_guide.md) — understand structured log context before adding trace IDs
+- [Structured Logging Guide](../../fundamentals/core_concepts/runtime/logging/structlog_guide.md) — understand structured log context before adding trace IDs
 - [FastAPI Patterns](../../fundamentals/fastapi/) — middleware and lifespan hooks used in instrumentation setup
 - [Docker & Deployment](../../operations/deployment/docker_and_deployment.md) — where the Collector runs alongside your app
+
+## What's changing — checked 2026-10-30
+
+**PREVIEW:** OpenTelemetry Profiles is in public alpha. Profiles can connect CPU/runtime cost to
+other telemetry, but SDK, Collector and backend support must be evaluated together. Keep profiling
+an optional performance-investigation branch; traces, metrics and logs remain this path's baseline.
+[Profiles alpha announcement](https://opentelemetry.io/blog/2026/profiles-alpha/).

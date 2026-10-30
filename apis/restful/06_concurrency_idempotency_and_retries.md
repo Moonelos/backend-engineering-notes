@@ -195,8 +195,6 @@ This example retries only idempotent reads and keeps one end-to-end deadline:
 ```python
 import asyncio
 import random
-import time
-
 import httpx
 
 
@@ -210,33 +208,37 @@ async def get_order(
     total_timeout: float = 5.0,
     max_attempts: int = 3,
 ) -> dict[str, object]:
-    deadline = time.monotonic() + total_timeout
+    if total_timeout <= 0 or max_attempts < 1:
+        raise ValueError("Positive timeout and at least one attempt are required")
+    deadline = asyncio.get_running_loop().time() + total_timeout
 
-    for attempt in range(max_attempts):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("Order lookup exceeded its total deadline")
+    # Phase inactivity limits do not stop a peer that keeps trickling bytes.
+    # This outer scope cancels the entire operation, including retry sleeps.
+    async with asyncio.timeout_at(deadline):
+        for attempt in range(max_attempts):
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                response = await client.get(
+                    f"/orders/{order_id}",
+                    timeout=httpx.Timeout(min(remaining, 2.0)),
+                )
+                if response.status_code not in RETRYABLE_STATUS:
+                    response.raise_for_status()
+                    return response.json()
+                if attempt == max_attempts - 1:
+                    response.raise_for_status()
+            except httpx.PoolTimeout:
+                raise  # Local saturation: another provider attempt adds pressure.
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
+                    httpx.ConnectTimeout, httpx.ReadTimeout):
+                if attempt == max_attempts - 1:
+                    raise
 
-        try:
-            response = await client.get(
-                f"/orders/{order_id}",
-                timeout=httpx.Timeout(min(remaining, 2.0)),
-            )
-            if response.status_code not in RETRYABLE_STATUS:
-                response.raise_for_status()
-                return response.json()
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
-            if attempt == max_attempts - 1:
-                raise
-
-        if attempt == max_attempts - 1:
-            response.raise_for_status()
-
-        maximum_delay = min(0.1 * (2**attempt), 1.0)
-        delay = random.uniform(0.0, maximum_delay)
-        if delay >= deadline - time.monotonic():
-            raise TimeoutError("No retry budget remains")
-        await asyncio.sleep(delay)
+            maximum_delay = min(0.1 * (2**attempt), 1.0)
+            delay = random.uniform(0.0, maximum_delay)
+            if delay >= deadline - asyncio.get_running_loop().time():
+                raise TimeoutError("No retry budget remains")
+            await asyncio.sleep(delay)
 
     raise RuntimeError("unreachable")
 ```
@@ -264,5 +266,30 @@ Create one long-lived `AsyncClient` with explicit pool limits. More complete tim
 - [Additional HTTP Status Codes — RFC 6585](https://www.rfc-editor.org/rfc/rfc6585)
 
 ---
+
+
+## Recap
+
+- An unknown network outcome can coexist with a committed effect.
+- A stable scoped key and request fingerprint identify the same logical operation.
+- The outer deadline includes attempts and sleep; per-read inactivity alone is insufficient.
+
+## Check yourself
+
+**Payment commits and the response disappears. Should a retry use a new idempotency key?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The original key identifies the same logical effect; a new one authorizes another operation. Reuse the original identity or query its stored outcome.
+
+</details>
+
+**A peer sends one byte before each read timeout. What still ends the request?**
+
+<details><summary>Reasoned answer</summary>
+
+The monotonic outer deadline cancels the operation even while individual network reads keep making progress.
+
+</details>
 
 **Next**: [Caching and Performance](07_caching_and_performance.md)

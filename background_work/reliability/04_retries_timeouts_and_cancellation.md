@@ -80,6 +80,17 @@ When a provider returns a valid `Retry-After`, treat it as the minimum next elig
 
 ---
 
+### The budget is checked again when work is claimed
+
+A retry chosen at 10:59 for 11:01 already exceeds an 11:00 cutoff. The scheduling predicate above compares the proposed `next_attempt_at`, not only the current time. A queue delay can still push a valid 10:59 retry past 11:00, so the claim must also include:
+
+```sql
+-- Add to the canonical PENDING claim predicate; max_retry_age is an interval.
+AND (first_failed_at IS NULL OR now() < first_failed_at + :max_retry_age)
+```
+
+A bounded reconciler terminalizes expired pending jobs instead of leaving them eligible forever. Use the same token/state conditions when changing running jobs; a past deadline alone does not authorize a stale attempt to write. The complete [durable-job adapter](../examples/durable_job/store.py) stores an absolute `retry_deadline` and checks it in retry, claim and recovery. Its [budget test](../examples/durable_job/test_lifecycle.py) proves that a ready-but-expired row is never claimed and becomes `FAILED`.
+
 ## 4. One owned transition chooses retry or terminal failure
 
 The job's `attempt` was incremented at claim. On failure, compute `:next_attempt_at` in application code from the classified error and provider guidance, then commit this conditional transition:
@@ -99,14 +110,14 @@ decided AS (
     SET status = CASE
             WHEN :retryable
              AND owned.attempt < :max_attempts
-             AND now() < COALESCE(owned.first_failed_at, now()) + :max_retry_age
+             AND :next_attempt_at < COALESCE(owned.first_failed_at, now()) + :max_retry_age
                 THEN 'PENDING'
             ELSE 'FAILED'
         END,
         next_attempt_at = CASE
             WHEN :retryable
              AND owned.attempt < :max_attempts
-             AND now() < COALESCE(owned.first_failed_at, now()) + :max_retry_age
+             AND :next_attempt_at < COALESCE(owned.first_failed_at, now()) + :max_retry_age
                 THEN :next_attempt_at
             ELSE NULL
         END,
@@ -116,14 +127,14 @@ decided AS (
         terminal_reason = CASE
             WHEN NOT :retryable THEN 'PERMANENT_ERROR'
             WHEN owned.attempt >= :max_attempts THEN 'ATTEMPT_BUDGET_EXHAUSTED'
-            WHEN now() >= COALESCE(owned.first_failed_at, now()) + :max_retry_age
+            WHEN :next_attempt_at >= COALESCE(owned.first_failed_at, now()) + :max_retry_age
                 THEN 'WALL_CLOCK_BUDGET_EXHAUSTED'
             ELSE NULL
         END,
         finished_at = CASE
             WHEN :retryable
              AND owned.attempt < :max_attempts
-             AND now() < COALESCE(owned.first_failed_at, now()) + :max_retry_age
+             AND :next_attempt_at < COALESCE(owned.first_failed_at, now()) + :max_retry_age
                 THEN NULL
             ELSE now()
         END,
@@ -233,5 +244,36 @@ A compensation is a new effect with its own lifecycle. A refund offsets a captur
 Do not retry deterministic failures until code or input changes. Do not offer cancellation when the product cannot explain what happens to already committed irreversible effects. Do not use `sleep()` as a durable retry or timer.
 
 ---
+
+## Recap and check yourself
+
+- Retry reuses the obligation and records a durable next eligible time.
+- Attempt and elapsed-time budgets must hold both when scheduling and when claiming.
+- Cancellation and completion race through expected state/version; external committed effects may need compensation.
+
+**Cancellation commits while a provider response is in flight. Can completion set success afterward?**
+
+<details><summary>Answer</summary>
+
+No. Its expected state/version no longer matches. Preserve provider evidence separately and schedule compensation if the business policy requires it.
+
+</details>
+
+**At 10:59 a backoff chooses 11:01, but the retry deadline is 11:00. Schedule it?**
+
+<details><summary>Answer</summary>
+
+No. Compare the proposed eligibility time to the deadline. Also recheck at claim because queue delay can make a previously valid retry too old.
+
+</details>
+
+**Try it:** Set a pending job’s retry_deadline into the past in the canonical test. Fill the expected `claim` result and state after `recover`.
+
+<details><summary>Hint and worked solution</summary>
+
+Eligibility time and deadline are independent conditions. `claim` returns None; recovery marks FAILED. Making it immediately ready must not bypass elapsed-time exhaustion.
+
+</details>
+
 
 **Next**: [Reconciliation, DLQ, and Observability](05_reconciliation_dlq_and_observability.md)

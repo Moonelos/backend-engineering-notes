@@ -2,12 +2,38 @@
 
 > Understand how HTTPX works at runtime before using it in production systems.
 
-[![HTTPX](https://img.shields.io/badge/HTTPX-0.27+-009688.svg)](https://www.python-httpx.org)
+[![HTTPX](https://img.shields.io/badge/HTTPX-0.28.1-009688.svg)](https://www.python-httpx.org)
 [![HTTP/2](https://img.shields.io/badge/HTTP%2F2-supported-00A86B.svg)](https://httpwg.org/specs/rfc9113.html)
 
 This guide explains HTTPX internals — **connection pooling**, **timeouts**, **HTTP/2**, and how it differs from aiohttp.
 
 ---
+
+## First bounded client
+
+From the repository root:
+
+```bash
+python -m venv /tmp/notes-httpx-env
+source /tmp/notes-httpx-env/bin/activate
+python -m pip install 'httpx==0.28.1'
+python fundamentals/httpx/examples/first_client.py
+```
+
+The [complete program](examples/first_client.py) prints two `200 {'order': 'ord_42'}`
+lines and `client closed`. One owner reuses the client and puts each request inside a
+total deadline. MockTransport makes this independent of a remote service; it proves the
+application lifecycle, not actual TCP reuse, TLS or connection limits. The following
+lessons explain and test those transport boundaries.
+
+## What's changing
+
+**GA — HTTPX2:** a distinct package/import and transport stack (`httpcore2`) with operating
+system trust through `truststore`; it also has optional WebSocket support. These notes
+retain HTTPX 0.28.1 so examples do not silently change behavior. Recheck mocks, custom
+transports, certificate trust and Starlette TestClient when migrating; see the
+[library comparison](05_httpx_vs_aiohttp.md#httpx2-is-a-separate-migration-decision).
+[Maintainer documentation](https://pydantic.dev/docs/httpx2/get-started/), checked 2026-10-30.
 
 ## Prerequisites
 
@@ -63,8 +89,9 @@ print(response.http_version)  # HTTP/2 when the server and dependency negotiate 
 await client.aclose()
 ```
 
-If this prints `HTTP/1.1`, the request still worked; either the optional HTTP/2 dependency is
-missing or the server did not negotiate HTTP/2.
+If this prints `HTTP/1.1`, the installed client and server did not negotiate HTTP/2.
+With `http2=True` and the optional h2 dependency missing, client construction raises
+ImportError; that is not negotiation fallback.
 
 ### Key Concepts
 

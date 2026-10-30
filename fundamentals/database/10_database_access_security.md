@@ -2,6 +2,17 @@
 
 Read [SQL foundations](01_databases_and_schemas.md) and the connection examples in [drivers](02_python_drivers.md) first. A bound parameter protects the SQL/data boundary. It does not decide which tables a connection may modify or whether the server at the other end is your intended database. This lesson develops those two boundaries.
 
+Application-to-proxy TLS and proxy-to-database TLS are separate trust decisions:
+
+```mermaid
+flowchart LR
+ A[Application runtime role] -->|Verify proxy CA and hostname| P[Pool or proxy]
+ P -->|Separate server CA and hostname policy| D[PostgreSQL]
+ M[Migration identity] -->|Become notes_owner| D
+```
+
+Successful verification of the first leg proves neither the second peer's identity nor the application's table privileges. Test each TLS leg with a valid peer and a bad CA/hostname, then test runtime CRUD and denied DDL independently.
+
 ## Separate the object owner from the running application
 
 Alice's API needs to insert users and posts. A deployment also needs to add columns. If both use a table-owning account, an application bug or stolen credential can perform either action. PostgreSQL checks privileges using the connection's effective role; a table owner has powers that ordinary CRUD grants cannot subtract. Give the runtime role only the actions the application needs, and use a separate controlled migration identity that can become the owner.
@@ -150,3 +161,7 @@ The excerpts were exercised with Psycopg 3.3.6 and asyncpg 0.31.0 against a disp
 Yesterday runtime INSERT worked. Today's migration created `notes_app.posts`; runtime SELECT now reports permission denied. The migration used `notes_migrator` directly, while default privileges were set for `notes_owner`. Should you give runtime membership in the owner role?
 
 No. The creator role determines the applicable default privileges. Inspect the new object's owner, apply the intended grants, and fix migrations to SET ROLE before object creation. Owner membership would let the runtime alter/drop objects and erase the boundary demonstrated above. Retest with another disposable future object so the next deployment is covered. If the failure instead occurs during the TLS handshake, changing table grants cannot affect it; investigate endpoint identity and CA trust first.
+
+## PostgreSQL 18 authentication migration
+
+PostgreSQL 18 deprecates MD5 password authentication. Inventory database clients and poolers before changing `pg_hba.conf`: confirm SCRAM support, issue passwords with `password_encryption = 'scram-sha-256'`, rotate affected role passwords so stored verifiers change, then switch/test HBA entries. Changing only `password_encryption` does not rewrite old password verifiers. Rehearse both proxy legs and reconnects, retain a secured administrative recovery path, and monitor authentication failures during a staged rollout. See [PostgreSQL password authentication](https://www.postgresql.org/docs/18/auth-password.html) and [release 18](https://www.postgresql.org/docs/18/release-18.html), checked 2026-10-30. PostgreSQL's new OAuth authentication is a distinct deployment choice requiring compatible clients and server validation configuration; it does not replace application row authorization.

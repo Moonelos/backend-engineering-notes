@@ -28,7 +28,7 @@ These two decisions produce three practical methods. The right one depends on wh
 | **Best for** | OTel metrics + existing Prometheus infra | Fully OTel-native, Collector-routed | Existing Prometheus-heavy org, OTel for traces only |
 | **Metric instrumentation** | Single API | Single API | Two APIs (OTel traces + prom metrics) |
 | **Operational complexity** | Medium | Higher (Collector required) | Low |
-| **Risk of duplicate metrics** | High if not careful | Low | None |
+| **Risk of duplicate metrics** | Requires unique instrumentation ownership | Requires unique instrumentation ownership | Requires unique instrumentation ownership |
 
 ---
 
@@ -65,7 +65,7 @@ from prometheus_client import start_http_server
 resource = Resource.create({SERVICE_NAME: os.getenv("SERVICE_NAME", "orders-api")})
 
 
-def init_telemetry(app: FastAPI) -> None:
+def init_telemetry(app: FastAPI):
     # Traces → Groundcover via OTLP
     trace_provider = TracerProvider(resource=resource)
     trace_provider.add_span_processor(
@@ -83,17 +83,26 @@ def init_telemetry(app: FastAPI) -> None:
     metrics.set_meter_provider(meter_provider)
 
     FastAPIInstrumentor.instrument_app(app)
+    return (trace_provider, meter_provider)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_telemetry(app)
-    # Prometheus scrape port — separate from app port so it is not publicly exposed
-    start_http_server(port=9464, addr="0.0.0.0")
-    yield
+    # Prometheus scrape port — loopback for this local example; remote scraping needs a private listener and policy
+    server, thread = start_http_server(port=9464, addr="127.0.0.1")
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        for provider in app.state.telemetry:
+            provider.force_flush(timeout_millis=3000)
+            provider.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.telemetry = init_telemetry(app)
 
 meter = metrics.get_meter(__name__)
 
@@ -227,7 +236,7 @@ resource = Resource.create({SERVICE_NAME: os.getenv("SERVICE_NAME", "orders-api"
 COLLECTOR_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel-collector:4317")
 
 
-def init_telemetry(app: FastAPI) -> None:
+def init_telemetry(app: FastAPI):
     # Traces → Collector
     trace_provider = TracerProvider(resource=resource)
     trace_provider.add_span_processor(
@@ -240,18 +249,25 @@ def init_telemetry(app: FastAPI) -> None:
         OTLPMetricExporter(endpoint=COLLECTOR_ENDPOINT),
         export_interval_millis=30_000,
     )
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    metrics.set_meter_provider(meter_provider)
 
     FastAPIInstrumentor.instrument_app(app)
+    return (trace_provider, meter_provider)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_telemetry(app)
-    yield
+    try:
+        yield
+    finally:
+        for provider in app.state.telemetry:
+            provider.force_flush(timeout_millis=3000)
+            provider.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.telemetry = init_telemetry(app)
 
 meter = metrics.get_meter(__name__)
 
@@ -324,7 +340,7 @@ from prometheus_client import Counter, Histogram, start_http_server
 resource = Resource.create({SERVICE_NAME: os.getenv("SERVICE_NAME", "orders-api")})
 
 
-def init_telemetry(app: FastAPI) -> None:
+def init_telemetry(app: FastAPI):
     # OTel traces only
     trace_provider = TracerProvider(resource=resource)
     trace_provider.add_span_processor(
@@ -336,6 +352,7 @@ def init_telemetry(app: FastAPI) -> None:
     )
     trace.set_tracer_provider(trace_provider)
     FastAPIInstrumentor.instrument_app(app)
+    return (trace_provider,)
 
 
 # Prometheus-native instruments — defined at module level, not inside a function
@@ -355,12 +372,20 @@ REQUEST_DURATION = Histogram(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_telemetry(app)
-    start_http_server(port=9464, addr="0.0.0.0")
-    yield
+    server, thread = start_http_server(port=9464, addr="127.0.0.1")
+    try:
+        yield
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+        for provider in app.state.telemetry:
+            provider.force_flush(timeout_millis=3000)
+            provider.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.telemetry = init_telemetry(app)
 
 
 @app.get("/checkout")
@@ -436,10 +461,50 @@ meter.create_counter("http_requests_total")
 Counter("http_requests_total", ...)
 ```
 
-Both end up at the Prometheus scrape endpoint and both push to any OTLP backend. Dashboards then show doubled counts or conflicting label schemas.
+A Prometheus-native registry is exposed only through its configured scrape server; it does not
+automatically acquire an OTLP exporter. OTel instruments flow through their configured readers and
+exporters. If both feed a scrape registry or converge downstream under the same series identity,
+you can get duplicate-registration errors, conflicting schemas or double-counted logical work.
+Trace each configured path before diagnosing the symptom.
 
 **Rules to avoid this:**
 
 - Pick one metrics API per service. Either OTel metrics or Prometheus client, not both.
 - If using Method 1A (`PrometheusMetricReader`), never also import `prometheus_client` counters/histograms for the same logical metrics.
 - In Method 2, if you later add OTel metrics, remove the equivalent Prometheus client instruments.
+
+## Recap
+
+- OTel instruments need their configured readers/exporters; native Prometheus registries need scraping.
+- Each logical metric needs one deliberate ownership path to avoid collisions or duplicate counts.
+- A scrape server and its providers require explicit lifecycle cleanup and process topology.
+
+## Check yourself
+
+**Q: Four workers each bind port 9464. Does Method 1A automatically combine their counts?**
+
+<details><summary>Answer</summary>
+
+No. The Prometheus OTel exporter does not supply multiprocess aggregation; binds can collide or expose only one process. Use one process per pod with per-pod scraping or a deliberately supported aggregation design.
+
+</details>
+
+**Q: A native Prometheus Counter is created beside an OTLP exporter. Does it automatically get pushed?**
+
+<details><summary>Answer</summary>
+
+No. It belongs to the Prometheus registry. Only OTel instruments attached to the configured OTel reader/exporter use that path; otherwise arrange explicit scraping/translation.
+
+</details>
+
+## Try it
+
+Choose a deployment for four workers and predict the result after one request in each.
+
+Hint: State the process-to-scrape-target mapping before adding counts.
+
+<details><summary>Worked solution</summary>
+
+With four one-process pods, expose four private targets and sum the same counter across distinct instance labels: total 4. Reusing one shared socket does not prove aggregation.
+
+</details>

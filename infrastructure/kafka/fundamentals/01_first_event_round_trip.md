@@ -35,10 +35,10 @@ partition, preserves the data, divides consumer work, and survives broker failur
 
 ## Run the smallest complete round trip
 
-Start the official Kafka 4.3.1 image:
+Start the official Kafka 4.3.2 image:
 
 ```bash
-docker run --rm --name kafka-notes -p 9092:9092 -d apache/kafka:4.3.1
+docker run --rm --name kafka-notes -p 9092:9092 -d apache/kafka:4.3.2
 ```
 
 Wait until the broker is ready, then create a one-partition topic:
@@ -122,14 +122,24 @@ consumer with no saved group position. The broker still has the record.
 That observation creates the next question: if the record remains stored, what exactly advances
 when a consumer reads it?
 
+## Recap
+
+- Publication appends a record to a retained partition log.
+- Independent readers can each read that same record.
+- This disposable one-broker fixture demonstrates the path, not replicated availability.
+
 ## Check your model
 
 Suppose a second console consumer runs the same command. Does it steal `evt-101` from the first
 consumer?
 
+<details><summary>Answer</summary>
+
 No. Both commands are independent readers without a durable shared group position. Each asks for the
 earliest retained record, so each can fetch offset `0`. Chapter 2 separates the stored log from
 reader progress; Chapter 4 adds coordinated consumer groups.
+
+</details>
 
 ## Boundary of this local setup
 
@@ -148,3 +158,17 @@ docker stop kafka-notes
 ---
 
 **Next:** [The Retained Log: Topics, Partitions, and Offsets](02_log_topics_partitions_and_offsets.md)
+
+## Try it
+
+Publish a second event, `evt-102`, to the same fresh one-partition topic. Before consuming it,
+fill in its expected offset and the first offset a new earliest reader will see.
+Hint: appending changes the log end; reading changes only a reader's position.
+
+<details><summary>Worked solution</summary>
+
+The second event has offset 1 in this fresh fixture. A new earliest reader begins at offset 0
+and sees both events while retention still holds them. Reusing an existing committed group
+can instead resume later; a new terminal process alone does not create a new reader identity.
+
+</details>

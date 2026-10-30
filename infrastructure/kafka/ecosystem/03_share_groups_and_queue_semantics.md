@@ -64,3 +64,12 @@ operate and observe them. Conventional groups or a mature dedicated queue may be
 ---
 
 **Next**: [When to Use Kafka](04_when_to_use_kafka.md)
+
+## What's changing in 4.4
+
+Checked 2026-10-30: **GA on the broker**, share-group dead lettering requires `share.version=2`.
+Rejected records and records exceeding delivery count can enter the configured dead-letter path.
+Choose a destination and permissions, deliberately reject one fixture, inspect the parked record,
+and prove its replay policy before relying on this feature. Upgrading broker binaries alone does
+not turn on the feature level or validate the installed Python client's acknowledgement support.
+[4.4 release announcement](https://kafka.apache.org/blog/2026/10/22/apache-kafka-4.4.0-release-announcement/).

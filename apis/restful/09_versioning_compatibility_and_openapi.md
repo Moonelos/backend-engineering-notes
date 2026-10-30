@@ -73,7 +73,7 @@ Choose one strategy across the product. Version discovery, defaults, errors, cac
 
 ## 4. OpenAPI as an Executable Contract
 
-OpenAPI describes HTTP operations and their inputs, outputs, and security schemes. The latest published specification is currently 3.2.0, while 3.1 and 3.0 remain common in tooling. Select the newest revision that every generator, gateway, validator, and documentation tool in your pipeline supports correctly.
+OpenAPI describes HTTP operations and their inputs, outputs, and security schemes. The [specification index](https://spec.openapis.org/oas/) lists 3.2.1 (checked 2026-10-30); this example deliberately stays on 3.1.0. Select the newest revision that every generator, gateway, validator, and documentation tool in your pipeline supports correctly.
 
 ```yaml
 openapi: 3.1.0
@@ -107,6 +107,26 @@ paths:
       security:
         - oauth2: [order:read]
 components:
+  securitySchemes:
+    oauth2:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.example.com/oauth2/token
+          scopes:
+            order:read: Read authorized orders
+  responses:
+    NotFound:
+      description: No visible order has that identifier
+      content:
+        application/problem+json:
+          schema:
+            type: object
+            required: [type, title, status]
+            properties:
+              type: {type: string, format: uri}
+              title: {type: string}
+              status: {type: integer, const: 404}
   schemas:
     Order:
       type: object
@@ -206,5 +226,30 @@ Backward-compatible reads are insufficient if new writes produce state the old p
 - [OpenAPI Specification 3.2.0](https://spec.openapis.org/oas/v3.2.0.html)
 
 ---
+
+
+## Recap
+
+- OpenAPI describes the wire contract but cannot prove authorization or transaction behavior.
+- Additive changes can still break exhaustive client logic.
+- Contraction and rollback require evidence about deployed consumers and stored data.
+
+## Check yourself
+
+**The new server adds an enum value that old clients exhaustively switch over. Does an unchanged string schema prove compatibility?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The old program may reject or mishandle the new value despite a wire-compatible shape; test its unknown-value path.
+
+</details>
+
+**Does changing info.version route requests to a new API implementation?**
+
+<details><summary>Reasoned answer</summary>
+
+No. It labels the document/API release. Routing versions require an explicit path, header or other supported strategy.
+
+</details>
 
 **Next**: [Testing, Observability, and Operations](10_testing_observability_and_operations.md)

@@ -187,3 +187,28 @@ loss? No: it recovers Bob's tier but erases the 10:02 user. Restore separately, 
 the damaged rows, or use validated PITR to a point after the registration and before the bug.
 Neither route can reconstruct events absent from every artifact. A successful restore is useful
 only when its resulting state satisfies the business requirement.
+
+## Check your understanding
+
+Restore independently and verify business data. Recovery point and recovery duration are separate objectives; replicas repeat logical mistakes.
+
+**Prediction:** A valid user is inserted after the dump but before a tier corruption. Is replacing production with the dump sufficient?
+
+<details><summary>Answer</summary>
+No. It loses the later valid user. Restore independently, compare damaged tier fields and apply a reviewed targeted repair while preserving later rows.
+</details>
+
+**Diagnosis:** Does a verified base-backup manifest prove every requested recovery time is reachable?
+
+<details><summary>Answer</summary>
+No. The necessary uninterrupted WAL sequence and tested target recovery are separate requirements.
+</details>
+
+
+**Try it:** In the disposable restore lab, add a new user after the dump and before corrupting Bob's tier. After restoring the independent copy, leave the targeted repair predicate and preservation assertion blank.
+
+Hint: Join the repaired field by stable user identity; do not replace the whole live database.
+
+<details><summary>Solution</summary>
+Repair only the reviewed damaged IDs/fields from restored data, guarded against newer intentional changes. Assert Bob is pro and the later user still exists unchanged. A full replacement would erase that valid later write, so compare the row sets before making the repair.
+</details>

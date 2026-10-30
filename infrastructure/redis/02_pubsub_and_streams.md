@@ -173,7 +173,7 @@ for message in pubsub.listen():
 ### When Pub/Sub Fails
 
 - **Subscriber goes offline**: Messages during the downtime are permanently lost.
-- **Slow subscribers**: Redis buffers messages in memory. A slow subscriber can cause Redis memory to grow unboundedly (configurable via `client-output-buffer-limit`).
+- **Slow subscribers**: Redis buffers messages, then disconnects a subscriber that crosses its configured output limit. Defaults are 32 MB hard or 8 MB for 60 seconds; messages missed during disconnection are permanently lost. Disabling those limits can permit unbounded growth. [Client limits](https://redis.io/docs/latest/develop/reference/clients/) (checked 2026-10-30).
 - **Exactly-once processing**: Not possible. No acknowledgments, no retries.
 - **Message history**: Cannot replay past messages. No way to ask "what did I miss?"
 - **Consumer groups**: No built-in way to distribute messages across multiple workers (every subscriber gets every message).
@@ -223,7 +223,7 @@ async def stream_demo():
     await r.xadd("events:orders", {
         "type": "order_paid",
         "order_id": "42"
-    }, maxlen=10000)  # keep at most 10,000 entries
+    }, maxlen=10000, approximate=False)  # keep at most 10,000 entries
 
     # Approximate trimming (more efficient, slight overcount OK)
     await r.xadd("events:orders", {
@@ -426,28 +426,22 @@ async def check_pending(r):
 
 ```python
 async def reclaim_stale_messages(r, consumer_name: str, min_idle_ms: int = 60000):
-    """
-    Claim messages that have been pending for too long (consumer probably crashed).
-    min_idle_ms: only claim messages idle for at least this many milliseconds.
-    """
-    # XAUTOCLAIM: automatically claim stale messages (Redis 6.2+)
-    # This is the modern, preferred approach
-    result = await r.xautoclaim(
-        name=STREAM,
-        groupname=GROUP,
-        consumername=consumer_name,
-        min_idle_time=min_idle_ms,
-        start_id="0-0",
-        count=10
-    )
-
-    next_id, claimed, deleted = result
-    for msg_id, data in claimed:
-        print(f"[{consumer_name}] Reclaimed stale message {msg_id}: {data}")
-        # Process and ACK
-        await r.xack(STREAM, GROUP, msg_id)
-
-    return len(claimed)
+    cursor = "0-0"
+    recovered = 0
+    while True:
+        cursor, claimed, deleted = await r.xautoclaim(
+            STREAM, GROUP, consumer_name, min_idle_time=min_idle_ms,
+            start_id=cursor, count=10,
+        )
+        if deleted:
+            raise RuntimeError("Pending payload was trimmed; reconcile source before continuing")
+        for msg_id, data in claimed:
+            await process_event(data)  # must durably deduplicate the business event
+            await r.xack(STREAM, GROUP, msg_id)
+            recovered += 1
+        if cursor == "0-0":
+            return recovered
+        # An empty claimed batch does not imply the scan is complete.
 
 # XCLAIM: manually claim specific message IDs (older approach)
 claimed = await r.xclaim(
@@ -502,119 +496,63 @@ async def consumer_with_recovery(r, group: str, consumer_name: str):
             break
 ```
 
-### Reliable Event Processor with Dead Letter Queue
+### Assemble continuous recovery with bounded processing and durable parking
 
-```python
-async def reliable_event_processor(
-    r,
-    stream: str,
-    group: str,
-    consumer: str,
-    handler,
-    batch_size: int = 10,
-    block_ms: int = 5000,
-    max_retries: int = 3
-):
-    """
-    A production-ready stream consumer with:
-    - Batched reads
-    - Individual message ACK
-    - Failed message detection and dead letter queue
-    - Graceful shutdown
-    """
-    # Ensure group exists
-    try:
-        await r.xgroup_create(stream, group, id="0", mkstream=True)
-    except aioredis.ResponseError as e:
-        if "BUSYGROUP" not in str(e):
-            raise
+A startup-only pending sweep cannot repair failures that happen later, and `>` never returns an
+already-pending entry. The worker must keep alternating new deliveries with scans of the *whole*
+group's pending list. This also recovers entries left by a consumer name that will never return.
 
-    # First: process any pending messages (from previous crash)
-    await _process_pending(r, stream, group, consumer, handler, max_retries)
-
-    # Then: process new messages
-    while True:
-        try:
-            result = await r.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={stream: ">"},
-                count=batch_size,
-                block=block_ms
-            )
-
-            if not result:
-                continue
-
-            for stream_name, messages in result:
-                for msg_id, data in messages:
-                    try:
-                        await handler(msg_id, data)
-                        await r.xack(stream, group, msg_id)
-                    except Exception as e:
-                        print(f"Failed to process {msg_id}: {e}")
-                        # Message stays in PEL, will be retried
-
-        except asyncio.CancelledError:
-            print(f"[{consumer}] Shutting down gracefully...")
-            break
-
-async def _process_pending(r, stream, group, consumer, handler, max_retries):
-    """Process messages that were delivered but not ACKed (crash recovery)."""
-    while True:
-        pending = await r.xpending_range(
-            name=stream, groupname=group,
-            min="-", max="+", count=10,
-            consumername=consumer
-        )
-
-        if not pending:
-            break
-
-        for msg_info in pending:
-            msg_id = msg_info["message_id"]
-            delivery_count = msg_info["times_delivered"]
-
-            if delivery_count >= max_retries:
-                print(f"Message {msg_id} exceeded max retries, sending to dead letter")
-                await r.xadd(f"{stream}:dead-letter", {"original_id": msg_id})
-                await r.xack(stream, group, msg_id)
-                continue
-
-            # XCLAIM performs a real redelivery and increments the PEL delivery
-            # counter. XRANGE would only reread bytes, so poison messages would
-            # never advance toward max_retries.
-            claimed = await r.xclaim(
-                name=stream,
-                groupname=group,
-                consumername=consumer,
-                min_idle_time=0,
-                message_ids=[msg_id],
-            )
-            if claimed:
-                _, data = claimed[0]
-                try:
-                    await handler(msg_id, data)
-                    await r.xack(stream, group, msg_id)
-                except Exception as e:
-                    print(f"Retry failed for {msg_id}: {e}")
-
-# Usage
-async def handle_order_event(msg_id: str, data: dict):
-    print(f"Processing order event {msg_id}: {data}")
-    # your business logic here
-
-async def main():
-    r = aioredis.Redis(host="localhost", port=6379, decode_responses=True)
-    await reliable_event_processor(
-        r,
-        stream="events:orders",
-        group="order-processors",
-        consumer="worker-1",
-        handler=handle_order_event
-    )
-    await r.aclose()
+```mermaid
+sequenceDiagram
+    participant R as Redis stream and PEL
+    participant A as Worker A
+    participant D as Durable effect store
+    participant B as Replacement worker B
+    R->>A: XREADGROUP entry 42 (pending A)
+    A->>D: Commit event ID and result together
+    Note over A: Crash before XACK
+    B->>R: XAUTOCLAIM after idle threshold
+    R-->>B: Entry 42, pending B, delivery count 2
+    B->>D: Event already committed; skip effect
+    B->>R: XACK 42
 ```
+
+Claim changes delivery ownership; it cannot revoke a paused worker's external request. That is why
+both workers use the same durable business event ID. The handler deadline is shorter than the idle
+threshold so ordinary slow handling does not immediately trigger duplicate work, but pauses and
+network uncertainty still require idempotency.
+
+The complete [stream_worker.py](examples/stream_worker.py) implements one bounded batch at a time,
+a preserved `XAUTOCLAIM` cursor, per-handler deadlines, cancellation propagation and a delivery
+limit. A failed handler remains pending until the next idle reclaim pass; a successful handler is
+acknowledged only after it returns. It deliberately does not claim that Redis makes a remote effect
+atomic. Start it with a handler that commits event identity and result in one local transaction.
+
+For a poison event, the worker's Lua script stores **the complete original payload**, source ID,
+delivery count and safe error class in a parking stream, records the parking identity, then
+acknowledges the source. Both keys and the source use the same hash tag, such as
+`orders:{demo}:events`, so this atomic operation is valid on one Redis Cluster slot. Repeating the
+script after a lost reply returns the existing parking ID instead of adding another record. Keep
+parking identities through the replay horizon; archive them with the parked records instead of
+expiring them while the source can still replay. Bound parking storage and stop admission before
+exhaustion. Never trim a still-required pending payload: the worker surfaces missing payloads as a
+reconciliation failure.
+
+Run the complete fixture from the repository root against a disposable Redis 7 instance:
+
+```bash
+docker run --rm -d --name notes-redis-recovery -p 127.0.0.1:16379:6379 redis:7
+python3 -m venv /tmp/notes-redis-recovery-venv
+/tmp/notes-redis-recovery-venv/bin/python -m pip install 'redis>=5,<6'
+/tmp/notes-redis-recovery-venv/bin/python infrastructure/redis/examples/recovery_demo.py
+docker stop notes-redis-recovery
+```
+
+The fixture seeds an abandoned delivery, a transient failure and a poison payload. It requires two
+unique durable results, no remaining pending entries, and one parked record whose payload remains
+available after trimming the source. It then repeats the parking operation to verify one parking
+identity. Connection refusal means Redis is not ready; the fixture retries startup with a deadline.
+These are single-node recovery checks, not a failover or disk-durability certification.
 
 ### Stream Trimming
 
@@ -622,7 +560,7 @@ Streams grow indefinitely unless you trim them:
 
 ```python
 # Trim to exact max length
-await r.xtrim(STREAM, maxlen=10000)
+await r.xtrim(STREAM, maxlen=10000, approximate=False)
 
 # Approximate trim (more efficient — Redis trims in macro-node chunks)
 await r.xtrim(STREAM, maxlen=10000, approximate=True)
@@ -645,7 +583,7 @@ await r.xadd(STREAM, {"data": "value"}, maxlen=10000, approximate=True)
 | **Message replay** | Impossible | Read from any ID, re-read old entries |
 | **Consumer groups** | No. Every subscriber gets every message. | Yes. Messages distributed among group members. |
 | **Acknowledgments** | No | Yes (`XACK`) |
-| **Backpressure** | Slow subscriber = Redis memory grows | Consumer reads at its own pace |
+| **Backpressure** | Buffered until limit, then disconnected; missed messages lost | Consumer reads at its own pace |
 | **Pattern matching** | `PSUBSCRIBE events:*` | No (subscribe to specific streams) |
 | **Blocking read** | `SUBSCRIBE` (dedicated connection) | `XREAD BLOCK` / `XREADGROUP BLOCK` |
 | **Fan-out** | Built-in (all subscribers get it) | Multiple consumer groups on same stream |
@@ -803,7 +741,10 @@ async def get_recent_activity(r, user_id: int, count: int = 20):
 
 ### Pattern 4: Combined Pub/Sub + Streams in FastAPI
 
-A practical example showing both Pub/Sub for real-time push and Streams for durable processing:
+Integration excerpt: combine the canonical worker with Pub/Sub notifications. Supply
+`persist_order_effect_once` using the inbox transaction from the messaging lesson before running
+this app; the complete recovery fixture above supplies an executable local effect implementation.
+The deterministic event ID below assumes order IDs are unique and creation occurs only once.
 
 ```python
 from contextlib import asynccontextmanager
@@ -826,6 +767,10 @@ async def lifespan(app: FastAPI):
     yield
 
     consumer_task.cancel()
+    try:
+        await consumer_task
+    except asyncio.CancelledError:
+        pass
     await app.state.redis.aclose()
 
 app = FastAPI(lifespan=lifespan)
@@ -836,7 +781,8 @@ async def create_order(order_id: int, user_id: int):
 
     # Retain the event in the stream. Processing still requires persistence,
     # pending-entry recovery, and an idempotent handler.
-    await r.xadd("events:orders", {
+    await r.xadd("events:{orders}", {
+        "event_id": f"order-created:{order_id}",
         "action": "created",
         "order_id": str(order_id),
         "user_id": str(user_id),
@@ -850,36 +796,16 @@ async def create_order(order_id: int, user_id: int):
     return {"order_id": order_id, "status": "created"}
 
 async def order_stream_consumer(r: aioredis.Redis):
-    """Background task processing order events from a stream."""
-    group = "api-order-processors"
-    consumer = "api-worker-1"
+    from stream_worker import consume  # copy the linked example beside this app
+    stop = asyncio.Event()
 
-    try:
-        await r.xgroup_create("events:orders", group, id="0", mkstream=True)
-    except aioredis.ResponseError as e:
-        if "BUSYGROUP" not in str(e):
-            raise
+    async def handle(entry_id, fields):
+        # Supply the application's atomic inbox/effect transaction here.
+        await persist_order_effect_once(fields["event_id"], fields)
 
-    while True:
-        try:
-            results = await r.xreadgroup(
-                groupname=group,
-                consumername=consumer,
-                streams={"events:orders": ">"},
-                count=10,
-                block=2000,
-            )
-            if results:
-                for stream_name, messages in results:
-                    for msg_id, msg_data in messages:
-                        print(f"Processing order event: {msg_data}")
-                        # ... business logic ...
-                        await r.xack("events:orders", group, msg_id)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"Stream consumer error: {e}")
-            await asyncio.sleep(1)
+    await consume(r, "events:{orders}", "api-order-processors", "api-worker-1",
+                  handle, stop=stop)
+
 ```
 
 `XADD` retains the entry for later reads; it does not guarantee the business effect. The deployment
@@ -932,7 +858,7 @@ await r.xadd("events", {"data": "value"}, maxlen=50000, approximate=True)
 
 ### Mistake 4: Using a Single Redis Connection for Pub/Sub and Commands
 
-Pub/Sub puts the connection in a special "subscriber mode" where only Pub/Sub commands are allowed.
+With RESP2, subscribing restricts that connection to the permitted Pub/Sub-mode commands. RESP3 permits other commands while subscribed; redis-py still gives its Pub/Sub object a dedicated pooled connection. [SUBSCRIBE protocol behavior](https://redis.io/docs/latest/commands/subscribe/) (checked 2026-10-30).
 
 ```python
 # This works because redis-py uses connection pooling internally.
@@ -944,3 +870,67 @@ r = aioredis.Redis(host="localhost", port=6379)  # has a pool
 pubsub = r.pubsub()  # gets its own connection
 await r.get("some_key")  # uses a different connection from pool
 ```
+
+## Versioned stream capabilities
+
+Checked 2026-10-30. **GA:** Redis 8.2's `KEEPREF`, `DELREF` and `ACKED` policies make payload
+deletion versus consumer-group references explicit; `XACKDEL` combines acknowledgement and
+policy-aware deletion. Choose a policy only after tracing every group that still needs the entry.
+The Redis 7 worker above treats a trimmed pending payload as a failure requiring reconciliation.
+[Stream lifecycle](https://redis.io/docs/latest/develop/data-types/streams/).
+
+**GA:** 8.6 `XADD IDMP`/`IDMPAUTO` suppress eligible producer retries within configured retention.
+They do not atomically commit your database effect with `XACK`; retain the durable inbox and
+parking protocol. [XADD](https://redis.io/docs/latest/commands/xadd/).
+**GA:** 8.10 `MAXCOUNT`/`MAXSIZE` cap cumulative `XREAD`/`XREADGROUP` replies across streams, whereas
+`COUNT` alone applies per stream. Size application concurrency separately from reply bytes and
+verify the installed client's command arguments before using them.
+[XREAD limits](https://redis.io/docs/latest/commands/xread/).
+
+### Serial delivery reservation is part of the idle budget
+
+The complete worker reads or claims **one** entry before running its handler. Fetching ten and handling them serially would start all ten pending idle clocks at receipt; the last could be reclaimed while merely waiting behind healthy work. `processing_seconds < idle_ms` protects only an immediately started cooperative handler, with sufficient network/scheduling margin. It does not prove exclusivity against a stopped process or event-loop stall; durable business idempotency remains required.
+
+Run the two-consumer regression against the same disposable Redis fixture:
+
+```bash
+python infrastructure/redis/examples/slow_consumer_probe.py redis://127.0.0.1:16379
+```
+
+Six 40ms effects use a 50ms handler deadline and 60ms reclaim threshold. At 75ms the second consumer must reclaim zero healthy queued entries; all six finish once with no pending entries. The old ten-entry reservation makes four waiting entries incorrectly eligible in this trace. For concurrent processing, budget queue residence plus processing and use an explicit ownership/renewal design.
+
+## Recap
+
+- Pub/Sub reaches connected subscribers; Streams retain payloads subject to storage policy.
+- The PEL tracks unsettled delivery, not whether the business effect committed.
+- Continuous reclaim and atomic payload parking make retry and poison outcomes recoverable.
+
+## Check yourself
+
+**Q: A handler commits its database effect then crashes before XACK. What prevents a second effect on reclaim?**
+
+<details><summary>Answer</summary>
+
+A durable event-ID record committed atomically with the effect. PEL delivery count alone cannot prove business completion. The replacement reads that record, skips the duplicate effect and acknowledges.
+
+</details>
+
+**Q: XAUTOCLAIM returns no entries but a nonzero cursor. Has the scan finished?**
+
+<details><summary>Answer</summary>
+
+No. The scanned entries may not yet be idle, while eligible entries lie later. Preserve the returned cursor and continue until 0-0; repeatedly restarting at 0-0 can starve later work.
+
+</details>
+
+## Try it
+
+Change the recovery fixture so a poison payload is parked, then trim the source before inspecting the parking stream.
+
+Hint: Parking must contain the complete payload, not just source_id.
+
+<details><summary>Worked solution</summary>
+
+The parking record remains reconstructable and is present exactly once because the Lua operation records parking identity and acknowledgement together. The business effect ledger still has only the two successful events.
+
+</details>

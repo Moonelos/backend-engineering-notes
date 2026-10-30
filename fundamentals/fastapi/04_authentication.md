@@ -8,7 +8,36 @@
 > **Key insight**: Authentication proves identity; authorization separately decides whether that
 > identity may perform the requested action.
 
-A production guide to authentication, authorization, and security in FastAPI -- from mental model to battle-tested patterns.
+This implementation reference assumes the [JWT and OAuth foundation](../auth/README.md).
+The [local application and rejection tests](#first-result-a-complete-local-boundary) provide an executable
+checkpoint; other fragments name the database/session integration they require.
+
+
+## First result: a complete local boundary
+
+The [application factory](examples/auth_app.py) supplies an actual in-memory directory, Argon2
+password verification, JWT issuance/required-claim validation, public response projection, and a
+path-bound post ownership dependency. The [executable tests](examples/auth_boundary_tests.py)
+provide fixtures instead of a missing `get_user_by_email` implementation. From the repository root,
+using the virtualenv created in the [Cognito guide](../auth/cognito/oauth-jwt-guide.md):
+
+```bash
+/tmp/cognito-notes-venv/bin/python -m pip install 'pwdlib[argon2]==0.3.0' 'bcrypt==5.0.0' 'httpcore==1.0.9' 'SQLAlchemy==2.1.6' 'aiosqlite==0.22.1'
+/tmp/cognito-notes-venv/bin/python -m pytest -q fundamentals/fastapi/examples/auth_boundary_tests.py
+```
+
+The test logs in, calls `/users/me`, and checks that `hashed_password` and tenant fields are absent.
+It updates an owned post and rejects `/posts/2?resource_id=1`: the guard reads the same `post_id` as
+the route, so an extra query parameter cannot redirect authorization. Signed tokens missing `exp`,
+with the wrong audience, expired, or labeled `refresh` receive 401. The companion tests cover the
+API-security chapter's durable inbox and DNS pinning contracts.
+
+This local application demonstrates the HTTP boundary; its in-memory directory is not durable and
+its first-party login is not an OAuth authorization server. Use durable storage, account recovery,
+rate limits, session/revocation policy, and a managed OAuth issuer in the production continuation.
+HS256 assumes issuer and verifier share one trust boundary: a verifier holding the secret can mint
+tokens. Across independent services, use the configured issuer's asymmetric JWKS policy taught in
+[JWT](../auth/jwt.md) and [Cognito access tokens](../auth/cognito/tokens.md).
 
 ---
 
@@ -94,16 +123,25 @@ import bcrypt
 
 
 def hash_password(plain_password: str) -> str:
-    """Hash a password for storage. bcrypt truncates input at 72 bytes."""
+    """Compatibility hashing with explicit UTF-8 byte limit."""
+    if len(plain_password.encode("utf-8")) > 72:
+        raise ValueError("bcrypt input exceeds 72 bytes")
     return bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against a stored hash (constant-time comparison)."""
+    if len(plain_password.encode("utf-8")) > 72:
+        return False
     return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 ```
 
-> **bcrypt's 72-byte limit:** bcrypt silently truncates passwords longer than 72 bytes. If you need to support longer passphrases, use `argon2-cffi` / `pwdlib` with argon2 instead, which has no such limit.
+> **bcrypt's 72-byte boundary:** bcrypt 5.0 raises `ValueError` above the limit; older
+> implementations silently truncated. Count UTF-8 bytes, not characters. Preserve the legacy
+> verification contract during migration and rehash successful logins into Argon2; do not silently
+> change long-password interpretation. [bcrypt documentation](https://github.com/pyca/bcrypt),
+> checked 2026-10-30. Bound request size and hashing concurrency even with Argon2.
+
 
 ### How It Works
 
@@ -154,7 +192,7 @@ if not verify_password(request.password, user.hashed_password):
 
 ### Structure
 
-A JWT is three Base64-encoded parts separated by dots:
+A signed compact JWT (JWS) has three Base64URL-encoded segments separated by dots:
 
 ```
 header.payload.signature
@@ -164,20 +202,26 @@ header.payload.signature
 |------|----------|---------|
 | **Header** | Algorithm, token type | `{"alg": "HS256", "typ": "JWT"}` |
 | **Payload** | Claims (user data, expiry) | `{"sub": "user@example.com", "exp": 1700000000}` |
-| **Signature** | HMAC of header + payload | Prevents tampering |
+| **Signature** | Cryptographic result over the encoded header and payload | HMAC for HS256; asymmetric signature for RS256/ES256 |
 
 > **The payload is NOT encrypted.** Anyone can decode it. The signature only guarantees it hasn't been tampered with.
 
 ### Creating Tokens with PyJWT
 
-> **Library choice (2025+):** This guide uses **`PyJWT`** (`pip install pyjwt`). FastAPI's own docs switched from `python-jose` to PyJWT because `python-jose` is unmaintained and carries an algorithm-confusion vulnerability (CVE-2024-33663) via its unmaintained `ecdsa` dependency. If you must keep `python-jose`, the snippets below are nearly identical — import `from jose import jwt, JWTError` and catch `JWTError` instead of `PyJWTError`. PyJWT raises `jwt.ExpiredSignatureError` (a subclass of `jwt.PyJWTError`) on expiry.
+> **Library baseline:** this path uses PyJWT 2.15.1 and `pwdlib`/Argon2, matching the
+> [FastAPI tutorial's libraries](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/).
+> Do not describe all `python-jose` versions as unmaintained or vulnerable: its 3.4.0 release fixed
+> CVE-2024-33663/33664 and 3.5.0 followed. A migration must preserve required claims and algorithm
+> policy, not just change imports. [Maintainer release notes](https://github.com/mpdavis/python-jose/releases).
+
 
 ```python
 from datetime import datetime, timedelta, timezone
 import jwt
 from jwt import PyJWTError
 
-SECRET_KEY = "your-secret-key-from-environment"  # NEVER hardcode in production
+import os
+SECRET_KEY = os.environ["SECRET_KEY"]  # high-entropy secret, at least 32 bytes for HS256
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 TOKEN_ISSUER = "https://auth.example.com"
@@ -187,19 +231,24 @@ TOKEN_AUDIENCE = "https://api.example.com"
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire, "iss": TOKEN_ISSUER, "aud": TOKEN_AUDIENCE})
+    to_encode.update({"exp": expire, "iat": datetime.now(timezone.utc),
+                      "iss": TOKEN_ISSUER, "aud": TOKEN_AUDIENCE, "type": "access"})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict:
     """Decode and validate a JWT. Raises PyJWTError on failure."""
-    return jwt.decode(
+    claims = jwt.decode(
         token,
         SECRET_KEY,
         algorithms=[ALGORITHM],
         issuer=TOKEN_ISSUER,
         audience=TOKEN_AUDIENCE,
+        options={"require": ["exp", "iat", "iss", "aud", "sub", "type"]},
     )
+    if claims["type"] != "access":
+        raise jwt.InvalidTokenError("Expected access token")
+    return claims
 ```
 
 ### Token Expiration
@@ -220,106 +269,45 @@ except PyJWTError:
     raise HTTPException(status_code=401, detail="Token invalid or expired")
 ```
 
-### Refresh Tokens
+### Refresh tokens: a separate stateful credential
 
-Access tokens are short-lived. Refresh tokens let users get new access tokens without re-authenticating.
+Do not feed a refresh token to the access-token decoder. The access policy requires an API audience
+and `type=access`; a refresh credential belongs only at the authorization server. Prefer a managed
+issuer's supported rotation. If building a first-party session service, use a high-entropy opaque
+refresh token and store only its hash with a family, expiry and consumed state.
 
-```python
-REFRESH_TOKEN_EXPIRE_DAYS = 7
+The complete [refresh concurrency fixture](../auth/examples/refresh_rotation.py) and
+[transaction explanation](../auth/jwt.md#revocation-and-refresh-token-rotation) are the canonical
+implementation model. A refresh operation locks the family, re-reads the token under that lock,
+consumes it and inserts one successor in one transaction. Reuse commits family revocation before
+returning an error. Two unlocked reads followed by a repository `rotate()` call are insufficient.
 
-
-def create_refresh_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-@app.post("/auth/refresh")
-def refresh_access_token(refresh_token: str):
-    try:
-        payload = decode_access_token(refresh_token)
-    except PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-    if payload.get("type") != "refresh":
-        raise HTTPException(status_code=401, detail="Not a refresh token")
-
-    # Issue new access token
-    new_access_token = create_access_token(data={"sub": payload["sub"]})
-    return {"access_token": new_access_token, "token_type": "bearer"}
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Auth as Refresh endpoint
+    participant DB as Family transaction
+    Client->>Auth: Opaque refresh credential in protected body or cookie
+    Auth->>DB: Lock family and re-read token hash
+    alt Unused and unexpired
+        DB->>DB: Consume predecessor and insert successor atomically
+        DB-->>Auth: Commit successor metadata
+        Auth-->>Client: Access token plus replacement refresh token
+    else Reused
+        DB->>DB: Commit family revocation
+        Auth-->>Client: 401 and require fresh login
+    end
 ```
 
-| Token Type | Lifetime | Storage | Purpose |
-|------------|----------|---------|---------|
-| **Access token** | 15-30 minutes | Memory / JS variable | Authorize API requests |
-| **Refresh token** | 7-30 days | HttpOnly cookie / secure storage | Get new access tokens |
-
-### Refresh Token Rotation
-
-The simple example above accepts the same refresh token until it expires. That is easy to teach but too weak for production. [RFC 9700 OAuth 2.0 Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2) expects public clients to use sender-constrained refresh tokens or refresh-token rotation. For most FastAPI apps, rotation is the practical pattern.
-
-On every refresh:
-
-1. Look up the presented refresh token by hash.
-2. Reject it if expired, revoked, or already used.
-3. Mark it used.
-4. Issue a new refresh token in the same family.
-5. If an already-used token appears again, revoke the family and force re-login.
-
-```python
-import hashlib
-import secrets
-from datetime import datetime, timedelta, timezone
-
-
-def make_refresh_token() -> str:
-    return secrets.token_urlsafe(48)
-
-
-def hash_refresh_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-@app.post("/auth/refresh")
-async def rotate_refresh(refresh_token: str):
-    token_hash = hash_refresh_token(refresh_token)
-    record = await refresh_token_repo.get(token_hash)
-
-    if record is None or record.revoked_at or record.expires_at <= datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-    if record.used_at is not None:
-        await refresh_token_repo.revoke_family(record.family_id)
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
-
-    new_refresh = make_refresh_token()
-    await refresh_token_repo.rotate(
-        old_hash=token_hash,
-        new_hash=hash_refresh_token(new_refresh),
-        family_id=record.family_id,
-        user_id=record.user_id,
-        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
-    )
-
-    new_access = create_access_token(data={"sub": record.user_id})
-    return {
-        "access_token": new_access,
-        "refresh_token": new_refresh,
-        "token_type": "bearer",
-    }
-```
-
-Important details:
-
-- Store only a hash of the refresh token, never the raw token.
-- Put refresh tokens in an HttpOnly, Secure, SameSite cookie for browser apps, or platform secure storage for native/mobile apps.
-- Rotate in a database transaction so the old token cannot be used twice during a race.
-- Access tokens can stay stateless and short-lived; refresh tokens carry the revocation state.
+The transaction makes one successor possible, not guaranteed delivery of the HTTP response. Define
+lost-response behavior and serialize refreshes per client session. Browser cookies need `Secure`,
+`HttpOnly`, an appropriate `SameSite` policy **and CSRF protection**; native apps use platform secure
+storage. Never put refresh tokens in a query string. Short access expiry bounds exposure only when
+the API has no immediate revocation check.
 
 ---
 
-## 4. OAuth2PasswordBearer -- FastAPI's Built-In Flow
+## 4. Bearer extraction and the legacy password-form example
 
 ### What It Does
 
@@ -331,6 +319,12 @@ Important details:
 It does **NOT** validate the token. That is your job.
 
 ### The Login Flow
+
+This form example explains FastAPI's tutorial compatibility interface. It is not a recommendation
+to introduce the OAuth resource-owner password grant: published security guidance prohibits that
+grant. Use Authorization Code + PKCE for new OAuth user clients, as taught in
+[OAuth](../auth/oauth2.md). The complete local fixture later uses a first-party JSON login solely to
+exercise hashing, issuance and HTTP policy in one process.
 
 ```python
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -397,6 +391,8 @@ from pydantic import BaseModel
 
 
 class User(BaseModel):
+    id: str
+    tenant_id: str
     email: str
     is_active: bool
     role: str  # "user", "admin", "moderator"
@@ -424,14 +420,19 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
 
 def get_current_active_user(user: User = Depends(get_current_user)) -> User:
     if not user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     return user
 ```
 
 ### Using It in Endpoints
 
 ```python
-@app.get("/users/me")
+class UserPublic(BaseModel):
+    id: str
+    email: str
+
+
+@app.get("/users/me", response_model=UserPublic)
 def read_current_user(user: User = Depends(get_current_active_user)):
     return user
 
@@ -518,16 +519,26 @@ Each layer has **one responsibility**. Each can be tested independently. Each ca
 
 ### What It Is
 
-CORS is a browser security mechanism. When your frontend (e.g., `https://app.example.com`) calls your API (e.g., `https://api.example.com`), the browser blocks the request unless the API explicitly allows it.
+CORS controls whether browser JavaScript can read a cross-origin response. For requests requiring
+preflight, the browser first asks permission with OPTIONS and sends the actual request only when
+allowed. A simple request can already reach the server and change state before the browser hides
+its response. CORS is neither authentication nor CSRF protection, and it does not constrain curl or
+another server. [Browser CORS behavior](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS).
 
-**CORS only affects browsers.** Curl, Postman, and server-to-server calls are not affected.
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant API
+    Browser->>API: OPTIONS asking for Authorization and PUT
+    API-->>Browser: Explicit allowed origin method and headers
+    Browser->>API: PUT with bearer credential
+    API->>API: Authenticate and authorize object mutation
+    API-->>Browser: Response with CORS headers
+```
 
-### Why It Matters
-
-Without CORS configuration:
-- Your frontend cannot call your API from a different origin
-- You will get cryptic browser errors with zero server-side logs
-- The browser sends a **preflight OPTIONS request** before the actual request -- your API must respond to it
+Successful preflight permits the browser to send the request; it does not authorize the operation.
+Investigate OPTIONS and actual-request logs separately. Cookie authentication also needs a CSRF
+strategy even when an untrusted origin cannot read the response.
 
 ### FastAPI CORSMiddleware
 
@@ -550,7 +561,7 @@ app.add_middleware(
 | Parameter | Purpose | Recommendation |
 |-----------|---------|----------------|
 | `allow_origins` | Which origins can call the API | List specific domains |
-| `allow_credentials` | Allow cookies / auth headers | `True` if using auth |
+| `allow_credentials` | Allow browser credentialed responses such as cookies | Enable for cross-origin cookie/credentials mode; a manually supplied bearer header separately needs `allow_headers` |
 | `allow_methods` | Which HTTP methods | List only what you use |
 | `allow_headers` | Which request headers | List only what you need |
 | `expose_headers` | Which response headers the browser can read | As needed |
@@ -561,20 +572,21 @@ app.add_middleware(
 **Do not do this:**
 
 ```python
-# WRONG -- allows any website to call your API
+# Inappropriate for a policy restricted to the trusted browser application.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,  # This combination is actually rejected by browsers
+    allow_credentials=True,  # A wildcard response origin cannot authorize credentialed reads.
     allow_methods=["*"],
     allow_headers=["*"],
 )
 ```
 
-**Problems with `allow_origins=["*"]`:**
-- Any website can make requests to your API on behalf of your users
-- Combined with `allow_credentials=True`, browsers will actually **reject** this (spec violation)
-- In production, this is a security hole
+A wildcard response origin cannot authorize a credentialed browser read. Wildcard origins can be
+appropriate for intentionally public, noncredentialed data; production alone does not decide that.
+For authenticated browser sessions, configure explicit origins and test actual browser behavior.
+A malicious site does not gain the user's bearer token merely because an API permits its origin,
+and CORS rejection does not guarantee that a simple state-changing request was never sent.
 
 **Do this:**
 
@@ -582,7 +594,7 @@ app.add_middleware(
 # CORRECT -- explicit origins
 import os
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",")
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "").split(",") if origin.strip()]
 
 app.add_middleware(
     CORSMiddleware,
@@ -699,14 +711,17 @@ def get_current_user_or_client(
     api_key: str | None = Security(api_key_header),
 ) -> User | APIClient:
     """Accept either JWT or API key authentication."""
+    principal = None
     if token:
-        return decode_and_get_user(token)
-    if api_key:
-        return lookup_client_by_key(api_key)
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="No authentication provided",
-    )
+        principal = decode_and_get_user(token)  # Full JWT profile plus active user lookup.
+    elif api_key:
+        principal = lookup_client_by_key(api_key)  # Hashed key lookup; only active clients.
+    if principal is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing authentication",
+        )
+    return principal
 ```
 
 ---
@@ -755,7 +770,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["X-XSS-Protection"] = "0"  # obsolete browser filter; disable
         response.headers["Strict-Transport-Security"] = (
             "max-age=31536000; includeSubDomains"
         )
@@ -787,7 +802,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 ```python
 # Protected by default -- requires valid token
-@app.get("/users/me")
+@app.get("/users/me", response_model=UserPublic)
 def get_me(user: User = Depends(get_current_active_user)):
     return user
 
@@ -842,10 +857,12 @@ def get_post(post_id: int, user: User | None = Depends(get_optional_user)):
 ### Resource Ownership Check
 
 ```python
-def get_own_resource(resource_id: int, user: User = Depends(get_current_active_user)):
+def get_own_resource(post_id: int, user: User = Depends(get_current_active_user)):
     """Verify user owns the resource they're trying to access."""
-    resource = get_resource_by_id(resource_id)
+    resource = get_resource_by_id(post_id)
     if resource is None:
+        raise HTTPException(status_code=404, detail="Resource not found")
+    if resource.tenant_id != user.tenant_id:
         raise HTTPException(status_code=404, detail="Resource not found")
     if resource.owner_email != user.email and user.role != "admin":
         raise HTTPException(status_code=403, detail="Not your resource")
@@ -853,7 +870,7 @@ def get_own_resource(resource_id: int, user: User = Depends(get_current_active_u
 
 
 @app.put("/posts/{post_id}")
-def update_post(post_id: int, body: PostUpdate, resource=Depends(get_own_resource)):
+def update_post(body: PostUpdate, resource=Depends(get_own_resource)):
     return update_post_in_db(resource, body)
 ```
 
@@ -942,15 +959,10 @@ An unsafe decoder disables expiry verification through an option such as `verify
 Keep that shape as inert text: making it executable invites it to survive copy/paste.
 
 ```python
-# CORRECT -- let the library enforce expiry (default behavior)
-payload = jwt.decode(
-    token,
-    SECRET_KEY,
-    algorithms=[ALGORITHM],
-    issuer=TOKEN_ISSUER,
-    audience=TOKEN_AUDIENCE,
-)
-# Raises ExpiredSignatureError if token is expired
+# Reuse the complete access profile from section 2.
+payload = decode_access_token(token)
+# Missing exp/iat/iss/aud/sub/type, expired tokens, wrong issuer/audience,
+# and refresh tokens all raise PyJWTError.
 ```
 
 ---
@@ -1071,7 +1083,7 @@ Auth endpoints (login, register, password reset) should **always** be rate-limit
 | **Secrets** | Load from environment variables, never from code |
 | **Passwords** | Hash with bcrypt (direct) or argon2 via `pwdlib`, never store plaintext; avoid unmaintained `passlib` |
 | **JWTs** | Set expiration, validate on every request, use token types |
-| **CORS** | Whitelist specific origins, never `*` in production |
+| **CORS** | Explicit origins for credentialed browser access; wildcard only for intentionally public noncredentialed responses |
 | **HTTPS** | Enforce via reverse proxy, add HSTS header |
 | **Error messages** | Never leak whether a user exists or which field is wrong |
 | **Rate limiting** | Protect login and registration endpoints |
@@ -1081,138 +1093,6 @@ Auth endpoints (login, register, password reset) should **always** be rate-limit
 
 ---
 
-## 12. Complete Example: Putting It All Together
-
-> The user registration models below use a Create/Response split (`UserIn`/`UserOut` or similar). For the reasoning behind that split — why you separate Create / Update / Response schemas, how to share a base, `model_config` for ORM mode — see [03_pydantic.md §10 Common Patterns](./03_pydantic.md#10-common-patterns). The example here shows only the auth-specific delta (password hashing, never returning the hash).
-
-```python
-import os
-from datetime import datetime, timedelta, timezone
-
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-import bcrypt
-import jwt
-from jwt import PyJWTError
-from pydantic import BaseModel
-
-# --- Configuration ---
-
-SECRET_KEY = os.environ["SECRET_KEY"]
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-TOKEN_ISSUER = "https://auth.example.com"
-TOKEN_AUDIENCE = "https://api.example.com"
-
-# --- Security utilities ---
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
-
-
-# --- Models ---
-
-class User(BaseModel):
-    email: str
-    is_active: bool
-    role: str
-
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-
-# --- Auth functions ---
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
-
-
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-
-
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    to_encode["exp"] = datetime.now(timezone.utc) + timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-    )
-    to_encode["iss"] = TOKEN_ISSUER
-    to_encode["aud"] = TOKEN_AUDIENCE
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-# --- Dependencies ---
-
-def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    try:
-        payload = jwt.decode(
-            token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM],
-            issuer=TOKEN_ISSUER,
-            audience=TOKEN_AUDIENCE,
-        )
-        email: str = payload.get("sub")
-        if email is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user = get_user_by_email(email)  # your DB lookup
-    if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
-    return user
-
-
-def get_current_active_user(user: User = Depends(get_current_user)) -> User:
-    if not user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return user
-
-
-def require_role(role: str):
-    def checker(user: User = Depends(get_current_active_user)) -> User:
-        if user.role != role:
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-        return user
-    return checker
-
-
-# --- App ---
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.environ.get("ALLOWED_ORIGINS", "").split(","),
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-
-
-# --- Routes ---
-
-@app.post("/auth/login", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = get_user_by_email(form_data.username)
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-    token = create_access_token(data={"sub": user.email})
-    return {"access_token": token, "token_type": "bearer"}
-
-
-@app.get("/users/me")
-def read_me(user: User = Depends(get_current_active_user)):
-    return user
-
-
-@app.get("/admin/stats")
-def admin_stats(admin: User = Depends(require_role("admin"))):
-    return {"users": 1000, "active": 850}
-```
 
 ---
 
@@ -1221,7 +1101,23 @@ def admin_stats(admin: User = Depends(require_role("admin"))):
 1. **Auth is a dependency chain** -- each layer has one job
 2. **Tokens are not encrypted** -- they are signed; never put secrets in the payload
 3. **Passwords must be hashed** -- bcrypt (direct) or argon2, never a fast hash; avoid the unmaintained `passlib`
-4. **CORS is not optional** -- misconfigured CORS either blocks your frontend or opens security holes
+4. **CORS governs browser reads** -- configure it for the application's origin and credential model; retain authentication and CSRF controls
 5. **Secrets come from the environment** -- never from source code
 6. **Errors should not leak information** -- same message for wrong user and wrong password
 7. **Every token must expire** -- a token without expiry is a permanent key
+
+
+## Retention and transfer
+
+**Recap:** authenticate with a complete token policy, fetch current account state when required,
+then authorize the operation and exact resource. Filter public responses explicitly.
+
+**Check yourself:** a valid signature has no expiry claim. Will `jwt.decode` necessarily reject it?
+<details><summary>Answer</summary>No. Expiry verification checks a present claim; the endpoint must
+also require `exp`. The local negative fixture proves the distinction.</details>
+
+**Try it:** add a second tenant whose user has the same display email as an existing user. Design
+the stable subject and resource lookup, then test a cross-tenant post ID.
+<details><summary>Answer</summary>Use an immutable user ID scoped by the issuer, bind tenant context
+from trusted membership, and include both tenant and object in the query. Neither display email
+nor a role alone grants cross-tenant ownership.</details>

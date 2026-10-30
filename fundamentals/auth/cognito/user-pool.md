@@ -46,7 +46,6 @@ response = cognito.create_user_pool(
 
     # Multi-factor authentication (MFA) policy — mutable, but sign-in-impacting
     MfaConfiguration='OPTIONAL',           # 'OFF' | 'OPTIONAL' | 'ON'
-    EnabledMfas=['SOFTWARE_TOKEN_MFA'],    # TOTP apps like Google Authenticator
 
     # Account recovery
     AccountRecoverySetting={
@@ -92,6 +91,11 @@ response = cognito.create_user_pool(
 )
 
 pool_id = response['UserPool']['Id']
+# MFA factors use their dedicated API; EnabledMfas is not a CreateUserPool parameter.
+cognito.set_user_pool_mfa_config(
+    UserPoolId=pool_id, MfaConfiguration='OPTIONAL',
+    SoftwareTokenMfaConfiguration={'Enabled': True},
+)
 described = cognito.describe_user_pool(UserPoolId=pool_id)['UserPool']
 assert described['Id'] == pool_id
 print(described['Id'], described['Status'])  # us-east-1_..., Enabled
@@ -153,7 +157,7 @@ response = cognito.create_user_pool_client(
     # Which user attributes this app can read/write
     # Omit to grant access to all attributes (default for new clients)
     ReadAttributes=['email', 'name', 'custom:department'],
-    WriteAttributes=['name', 'custom:department'],
+    WriteAttributes=['email', 'name', 'custom:department'],
 
     # OAuth 2.0 settings (needed if using hosted UI / authorization code flow)
     AllowedOAuthFlows=['code'],                         # authorization code flow
@@ -263,7 +267,9 @@ elif 'ChallengeName' in response:
 
 `NotAuthorizedException` is the common failure when the credentials are wrong or the app client
 does not enable `ALLOW_USER_PASSWORD_AUTH`. A challenge is also a valid configured outcome; it must
-advance through the exhaustive loop below rather than being treated as failure.
+advance through the supported challenge handler below rather than being treated as failure.
+The example supports password-change and SMS/TOTP prompts only; it intentionally rejects passkey,
+choice-based, and MFA-setup challenges until the application implements their full protocol.
 
 ### Handling Challenges
 
@@ -283,7 +289,8 @@ def authenticate(username, password, client_id):
         session = response['Session']
 
         if challenge == 'NEW_PASSWORD_REQUIRED':
-            new_password = input("Set a new password: ")
+            from getpass import getpass
+            new_password = getpass("Set a new password: ")
             response = cognito.respond_to_auth_challenge(
                 ClientId=client_id,
                 ChallengeName='NEW_PASSWORD_REQUIRED',
@@ -340,12 +347,18 @@ def authenticate(username, password, client_id):
 
 ### Self Sign-Up
 
+These are administrative/user-flow excerpts for a disposable pool. Obtain the named password
+variables from a test secret store and enforce the configured minimum of 12 characters plus the
+character-class requirements. Do not put shared example passwords in a real account. The app
+client needs write access to each supplied attribute, including required `email`; immutable email
+can be supplied during initial registration, but not changed afterward.
+
 ```python
 # User signs themselves up
 response = cognito.sign_up(
     ClientId=client_id,
     Username='jane@example.com',
-    Password='MyPass123!',
+    Password=test_user_password,
     UserAttributes=[
         {'Name': 'email', 'Value': 'jane@example.com'},
         {'Name': 'name', 'Value': 'Jane Doe'},
@@ -377,7 +390,7 @@ cognito.admin_create_user(
         {'Name': 'name', 'Value': 'Jane Doe'},
         {'Name': 'custom:department', 'Value': 'engineering'},
     ],
-    TemporaryPassword='Temp1234!',
+    TemporaryPassword=temporary_user_password,
     MessageAction='SUPPRESS',           # don't send welcome email
 )
 # User status: FORCE_CHANGE_PASSWORD
@@ -387,7 +400,7 @@ cognito.admin_create_user(
 cognito.admin_set_user_password(
     UserPoolId=pool_id,
     Username='jane@example.com',
-    Password='Permanent1234!',
+    Password=permanent_user_password,
     Permanent=True,
 )
 # User status: CONFIRMED
@@ -416,7 +429,7 @@ cognito.admin_disable_user(UserPoolId=pool_id, Username='jane@example.com')
 # Re-enable
 cognito.admin_enable_user(UserPoolId=pool_id, Username='jane@example.com')
 
-# Force user to sign out everywhere (invalidates all tokens)
+# Force sign-out at Cognito; offline API JWT verification still needs revocation state
 cognito.admin_user_global_sign_out(UserPoolId=pool_id, Username='jane@example.com')
 ```
 
@@ -467,7 +480,7 @@ cognito.create_group(
     UserPoolId=pool_id,
     GroupName='admins',
     Description='Admin users',
-    Precedence=1,               # lower = higher priority when multiple groups conflict
+    Precedence=1,               # chooses preferred IAM role, not your app's permission merge
 )
 cognito.create_group(UserPoolId=pool_id, GroupName='premium', Precedence=10)
 cognito.create_group(UserPoolId=pool_id, GroupName='free',    Precedence=20)
@@ -530,39 +543,58 @@ pre-token generation for claims. The remaining triggers are conditional referenc
 | **Create auth challenge** | Create the actual challenge | Generate OTP, captcha, etc. |
 | **Verify auth challenge** | Validate the user's response | Check OTP, validate captcha |
 
-### Example: Post Confirmation — Add User to Group and Sync to DB
+### Example: Post Confirmation — idempotent profile initialization
 
 ```python
 import boto3
 from datetime import datetime, timezone
 
-def handler(event, context):
-    """Fires after a user confirms their account."""
-    user_pool_id = event['userPoolId']
-    username = event['userName']
-    email = event['request']['userAttributes'].get('email')
 
-    # Add to default group
-    cognito = boto3.client('cognito-idp')
-    cognito.admin_add_user_to_group(
-        UserPoolId=user_pool_id,
-        Username=username,
-        GroupName='free',
+def initialize_profile(event, table):
+    # Cognito also invokes post-confirmation after password-reset confirmation.
+    if event.get("triggerSource") != "PostConfirmation_ConfirmSignUp":
+        return event
+    attributes = event["request"]["userAttributes"]
+    table.update_item(
+        Key={"userId": attributes["sub"]},
+        UpdateExpression=("SET #email = if_not_exists(#email, :email), "
+                          "#tier = if_not_exists(#tier, :free), "
+                          "#created = if_not_exists(#created, :now)"),
+        ExpressionAttributeNames={"#email": "email", "#tier": "tier", "#created": "createdAt"},
+        ExpressionAttributeValues={":email": attributes.get("email", ""), ":free": "free",
+                                   ":now": datetime.now(timezone.utc).isoformat()},
     )
-
-    # Sync to your own database
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('users')
-    table.put_item(Item={
-        'userId': event['request']['userAttributes']['sub'],
-        'email': email,
-        'tier': 'free',
-        'createdAt': datetime.now(timezone.utc).isoformat(),
-    })
-
-    # Must return the event unchanged (Cognito requires this)
     return event
+
+
+def handler(event, context):
+    table = boto3.resource("dynamodb").Table("users")
+    return initialize_profile(event, table)
 ```
+
+Each field is initialized only if absent. A duplicate confirmation cannot overwrite an existing
+`premium` tier or move the creation time. A password-reset confirmation performs no profile write.
+The default entitlement lives in this profile; avoid an unrelated default-group side effect in the
+same trigger unless its retries and recovery are also defined. IAM must grant the Lambda only the
+required table action. Surface failures and make the application tolerate/reconcile an absent
+profile: authentication and an external database write are not one transaction.
+
+```mermaid
+sequenceDiagram
+    participant Cognito
+    participant Lambda
+    participant DB as Profile table
+    Cognito->>Lambda: ConfirmSignUp sub u42
+    Lambda->>DB: Initialize missing tier and createdAt
+    DB-->>Lambda: Existing premium fields preserved
+    Cognito->>Lambda: Duplicate ConfirmSignUp sub u42
+    Lambda->>DB: Same conditional initialization
+    Cognito->>Lambda: ConfirmForgotPassword sub u42
+    Lambda-->>Cognito: Return event without profile write
+```
+
+The duplicate executes safely because the database conditions apply at write time. A prior
+read followed by an unconditional `put_item` would still race a billing upgrade.
 
 ### Example: Pre Token Generation — Add Custom Claims
 
@@ -583,16 +615,27 @@ def handler(event, context):
     return event
 ```
 
-Attach a trigger to the pool:
+Attach a trigger while preserving every returned updateable setting and existing trigger:
+
 ```python
-cognito.update_user_pool(
-    UserPoolId=pool_id,
-    LambdaConfig={
-        'PostConfirmation': 'arn:aws:lambda:us-east-1:123456789012:function:PostConfirmation',
-        'PreTokenGeneration': 'arn:aws:lambda:us-east-1:123456789012:function:PreTokenGen',
-    }
+from config_updates import pool_trigger_update_request
+
+request = pool_trigger_update_request(
+    cognito, pool_id,
+    PostConfirmation="arn:aws:lambda:us-east-1:123456789012:function:PostConfirmation",
+    PreTokenGeneration="arn:aws:lambda:us-east-1:123456789012:function:PreTokenGen",
 )
+cognito.update_user_pool(**request)
 ```
+
+Copy [config_updates.py](examples/config_updates.py) beside the script. `UpdateUserPool` is a
+replacement-style operation: omitted configuration can reset to defaults. This helper preserves
+supported fields from `DescribeUserPool`, maps the pool name, and merges the trigger map. Review the
+redacted diff, use one administrative writer, apply, then describe and compare; no optimistic lock
+protects a concurrent administrator's update. New SDK/API fields require a fresh schema review.
+The Lambda also needs a resource policy allowing this pool to invoke it; setting an ARN alone does
+not create that permission. The pre-token example is the V1 identity-token event shape; access-token
+customization uses the appropriate newer event version and response schema. See [UpdateUserPool](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_UpdateUserPool.html).
 
 ---
 
@@ -610,10 +653,10 @@ cognito.confirm_forgot_password(
     ClientId=client_id,
     Username='jane@example.com',
     ConfirmationCode='654321',
-    Password='NewPass456!',
+    Password=replacement_user_password,
 )
 
-# Admin force-reset (user gets NEW_PASSWORD_REQUIRED on next login)
+# Admin force-reset: user enters RESET_REQUIRED and completes forgot-password confirmation
 cognito.admin_reset_user_password(
     UserPoolId=pool_id,
     Username='jane@example.com',
@@ -633,7 +676,7 @@ response = cognito.initiate_auth(
 
 new_access_token = response['AuthenticationResult']['AccessToken']
 new_id_token     = response['AuthenticationResult']['IdToken']
-# Note: a new RefreshToken is NOT issued — same one stays valid
+# Nonrotating client only. A rotating client uses GetTokensFromRefreshToken instead.
 ```
 
 ---
@@ -674,3 +717,50 @@ https://myapp-auth.auth.us-east-1.amazoncognito.com/oauth2/authorize
 
 - [cognito.md](./cognito.md) — Mental model and overview
 - [tokens.md](./tokens.md) — JWT structure, validation, refresh flow
+
+
+## Client-secret rotation and recovery changes
+
+As checked 2026-10-30, confidential clients can have two active secrets. Add the replacement with
+`AddUserPoolClientSecret`, deploy it to callers, observe successful token issuance using it, then
+remove the old secret by ID with `DeleteUserPoolClientSecret`. Keep the old secret during rollout
+for rollback. This does not convert a public app client into a confidential one, and the only active
+secret cannot be deleted. Store the returned value directly in a secret manager, never logs.
+[AWS app-client secret lifecycle](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-client-apps.html).
+
+Multi-Region replication changes the recovery contract, not just deployment topology. Essentials
+or Plus and a multi-Region customer-managed KMS key are prerequisites. The secondary handles a
+subset of authentication operations; signup, password reset and profile writes remain primary
+operations, and TOTP MFA is not supported in the secondary. Replica configuration is eventually
+consistent. Review email, SMS, Lambda, WAF and logs per Region, then rehearse actual failover with
+existing users and each authentication method. [Cognito MRR limitations](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-multi-region.html).
+
+Changing to the updated issuer changes newly issued tokens, including those produced by existing
+refresh tokens. Stage verifier support for explicitly trusted old/new issuers before switching,
+retain overlap through old access/ID expiry, and remove the old policy afterward. Each issuer has
+its own configured JWKS endpoint; never disable issuer validation during migration. Exercise key
+retrieval when the primary is unavailable. [AWS issuer migration guidance](https://aws.amazon.com/blogs/security/architecting-resilient-authentication-with-amazon-cognito-multi-region-replication/).
+
+## Operational checkpoint and retention
+
+Before production, record the pool/client configuration, verify callback and attribute permissions,
+rehearse every enabled MFA/challenge path, confirm SES/SMS delivery and throttling behavior, and
+monitor signup/login/reset failures separately. Test both the denied permission and the allowed
+one. Keep an administrator recovery path separate from user login. Configuration tests in the
+[practical guide](oauth-jwt-guide.md) validate request shapes and preservation locally; they do not
+prove cloud permissions, deliverability, triggers, or replication.
+
+**Recap:** the pool owns the directory and policy, while clients constrain application-specific
+flows. Administrative updates preserve complete configuration; repeated lifecycle events must
+preserve business state.
+
+**Check yourself:** a password reset fires post confirmation for a premium user. Should the handler
+create a fresh free profile?
+<details><summary>Answer</summary>No. Ignore the forgot-password trigger for initial provisioning;
+even signup retries must only initialize missing fields atomically.</details>
+
+**Try it:** enable rotation on a code-flow client with several callback URLs and SRP plus legacy
+refresh enabled. Predict the complete request before applying it in a disposable environment.
+<details><summary>Answer</summary>Preserve the URLs, OAuth scopes/flows and lifetimes; remove
+`ALLOW_REFRESH_TOKEN_AUTH`, set rotation and its grace period, then verify via Describe. A patch
+containing only the rotation field can reset unrelated configuration.</details>

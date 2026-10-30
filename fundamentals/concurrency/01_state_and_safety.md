@@ -30,7 +30,7 @@ If two concurrent owners can reach `items`, both names lead to the same mutable 
 | Term | Meaning |
 |------|---------|
 | Mutable | The object can be changed in place. Examples: `list`, `dict`, `set`, most class instances. |
-| Immutable | The object cannot be changed in place. Examples: `int`, `float`, `str`, `bytes`, `tuple` when it contains only immutable values. |
+| Immutable | The object cannot be changed in place. Examples: `int`, `float`, `str`, `bytes`, `tuple` (its slots cannot change; a referenced list can still mutate). |
 | Shared | More than one task, thread, process, request, or module can reach the same object. |
 | Thread-safe | Multiple OS threads can use it concurrently without corrupting state or breaking invariants. |
 | Async-safe | It does not corrupt logical per-task state and does not block the event loop. |
@@ -109,6 +109,22 @@ An `asyncio.Lock` may be held across `await` when the whole async operation is t
 Do not use `threading.Lock` as your default async lock. It blocks the event loop if acquisition waits, and it does not model ownership between tasks. Asyncio primitives are not thread-safe and are intended for tasks on one event loop.
 
 ---
+
+The lost update is a read-to-write invariant, even on one event-loop thread:
+
+```mermaid
+sequenceDiagram
+ participant A as Task A
+ participant C as counter
+ participant B as Task B
+ A->>C: Read 0
+ Note over A: await yields
+ B->>C: Read 0
+ A->>C: Write 1
+ B->>C: Write 1
+```
+
+Both tasks derived 1 from 0. The second write erases progress, so the lock must enclose the whole read/derive/write operation, including relevant suspension points.
 
 ## 5. Match the Primitive to the Scheduler
 
@@ -252,6 +268,16 @@ See [async/03_contextvars.md](async/03_contextvars.md) for propagation rules.
 
 ---
 
+Copied context bindings do not duplicate a database session:
+
+```mermaid
+flowchart LR
+ A[Task A context binding] --> S[One mutable session]
+ B[Task B copied binding] --> S
+```
+
+Both arrows reach the same session. Give each concurrent transaction its own session; copying the context is metadata propagation, not a session concurrency protocol.
+
 ## 8. The GIL Does Not Make Code Correct
 
 On the default CPython build, the GIL prevents multiple threads from executing Python bytecode at the exact same time. It does not make compound operations atomic at the level your business logic cares about.
@@ -309,4 +335,40 @@ If you run four Uvicorn/Gunicorn workers, you have four in-memory caches, four s
 
 ---
 
-**Next**: [Subinterpreters and Free-Threaded CPython](02_alternative_runtimes.md)
+
+## Recap
+
+- Reachability determines shared state; bindings do not imply private objects.
+- Protect the whole invariant with a primitive owned by the right scheduler.
+
+## Check yourself
+
+**Q: Two child contexts inherit a dictionary. One changes count. Can the other see it?**
+
+<details><summary>Answer</summary>
+
+Yes: the copied bindings reach the same dictionary. Rebinding to separate immutable values differs from mutating the shared referent.
+
+</details>
+
+**Q: Does a tuple containing a list make that list immutable?**
+
+<details><summary>Answer</summary>
+
+No. Tuple slots are immutable; the reachable list remains mutable.
+
+</details>
+
+## Try it
+
+Assign ownership for request metadata, a thread-shared counter and a cross-process quota.
+
+Hint: Separate immutable values, lock-protected memory and external authority.
+
+<details><summary>Worked solution</summary>
+
+Use per-task immutable metadata, one lock around the thread counter invariant, and a shared external atomic operation for the cross-process quota.
+
+</details>
+
+**Next**: follow the selected [async](async/README.md), [thread](threads/README.md), or [process](processes/README.md) branch. Evaluate [alternative runtimes](02_alternative_runtimes.md) after that baseline works.

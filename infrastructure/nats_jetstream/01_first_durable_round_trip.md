@@ -5,11 +5,13 @@
 ## Quick start: one server, one stream, one durable consumer
 
 Start NATS Server with **JetStream**—the persistence layer that stores selected NATS messages—and
-mount its data directory so a container restart does not erase the exercise:
+mount its data directory so a container restart does not erase the exercise. The one-message
+expectations below require a new `nats-notes-data` volume. If it already exists, inspect its stream
+state and use a new volume name for this run; do not delete earlier data merely to match an output:
 
 ```bash
 docker run --rm -d --name nats-notes \
-  -p 4222:4222 -p 8222:8222 \
+  -p 127.0.0.1:4222:4222 -p 127.0.0.1:8222:8222 \
   -v nats-notes-data:/data \
   nats:2.14.6 -js -sd /data
 ```
@@ -111,5 +113,42 @@ Clean up the container with `docker stop nats-notes`. Keep the volume if you wan
 recover the stream. Success is `docker ps` no longer listing `nats-notes`.
 
 ---
+
+## Recap
+
+- The stream stores matching subjects independently of connected consumers.
+- A durable consumer records delivery progress; acknowledgement changes that state.
+- LimitsPolicy retains messages until age/size policy removes them, not until one reader acknowledges.
+
+## Check yourself
+
+**Q: After order-worker acknowledges, a new audit-reader starts with deliver all. Does it see ord-42?**
+
+<details><summary>Answer</summary>
+
+Yes while the record remains within LimitsPolicy retention. Acknowledging in the first consumer does not erase the shared stream record.
+
+</details>
+
+**Q: Restarting with the same volume reports two messages. Is the expected one-message result evidence of a bug?**
+
+<details><summary>Answer</summary>
+
+No. The tutorial expects a fresh fixture. Existing retained records survive a container restart; inspect the stream or use a fresh volume instead of deleting unknown data.
+
+</details>
+
+## Try it
+
+Create a differently named durable with deliver all and predict stored-message count and delivered progress before fetching.
+
+Hint: Change reader identity only; do not publish a second event.
+
+<details><summary>Worked solution</summary>
+
+The fresh fixture still stores one message. The new reader receives ord-42 independently of order-worker progress; its own acknowledgement advances only its own state.
+
+</details>
+
 
 **Next**: [Streams, Subjects, and Retention](02_streams_subjects_and_retention.md)

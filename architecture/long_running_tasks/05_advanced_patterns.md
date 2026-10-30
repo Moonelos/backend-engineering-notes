@@ -26,6 +26,27 @@ Place order:
 
 Step 3 fails. Steps 1 and 2 already committed to their own databases. You need to **unwind** — release the inventory, refund the payment. Each service must know how to undo its own step.
 
+The compensation is another committed action, not a rewind of all services:
+
+```mermaid
+sequenceDiagram
+    participant O as Order saga 42
+    participant I as Inventory
+    participant P as Payment
+    participant S as Shipping
+    O->>I: Reserve items, key 42-reserve
+    I-->>O: Reservation committed
+    O->>P: Charge, key 42-charge
+    P-->>O: Charge committed
+    O->>S: Create shipment
+    S-->>O: Rejected
+    O->>P: Refund, key 42-refund
+    O->>I: Release, key 42-release
+```
+
+A refund may itself time out. The saga retains `refund pending` and retries the same compensation
+identity; it must not claim the order is fully compensated until the participants confirm it.
+
 ### Two flavors
 
 **Choreography** — services listen for events and react. Step 1 emits `InventoryReserved`; payment service reacts, emits `PaymentCharged`; shipping reacts; etc. On failure, services emit compensating events (`InventoryReleased`, `PaymentRefunded`) that other services consume.
@@ -85,11 +106,12 @@ INSERT INTO outbox (id, aggregate_id, aggregate_sequence, event_type, payload, s
 COMMIT;
 ```
 
-A publisher process / worker:
+A publisher excerpt (requires `claim_generation BIGINT NOT NULL DEFAULT 0`, claim owner/expiry
+columns and an application broker adapter; `import asyncio, secrets`):
 
 ```python
 async def outbox_publisher():
-    publisher_id = stable_process_id()
+    publisher_id = secrets.token_hex(16)  # unique per publisher incarnation
     while True:
         # Claim durably in a short transaction; row locks alone disappear as
         # soon as the SELECT's transaction ends.
@@ -115,10 +137,11 @@ async def outbox_publisher():
                 )
                 UPDATE outbox AS o
                    SET status='publishing', claim_owner=$1,
+                       claim_generation=claim_generation + 1,
                        claim_expires_at=now() + interval '30 seconds'
                   FROM candidates AS c
                  WHERE o.id = c.id
-                RETURNING o.id, o.aggregate_id, o.aggregate_sequence,
+                RETURNING o.id, o.claim_generation, o.aggregate_id, o.aggregate_sequence,
                           o.event_type, o.payload
                 """,
                 publisher_id,
@@ -128,13 +151,18 @@ async def outbox_publisher():
                 # The aggregate key keeps one aggregate on one ordered broker
                 # partition; ordering across different aggregates is irrelevant.
                 await broker.publish(
-                    e["event_type"], e["payload"], key=e["aggregate_id"]
+                    e["event_type"],
+                    {"event_id": str(e["id"]), "sequence": e["aggregate_sequence"],
+                     "payload": e["payload"]}, key=e["aggregate_id"]
                 )
-                await db.execute(
+                updated = await db.fetchval(
                     "UPDATE outbox SET status='published', published_at=now() "
-                    "WHERE id=$1 AND status='publishing' AND claim_owner=$2",
-                    e["id"], publisher_id,
+                    "WHERE id=$1 AND status='publishing' AND claim_owner=$2 "
+                    "AND claim_generation=$3 RETURNING id",
+                    e["id"], publisher_id, e["claim_generation"],
                 )
+                if updated is None:
+                    log.warning("stale_publish_completion", event_id=e["id"])
             except Exception:
                 log.exception("publish_failed", event_id=e["id"])
                 # Leave the durable claim to expire; the next claimant retries.
@@ -147,14 +175,41 @@ Key details:
 - `FOR UPDATE SKIP LOCKED` selects distinct rows, while the committed
   `publishing` owner/lease keeps them claimed after row locks are released.
 - **At-least-once delivery** — the publisher can crash between publishing and updating status, causing a republish. Consumers must be idempotent.
-- **Ordering** — the monotonic `aggregate_sequence`, earliest-pending query, and broker partition key
-  preserve order within one aggregate. Random UUID order does not. Multiple aggregates still publish
-  concurrently, and no global ordering is promised.
+- **Ordering boundary** — the sequence and earliest-pending query control normal publication,
+  but lease expiry cannot revoke an already paused broker send. A late old owner can publish
+  sequence 1 after the new owner sent 1 then 2. The generation predicate fences database
+  bookkeeping, not the broker. Consumers deduplicate `event_id` and apply a per-aggregate
+  sequence rule: ignore known duplicates, buffer/reconcile gaps, and reject stale updates.
+  If strict log order itself is required, use a partition owner/producer protocol that the broker
+  fences, or a properly configured CDC pipeline; a partition key alone is insufficient.
 - **Garbage collection** — published events shouldn't live forever. A separate job deletes rows older than N days, or uses table partitioning by date.
+
+The late-send schedule explains why consumer sequence checks still matter:
+
+```mermaid
+sequenceDiagram
+    participant A as Publisher A generation 1
+    participant D as Outbox
+    participant B as Publisher B generation 2
+    participant Q as Broker
+    A->>D: Claim order42 sequence 1
+    Note over A: Pause longer than lease
+    B->>D: Reclaim sequence 1
+    B->>Q: Publish sequence 1 then sequence 2
+    A->>Q: Late publish of sequence 1
+    A->>D: Mark published with generation 1
+    D-->>A: Rejected; current generation is 2
+```
+
+The database rejects stale bookkeeping, but the broker already saw the late duplicate. Check this
+failure with the local [ordering simulation](examples/recovery_contracts.py), which asserts that a
+sequence-aware projection stays at 2 for delivery order `1, 2, 1` and identifies a missing sequence.
 
 ### Outbox + CDC (Change Data Capture)
 
-An increasingly common variant: instead of a polling publisher, use Debezium / Postgres logical decoding to stream the outbox table directly to Kafka. Same atomicity guarantee; much higher throughput and no polling loop to tune.
+An increasingly common variant: instead of a polling publisher, use Debezium / Postgres logical decoding to stream the outbox table directly to Kafka. The business/outbox transaction stays the same, while publication is driven by the commit log.
+Measure throughput and operate replication slots, connector offsets, retention, replay and schema
+compatibility; removing polling does not remove those recovery duties.
 
 ---
 
@@ -272,7 +327,7 @@ When a request fans out through API → queue → worker → upstream → databa
 
 The minimum useful instrumentation for a long-running-task architecture:
 
-1. **HTTP ingress** — FastAPI's `opentelemetry-instrumentation-fastapi` auto-instruments every request. The current trace context goes into `request.state.
+1. **HTTP ingress** — FastAPI's `opentelemetry-instrumentation-fastapi` auto-instruments every request. The instrumentation attaches context to the active execution scope; do not assume an undocumented `request.state` field.
 2. **Broker enqueue / dequeue** — inject the trace context into the message headers on send; extract on receive. OpenTelemetry's semantic conventions define `messaging.*` attributes for this.
 3. **HTTP client calls** — `opentelemetry-instrumentation-httpx` auto-propagates context via `traceparent` headers.
 4. **Database calls** — `opentelemetry-instrumentation-sqlalchemy` adds spans for each query.
@@ -300,11 +355,46 @@ def my_actor(payload, _tracectx=None):
         do_work(payload)
 ```
 
-Now one Jaeger / Honeycomb / Tempo timeline shows: HTTP request → enqueue → dequeue (possibly minutes later) → worker processing → upstream API calls → DB queries, as a single connected trace.
+The context can connect spans in a backend that retains them. It does not keep the HTTP span
+running, preserve sampling decisions indefinitely, or guarantee a complete trace after queue delay.
 
-### Sampling
+This timing shows a successful request followed by a late worker failure:
 
-Tracing every request is expensive. Sample aggressively — 1% is a reasonable starting point. Most tracers let you configure **tail-based sampling**: keep all traces that contain an error or exceed a latency threshold, sample the rest. That gives you the traces you actually need to debug without paying for the 99% of boring ones.
+```mermaid
+sequenceDiagram
+    participant A as API span
+    participant Q as Queue
+    participant C as Collector
+    participant W as Worker span
+    A->>Q: t=0, enqueue payload plus traceparent
+    A->>C: t=1, successful span ends
+    Note over C: t=30, tail decision window closes
+    Q->>W: t=300, dequeue retained context
+    W->>C: t=301, error span with original trace ID
+```
+
+The message preserves identity through five minutes of queueing. A collector deciding after 30
+seconds may already have evicted that trace. Context propagation cannot recreate an upstream span
+that a sampler dropped.
+
+### Choose who makes the sampling decision
+
+A **head sampler** chooses at span creation, before the outcome is known. A 1% head sample cannot
+later retain all errors: 99% of requests may never reach the collector. A **tail sampler** observes
+completed spans in the collector, buffers them, and decides from error/latency attributes. Route
+all spans for a trace to the same decision owner and size its memory for arrival rate times wait.
+[OpenTelemetry sampling](https://opentelemetry.io/docs/concepts/sampling/), checked 2026-10-30.
+
+For a bounded five-minute job, choose and test a decision window beyond the supported queue plus
+execution delay, with trace-count/memory limits and eviction metrics. If that budget is excessive,
+start a worker trace with a link to the ingress context and sample worker outcomes independently;
+correlate them using a non-secret job ID. Document how the selected backend handles late spans,
+decision caching and eviction. “Keep errors” means errors observed before that policy's decision,
+not every error from an arbitrarily delayed job.
+
+Rehearse t=1 ingress completion followed by t=301 worker failure, then inspect both trace IDs,
+parent/link fields and collector dropped/evicted counts. Re-run after changing sampling policy;
+no tracing backend was provisioned by the local ordering simulation.
 
 ---
 
@@ -313,3 +403,16 @@ Tracing every request is expensive. Sample aggressively — 1% is a reasonable s
 - [02_worker_patterns.md](./02_worker_patterns.md) — worker patterns that consume these.
 - [04_infrastructure.md](./04_infrastructure.md) — the Redis / SQS / Kafka pieces the outbox relies on.
 - [`safe_and_scalable_api_calls/11_idempotency.md`](../../fundamentals/fastapi/safe_and_scalable_api_calls/11_idempotency.md) — the consumer-side idempotency that makes at-least-once safe.
+
+## Check the boundary
+
+**With a 30-second tail window and a five-minute queue delay, does propagating `traceparent`
+guarantee retention of a worker error?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Identity and retention are different state. The context permits correlation, while the
+collector may decide and evict before the worker starts. Extend a bounded retention policy or use
+linked worker traces with independent sampling, and verify the late-arrival case.
+
+</details>

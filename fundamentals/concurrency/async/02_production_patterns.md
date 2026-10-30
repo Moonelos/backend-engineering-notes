@@ -129,6 +129,18 @@ If producers must never wait, use `put_nowait()` and turn `QueueFull` into an ex
 
 ---
 
+The queue and workers protect distinct memory/capacity boundaries:
+
+```mermaid
+flowchart LR
+ P[Producer] -->|await put blocks when full| Q[Queue: at most 100 waiting]
+ Q --> W[10 fixed workers]
+ W --> F[fetch async I/O]
+ F --> R[Results dictionary grows with total unique URLs]
+```
+
+Ten workers bound active operations; the queue bounds waiting inputs. The result dictionary is still unbounded with total input. A genuinely unbounded stream needs a bounded or external result sink.
+
 ## 3. Treat Timeouts as Budgets
 
 `asyncio.timeout()` limits a whole region:
@@ -360,5 +372,41 @@ the corresponding executor, multi-process, or detached-work boundary.
 - [`asyncio` event loop](https://docs.python.org/3/library/asyncio-eventloop.html)
 
 ---
+
+
+## Recap
+
+- Bound active work, waiting work and retained results independently.
+- One deadline covers admission and execution; shutdown must signal healthy long-lived children.
+
+## Check yourself
+
+**Q: A semaphore permits 10 calls, but 500,000 tasks are created. Is memory bounded by 10?**
+
+<details><summary>Answer</summary>
+
+No. Waiting tasks still allocate memory. Use fixed workers and a bounded queue.
+
+</details>
+
+**Q: TaskGroup body ends normally while workers await input forever. Will exit cancel them?**
+
+<details><summary>Answer</summary>
+
+No. Normal exit awaits them. Signal the stop condition or send sentinels before leaving the scope.
+
+</details>
+
+## Try it
+
+Change the queue demo to maxsize=2, two workers and 20 inputs. Record peak queue depth and drain duration.
+
+Hint: Inspect qsize after put, and measure monotonic time around queue.join.
+
+<details><summary>Worked solution</summary>
+
+Depth must stay at most 2; producer put suspends while workers are busy. All 20 results arrive before join returns, then one sentinel per worker closes the group. Retained results still occupy memory proportional to 20.
+
+</details>
 
 **Next**: [Context Variables and Request-Scoped State](03_contextvars.md)

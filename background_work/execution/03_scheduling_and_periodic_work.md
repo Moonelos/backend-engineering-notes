@@ -144,6 +144,35 @@ CREATE TABLE schedule_firings (
 );
 ```
 
+The [executable scheduler fixture](../examples/durable_job/test_scheduler.py) supplies the missing schema and calendar resolver. Start the PostgreSQL lab in [minimal durable task](../foundations/03_minimal_durable_task.md#run-one-job-before-studying-the-schema), then run from its example directory:
+
+```bash
+.venv/bin/python -m pytest -q test_scheduler.py
+```
+
+Its three tests resolve both Athens fall-back instants, race two independent scheduler connections at a barrier, repeat the stale cursor after the firing commits, reject a disabled schedule, and illustrate bounded catch-up. `resolve_local` round-trips each `fold` candidate through UTC: imaginary spring times fail the round-trip, so the selected shift policy advances to the first real minute. This is a minute-resolution demonstration, not a general cron parser.
+
+The fixture uses the canonical `document_parse_jobs` and `job_outbox` schema; the SQL below is the same dependency pattern adapted to an application's `jobs` schema. `jobs` must supply the listed workflow/step/payload columns; do not paste this excerpt over the parse-job schema.
+
+Watch the loser receive no firing row: it therefore has nothing from which to create a job.
+
+```mermaid
+sequenceDiagram
+    participant A as Scheduler A
+    participant D as PostgreSQL
+    participant B as Scheduler B
+    A->>D: INSERT daily-report at 01:00Z
+    B->>D: INSERT same schedule and instant
+    D-->>A: Firing RETURNING row feeds job and outbox
+    A->>D: COMMIT
+    D-->>B: Unique conflict, zero rows
+    Note over A: Crash before advancing cursor
+    A->>D: Restart, insert same occurrence
+    D-->>A: Zero rows, existing job remains owed
+```
+
+The firing/job transaction survives the scheduler crash. The cursor is only a discovery optimization; replaying it cannot create a second obligation. A worker crash is a different race and uses the canonical job lease and attempt token.
+
 After calculating a due `:scheduled_for`, every replica may attempt the same transaction. The unique constraint chooses one winner, and the job receives a row only from that winner:
 
 ```sql
@@ -207,5 +236,36 @@ Before production, prove:
 Do not use a global scheduler for a timer that is part of one workflow's durable state; let the workflow engine/history own it. Do not use cron to poll continuously when an event or queue can represent the change directly.
 
 ---
+
+## Recap and check yourself
+
+- A logical calendar occurrence becomes one durable firing key before a worker executes it.
+- UTC instants distinguish repeated local labels; DST, misfire and overlap are explicit policies.
+- A unique firing plus dependent job insert survives replica races and replay of a stale cursor.
+
+**Both Athens 03:30 occurrences are required at fall-back. Should their keys collide?**
+
+<details><summary>Answer</summary>
+
+No. The instants are 00:30Z and 01:30Z. A local label alone would incorrectly merge two business occurrences.
+
+</details>
+
+**The scheduler commits the firing/job then dies before advancing next_fire_at. Should restart invent a new key?**
+
+<details><summary>Answer</summary>
+
+No. It recalculates the same stored occurrence and hits the unique constraint. The existing obligation remains, and the cursor can safely catch up.
+
+</details>
+
+**Try it:** In `test_scheduler.py`, change the fall-back policy to `first`. Fill the expected UTC list for local `2026-10-25 03:30`.
+
+<details><summary>Hint and worked solution</summary>
+
+Sort actual UTC instants before choosing the first. The sole expected instant is `2026-10-25T00:30:00+00:00`; the second occurrence is deliberately excluded, not merged by a local-label key.
+
+</details>
+
 
 **Next**: [Reliability Deep Dives](../reliability/README.md)

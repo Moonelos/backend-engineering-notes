@@ -25,6 +25,7 @@ schema. **Avro** is a schema-driven binary serialization format. Save this Avro 
 Set the subject to backward-transitive compatibility, then register v1:
 
 ```bash
+set -euo pipefail
 curl --fail-with-body -X PUT http://localhost:8081/config/orders.events.v1-value \
   -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
   -d '{"compatibility":"BACKWARD_TRANSITIVE"}'
@@ -37,8 +38,9 @@ jq -Rs '{schema: .}' order-created-v1.avsc | \
 ```
 
 The success signal is a response containing an integer schema `id`. An HTTP `409` means the new
-schema violates the subject's compatibility policy; a `200` from the compatibility endpoint or an
-ID from registration is the gate, not a local parse alone. The complete endpoint behavior is in
+schema violates the subject's compatibility policy; the compatibility endpoint must return
+`is_compatible: true`, while registration must return an ID. HTTP 200 alone also wraps
+`is_compatible: false`; fail the deployment on that boolean, not just HTTP status. The complete endpoint behavior is in
 the [Schema Registry API reference](https://docs.confluent.io/platform/current/schema-registry/develop/api.html).
 
 ---
@@ -65,6 +67,7 @@ subject version as if it were the wire ID.
 Adding an optional field with a default lets a new reader consume retained v1 records:
 
 ```bash
+set -euo pipefail
 jq '.fields += [{"name":"coupon_code","type":["null","string"],"default":null}]' \
   order-created-v1.avsc > order-created-v2.avsc
 ```
@@ -78,17 +81,19 @@ The generated field is:
 Before registration, submit the candidate against all supported versions:
 
 ```bash
+set -euo pipefail
 jq -Rs '{schema: .}' order-created-v2.avsc | \
   curl --fail-with-body -X POST \
     'http://localhost:8081/compatibility/subjects/orders.events.v1-value/versions?verbose=true' \
     -H 'Content-Type: application/vnd.schemaregistry.v1+json' \
-    --data-binary @-
+    --data-binary @- | jq -e '.is_compatible == true'
 ```
 
 The additive schema returns `{"is_compatible":true}`. Create a breaking candidate by changing the
 existing field type, then send it to the same compatibility endpoint:
 
 ```bash
+set -euo pipefail
 jq '(.fields[] | select(.name == "total_minor").type) = "string"' \
   order-created-v1.avsc > order-created-breaking.avsc
 ```
@@ -100,6 +105,7 @@ still prove that “minor units” did not silently become major units.
 Register the compatible v2 before running the client trace:
 
 ```bash
+set -euo pipefail
 jq -Rs '{schema: .}' order-created-v2.avsc | \
   curl --fail-with-body -X POST \
     http://localhost:8081/subjects/orders.events.v1-value/versions \
@@ -113,6 +119,23 @@ jq -Rs '{schema: .}' order-created-v2.avsc | \
 ---
 
 ## 3. Trace the schema ID from object to bytes and back
+
+The wire ID selects the historical writer contract; it does not select the new reader's defaults.
+
+```mermaid
+flowchart LR
+    A[Order object] --> S[Avro serializer]
+    S <--> R[Registry: writer ID to schema]
+    S --> W[Bytes: marker + writer ID + payload]
+    W --> D[Avro deserializer]
+    R --> D
+    V[v2 reader schema: coupon default null] --> D
+    D --> O[Old order plus coupon null]
+```
+
+Restoring data without its original ID mapping breaks the lookup from bytes to writer schema,
+even if a newly registered schema has identical text. Reader defaults are applied only after that
+lookup succeeds.
 
 Save this as `schema_round_trip.py` beside both `.avsc` files. It invokes the same registry-aware
 serializer and deserializer used around Kafka records, but keeps the bytes in files so the recovery
@@ -174,6 +197,7 @@ for name in schemas:
 Run the trace only after the v1 and v2 registrations have succeeded:
 
 ```bash
+set -euo pipefail
 uv run --with 'confluent-kafka[avro,schemaregistry]' python schema_round_trip.py
 ```
 
@@ -205,6 +229,7 @@ that prerequisite is what permits subject-level `IMPORT` mode. First preserve th
 export every subject version with its original ID/version, and export compatibility:
 
 ```bash
+set -euo pipefail
 export SRC_SR=http://localhost:8081 DST_SR=http://localhost:18081
 export SUBJECT=orders.events.v1-value
 test ! -e registry-backup || { echo 'registry-backup already exists; move it aside'; exit 1; }
@@ -225,6 +250,7 @@ Restore the original IDs and versions, restore the compatibility policy, return 
 normal writes, and decode the *pre-restore* bytes against the destination:
 
 ```bash
+set -euo pipefail
 curl --fail-with-body -s -X PUT "$DST_SR/mode/$SUBJECT" \
   -H 'Content-Type: application/json' -d '{"mode":"IMPORT"}' | jq -e '.mode == "IMPORT"'
 for file in registry-backup/versions/*.json; do

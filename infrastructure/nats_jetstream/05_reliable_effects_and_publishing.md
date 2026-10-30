@@ -53,24 +53,35 @@ For a database-backed handler, insert the event ID and change business state in 
 ```sql
 BEGIN;
 
+-- Prerequisite: this projection stores complete snapshots; order_id is its primary key.
+-- processed_events has PRIMARY KEY (consumer, event_id).
 WITH accepted AS (
     INSERT INTO processed_events (consumer, event_id)
     VALUES ('billing-projection', 'evt-202')
     ON CONFLICT DO NOTHING
     RETURNING 1
 )
-UPDATE order_projection
-SET status = 'created'
-WHERE order_id = 'ord-84'
-  AND EXISTS (SELECT 1 FROM accepted);
+INSERT INTO order_projection (order_id, status, aggregate_version)
+SELECT 'ord-84', 'created', 1 FROM accepted
+ON CONFLICT (order_id) DO UPDATE
+SET status = EXCLUDED.status, aggregate_version = EXCLUDED.aggregate_version
+WHERE order_projection.aggregate_version < EXCLUDED.aggregate_version;
 
 COMMIT;
 ```
 
 The common table expression exposes whether the insert won. On redelivery, the uniqueness
-constraint makes `accepted` empty, so the update becomes a no-op and the worker can safely
+constraint makes `accepted` empty, so the projection write becomes a no-op and the worker can safely
 acknowledge it. `(consumer, event_id)` allows independent projections to process the same event once
-each.
+each. The upsert defines the missing-order policy: a complete snapshot can create the row. For a
+transition that requires an existing aggregate, use a transaction that checks the affected-row
+count and raises on zero, rolling back the processed ID too. Never silently commit a completion
+marker for an effect that could not be applied.
+
+The version predicate handles a different race: version 8 arrives, then an older version 7 is
+redelivered. Version 7 cannot overwrite 8. This is valid for complete snapshots; a delta such as
+"add 3 items" cannot be discarded merely because a later delta arrived. Deltas need ordered
+sequence/gap handling, not last-version replacement.
 
 For an external API, pass the event ID as that API's idempotency key when supported. If the remote
 system offers no idempotent operation or status lookup, no broker setting can remove the uncertainty.
@@ -125,8 +136,9 @@ idempotency while producing no error.
 ⚠️ A dedup table insert committed separately from the business update can record “done” before the
 effect exists. Keep both in one transaction.
 
-Do not add dedup state for naturally convergent operations such as replacing a projection row with
-the complete latest value. Do not describe a workflow as exactly once when it crosses a system that
+A complete snapshot can converge without a separate event-ID table only when its aggregate
+version is compared atomically and older/equal versions cannot replace newer state. Plain last-write
+replacement is idempotent for the same value but unsafe under out-of-order snapshots. Do not describe a workflow as exactly once when it crosses a system that
 has neither idempotency keys nor reconciliation; state the remaining ambiguity instead.
 
 > **Edge case:** optimistic concurrency with expected stream sequence can serialize publishers to a

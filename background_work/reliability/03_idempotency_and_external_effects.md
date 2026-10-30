@@ -287,4 +287,35 @@ Do not add idempotency storage to pure read operations or deterministic local re
 
 ---
 
+## Recap and check yourself
+
+- Business identity survives delivery retries and manual redrive.
+- Request hashes stop one operation key from silently changing meaning.
+- Provider success and local recording are separate commits, so ambiguous outcomes need reconciliation.
+
+**A manual redrive has a new message ID but requests the same final report. Should its operation key change?**
+
+<details><summary>Answer</summary>
+
+No. Transport identity changed; the logical run/step/definition did not. Reuse the operation key and check its request hash.
+
+</details>
+
+**The provider accepted a payment but the HTTP response was lost. Why not mark it failed and use a new key?**
+
+<details><summary>Answer</summary>
+
+That would allow a second charge. Query or retry the same key under the provider contract, then record the known result; a timeout proves uncertainty, not absence of an effect.
+
+</details>
+
+**Try it:** Complete a two-call fixture: call 1 uses key K/hash H; call 2 uses K/hash H2. Fill the expected branch before the provider is invoked.
+
+<details><summary>Hint and worked solution</summary>
+
+A key cannot silently change its input. Reject a request-hash conflict and make no second provider call. Returning a prior result for different input is also wrong.
+
+</details>
+
+
 **Next**: [Retries, Timeouts, and Cancellation](04_retries_timeouts_and_cancellation.md)

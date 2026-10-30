@@ -198,4 +198,33 @@ Do not adopt an orchestrator only for a visual diagram, built-in retries, or the
 
 ---
 
+## What's changing: durable agent integrations
+
+**EMERGING integration option, checked 2026-10-30.** [Temporal's durable AI guidance](https://docs.temporal.io/ai) and [Pydantic AI's Temporal integration](https://pydantic.dev/docs/ai/capabilities/durable_execution/temporal/) show how agent model/tool work can execute inside a durable workflow. This reduces adapter wiring; it does not change the ownership test. Attaching `TemporalDurability` to an agent and then calling the agent directly inside an ordinary API handler does not make that handler a persisted workflow execution.
+
+Start the run through the workflow entry point, use serializable bounded history, and map model/tool calls to the integration's durable activity boundaries. Keep stable effect keys and authorization checks for tools. If run-42 pauses for approval and the API pod exits, the workflow must still own the wait; a process-local agent object cannot recover it. Treat these integrations as an optional route when agent state and recovery justify the platform, not a requirement for every LLM request.
+
+## Recap and check yourself
+
+- A domain database and an engine must not independently own conflicting transitions.
+- Engine start is another distributed handoff and needs stable identity and recoverable intent.
+- Choose data intervals, service signals or agent checkpoints according to the state being recovered.
+
+**The request commits editorial_run=42 then dies before engine start. How is it recovered?**
+
+<details><summary>Answer</summary>
+
+Commit an outbox start command with the run, retry using a stable engine workflow ID, and retain one authoritative transition owner. A new random workflow ID on each retry defeats deduplication.
+
+</details>
+
+**The API calls an agent directly after attaching a Temporal durability capability. Is that invocation durable?**
+
+<details><summary>Answer</summary>
+
+No. The execution must start inside the workflow integration. Serializable history and idempotent tool effects remain necessary; a configured capability does not migrate an ordinary handler call into engine ownership.
+
+</details>
+
+
 **Next**: [Temporal-Class Engines](temporal/overview.md)

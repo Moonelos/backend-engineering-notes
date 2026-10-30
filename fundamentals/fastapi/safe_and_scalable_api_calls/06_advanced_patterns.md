@@ -1,761 +1,302 @@
-# Part 6: Advanced Resilience Patterns
+# Part 6: Keep one slow dependency from consuming the service
 
-<!-- length-justification: This conditional deep-dive keeps the resilience mechanisms in one decision reference because circuit breakers, bulkheads, hedging, queues, and adaptive limits must be compared by the load and failure propagation they reshape. -->
+> **Role:** implementation and conditional resilience patterns. Read [the bounded caller](03_call_patterns.md) and [production operation](05_production_architecture.md) first. You should understand a task, a cancellation deadline, an HTTP response owner and the difference between a logical operation and an attempt.
+>
+> **Outcome:** isolate a failing dependency, admit a single recovery probe, cancel every owned hedge, and bound priority work. Python 3.14, HTTPX 0.28.1 and Redis 7.4 are the tested baseline; source pins are in the linked laboratory.
 
-> **Who this is for**: Engineers adding resilience controls after the bounded external-call baseline
-> is already working.
+Vendor A normally answers inventory lookups in 80 ms. During an incident its p99 reaches
+four seconds. Vendor B still answers in 90 ms, but requests for B now fail too: A has
+occupied every shared permit. Retrying A faster makes this worse. We will change one
+part of this incident at a time and measure which resource each change protects.
 
-> **Principle**: Some mechanisms must be shared across pods, others must remain local.
+## 1. Partition the resource before adding a policy
 
-> **Key insight**: Advanced resilience controls reshape load and failure propagation, so their
-> scope must match the resource they protect.
+A **bulkhead** is a capacity partition. Give A and B separate `BoundedCaller` instances,
+with capacities 8 and 4 and bounded waiter populations. A can occupy eight slots; its
+ninth caller waits briefly or is rejected. B retains four. HTTP connection pools must
+also fit this topology: independent caller gates over one tiny pool can still contend
+at the transport layer. Use separate clients when transport isolation is required.
 
----
+The path below describes one request for A. A denied local request never contacted A,
+so its queue timeout is not evidence of A's health.
 
-## 0. Pod Awareness: Mental Model
+```mermaid
+flowchart LR
+  R[Authenticated inventory request] --> Route{Dependency}
+  Route --> A[Vendor A: 8 active, 8 waiting]
+  Route --> B[Vendor B: 4 active, 4 waiting]
+  A --> CA[A breaker partition]
+  B --> CB[B breaker partition]
+  CA --> HA[A HTTP pool]
+  CB --> HB[B HTTP pool]
+```
 
-In a multi-pod environment:
-- Each pod has **its own memory**
-- Load balancer distributes traffic **non-deterministically**
-- Local state ≠ global truth
-- **Coordination requires shared state** (Redis)
+There are two choices here: which work shares capacity, and which observations share
+health state. A breaker for `A/account1/regionEU/inventory` may be useful when that
+account or endpoint fails independently. A single breaker for every provider would
+turn A's incident into an intentional outage for B. Many tiny tenant breakers, on the
+other hand, may each lack enough traffic to make useful decisions.
 
-### Rule of Thumb
+A process-local breaker can reduce latency without a coordination dependency. A shared
+breaker is appropriate when the fleet must coordinate scarce probes or account-wide
+health; it also puts Redis availability in the admission path. It is not a universal
+requirement that every replica share one breaker.
 
-> **Protecting a downstream dependency → shared state**
-> **Protecting a pod's own health → local state**
+## 2. A breaker consumes eligible observations
 
-| Concern | Scope | State | Why |
-|---------|-------|-------|-----|
-| Circuit breaker | Global | Redis | All pods must agree when to stop |
-| Vendor rate limit | Global | Redis | Vendor sees all pods |
-| Semaphore | Local | In-memory | Pod capacity is per-pod |
-| Bulkhead | Local or partitioned | Separate pools/queues | One dependency or tenant must not consume all capacity |
-| Hedged request | Local decision + global budget | In-memory + Redis quota | Duplicate only slow tail calls, not every call |
-| Load shedding | Local | In-memory | Pod health is local |
-| Adaptive retry | Local | In-memory | Based on local conditions |
+A circuit breaker temporarily refuses attempts after sufficient failure evidence.
+In the supplied fixture the rule is **three consecutive eligible failures**, not an
+error-rate sliding window. Closed permits ordinary work; open rejects until a cooldown;
+half-open admits one leased probe. A successful current probe closes the circuit.
 
----
+| Result | Fixture policy | Why |
+|---|---|---|
+| 502/503/504 or admitted provider read failure | Failure | The selected dependency failed work it received |
+| Valid complete response | Success | Positive evidence for this partition |
+| Local queue/HTTP pool timeout | Neutral | The application could not admit/send work |
+| Caller cancellation | Neutral | The user stopped waiting; provider health is unknown |
+| Authentication/validation 4xx | Neutral, investigate separately | Credentials or request meaning needs correction |
+| 429 | Account rate policy, usually separate from availability | More probe traffic can worsen quota exhaustion |
 
-### Bulkhead Isolation
+Classify a single admitted attempt, or explicitly document that a breaker observes a
+whole operation. A three-attempt caller which eventually succeeds conceals two attempt
+failures from an outer breaker. For per-attempt observations, call with
+`max_attempts=1` at the owned attempt boundary and put the retry decision outside that
+observation. Preserve one total deadline and the core caller's retry-safety rules.
 
-A semaphore protects one shared pool. A bulkhead creates **separate pools** so one slow dependency, model, tenant, or workload cannot consume capacity reserved for another.
+The lifecycle has two distinct waits: an open cooldown and a half-open probe lease.
+
+```mermaid
+stateDiagram-v2
+  Closed --> Open: Three eligible consecutive failures
+  Open --> HalfOpen: Cooldown ends; atomic probe claim
+  HalfOpen --> Closed: Current live probe succeeds
+  HalfOpen --> Open: Current live probe fails
+  HalfOpen --> HalfOpen: Expired probe replaced with new generation
+```
+
+Expiry permits a replacement probe; it does not authorize the old probe's evidence.
+
+A shared probe needs more than `SET lock NX`. Suppose A acquires probe generation 7,
+pauses for a second, and its 500 ms lease expires. B acquires generation 8. A returning
+success must not close B's circuit or delete B's ownership. The atomic record operation
+compares **both generation and probe token**, and rejects expired probe evidence.
+
+```mermaid
+sequenceDiagram
+  participant A as Probe A
+  participant R as Redis breaker
+  participant B as Probe B
+  A->>R: allow: generation 7, token A, 500 ms
+  Note over A,R: Lease expires while A is paused
+  B->>R: allow: generation 8, token B
+  A->>R: success for generation 7
+  R-->>A: stale evidence ignored
+  B->>R: eligible failure for generation 8
+  R->>R: open generation 9; cooldown starts
+  A->>R: late cleanup for token A
+  R-->>A: cannot change generation 9
+```
+
+[SharedBreaker in the complete source](examples/advanced_resilience.py) implements the
+transition in one Redis script. Server `TIME` supplies the lease clock. Its closed-state
+success advances the generation, invalidating older outstanding evidence; consequently
+this is a deliberately conservative consecutive-evidence policy, not a statistical
+health estimator. Shared rate windows need a separately specified sample/window policy.
+Redis scripts execute atomically, and registered scripts must reload after cache loss;
+these guarantees and the Redis 7 effects-replication baseline are covered in
+[Redis's scripting documentation](https://redis.io/docs/latest/develop/programmability/eval-intro/).
+
+Do not delete the breaker key during routine operation: resetting its generation can
+make an old ticket look current. For migration, use a new versioned partition key and
+drain old attempts. An ambiguous `allow` reply can consume a probe lease; this fixture
+fails the call and lets the short lease expire rather than dispatching an uncertain probe.
+
+## 3. Hedge only after paying for the second attempt
+
+A **hedge** starts a second equivalent request when the first is unusually slow. If the
+first succeeds before 50 ms, no duplicate starts. Otherwise a second independently
+admitted attempt races it; the first *successful* result wins. A fast error must not beat
+a slower success. Every losing task is cancelled and awaited before the owner returns.
+
+The critical ownership shape is this excerpt from [the runnable implementation](examples/advanced_resilience.py):
 
 ```python
-import asyncio
-
-
-bulkheads = {
-    "openai": asyncio.Semaphore(40),
-    "anthropic": asyncio.Semaphore(20),
-    "embeddings": asyncio.Semaphore(10),
-}
-
-
-async def call_with_bulkhead(kind: str, call):
-    async with bulkheads[kind]:
-        return await call()
+# Structural excerpt: tasks are created inside hedge(), whose full definition is linked.
+try:
+    # Start primary; wait without transferring ownership to an unobserved shield.
+    # Start secondary only after delay or an early primary failure.
+    # Inspect successes while retaining both tasks.
+    ...
+finally:
+    for task in tasks:
+        task.cancel()
+    await finish(asyncio.gather(*tasks, return_exceptions=True))
 ```
 
-Use bulkheads when:
+`finish` owns the cleanup task while awaiting it, including a second cancellation of the
+parent. It does not make a non-cooperative task interruptible; clients, cleanup calls
+and provider operations still require bounded transport timeouts. Never use
+`wait_for(shield(primary), delay)` and then forget primary if the caller disconnects
+during the delay. The fixture cancels before the hedge delay and asserts primary stopped.
 
-- One vendor outage should not starve all other vendors.
-- Batch jobs should not steal capacity from interactive requests.
-- A noisy tenant should not exhaust shared model concurrency.
-- Queue workers have different SLAs.
+The race owns both tasks even when cancellation arrives before the secondary exists.
 
-Bulkheads cost efficiency. If the `embeddings` pool is idle, `openai` calls cannot automatically use that capacity unless you design an overflow rule. That tradeoff is the point: reliability sometimes means leaving capacity fenced off.
-
----
-
-### Hedging: Tail-Latency Mitigation
-
-A hedged request starts a second copy only after the first copy is unusually slow. Whichever finishes first wins; the loser is cancelled or ignored.
-
-```python
-import asyncio
-
-
-async def hedged_call(primary, duplicate, *, hedge_after: float = 1.5):
-    first = asyncio.create_task(primary())
-
-    try:
-        return await asyncio.wait_for(asyncio.shield(first), timeout=hedge_after)
-    except TimeoutError:
-        second = asyncio.create_task(duplicate())
-        done, pending = await asyncio.wait(
-            {first, second},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        return done.pop().result()
+```mermaid
+sequenceDiagram
+  participant C as Caller
+  participant H as Hedge owner
+  participant A as Primary
+  participant B as Secondary
+  C->>H: begin one read operation
+  H->>A: independently admitted attempt
+  Note over H,A: 50 ms passes without success
+  H->>B: separately admitted attempt
+  B-->>H: successful result
+  H->>A: cancel losing attempt
+  A-->>H: response closed; task joined
+  H-->>C: return B result
 ```
 
-Hedging is **not** a normal retry. It spends extra vendor capacity to reduce p95/p99 latency. Only use it when all of these are true:
+If C cancels before 50 ms, the same finally block cancels and joins A without starting B.
 
-- The operation is read-only or safely idempotent.
-- The upstream has spare capacity.
-- You have a global hedge budget, so a tail-latency event does not double cluster traffic.
-- You cancel or ignore the losing request quickly.
-- You measure whether p99 improves enough to justify the extra cost.
+Each factory passed to `hedge` must use its own admitted caller. Do not call raw HTTPX
+from the second factory and bypass shared attempt accounting. A hedge against the same
+provider costs two provider attempts and may consume two usage reservations. Two different
+providers can require two business effects even with identical idempotency keys: their
+deduplication stores are independent. Restrict hedging to reads or an explicitly safe
+operation; cancellation is not evidence that a remote effect or bill was undone.
 
-For LLM calls, hedging is usually a premium-feature or incident-mode tool, not a default. It can double token spend if both calls complete.
+For a p95 of 50 ms, hedging every request after 50 ms would duplicate roughly 5% of
+requests under that measured distribution. During an outage the duplication fraction
+can jump dramatically. Cap hedge volume separately, disable it under saturation, and
+include it in [the durable budget](10_llm_token_economics.md). Measure the reduction in
+p99 against added attempts and provider cost before enabling it broadly.
 
----
+## 4. Queue deadlines end when execution begins
 
-## 1. Circuit Breakers (🔴 MUST Be Pod-Aware)
+A priority queue lets a small amount of admitted work wait for a worker. It does not
+create capacity. [PriorityWork](examples/advanced_resilience.py) has a maximum cardinality,
+uses nonblocking insertion to avoid an unbounded population of blocked `put()` callers,
+and attaches a latest-start time to each item. The worker checks that time before
+calling the factory. The factory then owns its separate execution deadline.
 
-### What Problem They Solve
+The lower integer priority wins; a monotonically increasing sequence breaks ties without
+comparing coroutine objects. A cancelled submitter leaves a cancelled future. The
+worker skips it, and checks `future.done()` again before completing a result because a
+caller can cancel during execution. Every dequeue reaches `task_done()` in `finally`.
+Request errors become that request's result error; cancellation of the worker propagates.
 
-When a vendor is **systematically failing**, retries across multiple pods:
-- Multiply traffic against a broken system
-- Burn global rate limits
-- Create cascading failures
-- Prevent recovery
+This is an **ephemeral** queue: cancellation after execution starts abandons the
+response while bounded execution may finish. Keep worker tasks owned by application
+lifespan; on shutdown stop admission, drain within the shutdown budget, cancel/join
+workers, then call `abandon_pending()`. Never put accepted durable business jobs here.
+Priority must come from the verified tenant's server-side plan, not `?tier=premium`.
+Strict priority can starve background work; reserve some worker capacity or use a
+weighted fair scheduler when every class must progress.
 
-A **pod-aware circuit breaker** ensures **all pods agree** when to stop calling.
+Redis `BZPOPMIN` atomically removes an item. If the worker dies after removal, there is
+nothing left to redeliver. A distributed priority score is therefore not a durable
+queue contract. Use a broker with acknowledgement and reclaim semantics or the
+[durable job state machine](../../../background_work/foundations/03_minimal_durable_task.md)
+(the collection's background-work path describes the complete transaction and lease).
+Treat any priority broker message as a hint to durable job state, and fence stale owners.
 
-### Circuit Breaker States
+## 5. Conditional policies after the measured baseline
 
-| State | Behavior |
-|-------|----------|
-| **Closed** | Normal operation |
-| **Open** | All pods fail fast (no vendor calls) |
-| **Half-open** | Limited probe calls globally |
+| Policy | When it helps | Boundary to preserve |
+|---|---|---|
+| Adaptive concurrency | Latency rises before errors; measured headroom changes | Change one partition slowly; set min/max; exclude admission wait from provider latency |
+| Batching | Provider accepts bounded groups with lower per-item overhead | Bound items, bytes and formation delay; map each result/error back to its operation |
+| Cache/fallback | Stale inventory is acceptable for this read | Define maximum staleness and label degraded data; never fake payment success |
+| Priority shedding | Premium interactive traffic must retain a reserved share | Authenticate tier; expose rejection reason; avoid permanent starvation |
+| Retry budget | A dependency outage multiplies attempts | Atomically reserve retry starts; a read-then-increment ratio check races |
 
-### State Transitions
+An adaptive controller that counts local queue wait as provider latency can lower
+concurrency because of the very queue it created, shrinking capacity repeatedly. Record
+queue wait, admitted duration and response-read duration separately. Increase cautiously
+when latency and errors are stable; cut quickly on credible overload; roll back the
+controller independently of the hard fixed cap. Small batches smooth overhead, but a
+large batch can delay every result behind one slow element. Preserve per-item deadlines.
 
-```
-Closed → Open: After N failures in window
-Open → Half-open: After timeout
-Half-open → Closed: After M successes
-Half-open → Open: After any failure
-```
+## 6. Run and operate the incident laboratory
 
-### Where It Belongs
+From this directory's `examples` subdirectory, create a local environment and services:
 
-```
-Queue timeout
-  ↓
-Circuit breaker (GLOBAL fail fast)
-  ↓
-Global vendor rate limiter
-  ↓
-Local rate limiter (optional)
-  ↓
-Semaphore
-  ↓
-Vendor call
-```
-
-**Critical**: Circuit breaker comes **before** rate limiting.
-
-If breaker is open, don't waste rate limit tokens or semaphore slots.
-
-### Breaker state follows the dependency failure domain
-
-Without shared state:
-
-```
-Pod A → breaker OPEN
-Pod B → breaker CLOSED
-Pod C → breaker CLOSED
-```
-
-If all pods call the same vendor partition and should stop together, independent breakers let Pods
-B and C continue sending traffic after Pod A opens. Shared state can coordinate that failure
-domain. But a global breaker can also correlate unrelated tenants, regions, or vendor shards and
-turn one localized fault into a fleet-wide outage.
-
-Use process-local state when each instance has an independent connection/failure domain, shared
-state when callers truly share one dependency budget, and partition either design by the smallest
-key that fails together (for example region plus vendor account).
-
-### Redis-Backed Circuit Breaker
-
-```python
-import redis.asyncio as redis
-import time
-
-
-class CircuitBreakerOpen(Exception):
-    pass
-
-
-class PodAwareCircuitBreaker:
-    """
-    Redis-backed circuit breaker shared across all pods.
-    """
-    
-    def __init__(
-        self,
-        redis_client: redis.Redis,
-        key: str,
-        failure_threshold: int = 5,
-        success_threshold: int = 2,
-        timeout_seconds: int = 60,
-    ):
-        self.redis = redis_client
-        self.key_prefix = f"breaker:{key}"
-        self.failure_threshold = failure_threshold
-        self.success_threshold = success_threshold
-        self.timeout = timeout_seconds
-    
-    async def allow(self) -> None:
-        """Raises CircuitBreakerOpen if breaker is open."""
-        state = await self._get_state()
-
-        if state == "open":
-            opened_at = await self.redis.get(f"{self.key_prefix}:opened_at")
-            if opened_at:
-                elapsed = time.time() - float(opened_at)
-                if elapsed > self.timeout:
-                    # SET NX elects one probe across all pods. Everyone else fails closed.
-                    elected = await self.redis.set(
-                        f"{self.key_prefix}:probe", "1", nx=True, ex=self.timeout
-                    )
-                    if not elected:
-                        raise CircuitBreakerOpen()
-                    await self.redis.set(f"{self.key_prefix}:successes", 0)
-                    await self._set_state("half_open")
-                else:
-                    raise CircuitBreakerOpen()
-            else:
-                raise CircuitBreakerOpen()
-        elif state == "half_open":
-            elected = await self.redis.set(
-                f"{self.key_prefix}:probe", "1", nx=True, ex=self.timeout
-            )
-            if not elected:
-                raise CircuitBreakerOpen()
-    
-    async def is_open(self) -> bool:
-        """Non-raising check used by adaptive retry decisions."""
-        return await self._get_state() == "open"
-    
-    async def record_success(self) -> None:
-        state = await self._get_state()
-        
-        if state == "half_open":
-            successes = await self.redis.incr(f"{self.key_prefix}:successes")
-            await self.redis.delete(f"{self.key_prefix}:probe")
-            if successes >= self.success_threshold:
-                await self._set_state("closed")
-                await self.redis.set(f"{self.key_prefix}:failures", 0)
-        elif state == "closed":
-            await self.redis.set(f"{self.key_prefix}:failures", 0)
-    
-    async def record_failure(self) -> None:
-        state = await self._get_state()
-        
-        if state == "half_open":
-            await self.redis.delete(f"{self.key_prefix}:probe")
-            await self._set_state("open")
-            await self.redis.set(f"{self.key_prefix}:opened_at", time.time())
-        elif state == "closed":
-            failures = await self.redis.incr(f"{self.key_prefix}:failures")
-            await self.redis.expire(f"{self.key_prefix}:failures", 60)
-            
-            if failures >= self.failure_threshold:
-                await self._set_state("open")
-                await self.redis.set(f"{self.key_prefix}:opened_at", time.time())
-    
-    async def _get_state(self) -> str:
-        state = await self.redis.get(f"{self.key_prefix}:state")
-        return state.decode() if state else "closed"
-    
-    async def _set_state(self, state: str) -> None:
-        await self.redis.set(f"{self.key_prefix}:state", state)
-
-
-# Usage
-async def call_llm_with_breaker(payload: dict):
-    await breaker.allow()  # Check FIRST
-    
-    try:
-        result = await call_llm(payload)
-        await breaker.record_success()
-        return result
-    except Exception as e:
-        await breaker.record_failure()
-        raise
+```bash
+python3.14 -m venv .venv
+.venv/bin/pip install -r advanced_requirements.txt
+docker compose -p advanced-notes-repair -f advanced_compose.yaml up -d --wait
+.venv/bin/python -m pytest -q advanced_test_streaming.py advanced_test_redis.py
 ```
 
----
+The tests exercise cancellation before hedge creation, first-error/second-success,
+cancelled priority futures, final shared permit races, script-cache flush, and a probe
+whose expired generation cannot overwrite its successor. Redis and PostgreSQL use
+loopback ports 57379 and 57432. These are disposable laboratory services, not a
+production deployment. When finished with Parts 6–11:
 
-## 2. Priority Queues (🟡 Pod-Aware IF Backlog Exists)
-
-### When Redis Queue Is REQUIRED
-
-✅ Use Redis/broker when:
-- Mixed workloads (realtime + batch)
-- Different SLAs / user tiers
-- High traffic with variable latency
-- Long-running tasks
-
-❌ Not needed when:
-- All requests are equivalent
-- No backlog (requests complete quickly)
-- Low traffic
-
-### Pod-Local Queue (Simple Case)
-
-```python
-import asyncio
-from dataclasses import dataclass, field
-from typing import Any
-
-
-@dataclass(order=True)
-class PriorityQueueItem:
-    priority: int
-    payload: Any = field(compare=False)
-    future: asyncio.Future = field(compare=False)
-
-
-priority_queue = asyncio.PriorityQueue()
-
-
-async def submit_with_priority(payload: dict, priority: int):
-    """Lower number = higher priority."""
-    future = asyncio.Future()
-    await priority_queue.put(PriorityQueueItem(priority, payload, future))
-    return await future
-
-
-async def worker():
-    while True:
-        item = await priority_queue.get()
-        try:
-            result = await call_llm(item.payload)
-            item.future.set_result(result)
-        except Exception as e:
-            item.future.set_exception(e)
+```bash
+docker compose -p advanced-notes-repair -f advanced_compose.yaml down -v
 ```
 
-> ⚠️ This is **not pod-aware**. Each pod has its own queue.
-
-### Redis Priority Queue (Multi-Pod)
-
-```python
-class RedisPriorityQueue:
-    """Shared priority queue using Redis sorted set."""
-    
-    def __init__(self, redis_client: redis.Redis, key: str):
-        self.redis = redis_client
-        self.key = key
-    
-    async def push(self, payload: dict, priority: int) -> str:
-        task_id = f"{time.time()}:{id(payload)}"
-        await self.redis.zadd(
-            self.key,
-            {json.dumps({"id": task_id, "payload": payload}): priority}
-        )
-        return task_id
-    
-    async def pop(self, timeout: float = 1.0) -> Optional[dict]:
-        result = await self.redis.bzpopmin(self.key, timeout=timeout)
-        if result:
-            key, member, score = result
-            return json.loads(member)
-        return None
-```
-
----
-
-## 3. Adaptive Retry (🟢 Pod-Local by Design)
-
-### Why Local
-
-Adaptive retry decisions depend on:
-- Local latency
-- Local queue pressure
-- Local semaphore contention
-- Global breaker state (already shared)
-
-Each pod should adapt to **its own health**.
-
-### Retry Budget Computation
-
-```python
-def compute_retry_budget(
-    *,
-    breaker_open: bool,
-    queue_wait_seconds: float,
-    recent_error_rate: float,
-    semaphore_pressure: float,
-) -> int:
-    """
-    Compute how many retries are safe right now.
-    Returns 0-3.
-    """
-    
-    # No retries if circuit breaker is open
-    if breaker_open:
-        return 0
-    
-    # No retries if queue is backing up
-    if queue_wait_seconds > 2.0:
-        return 0
-    
-    # No retries if semaphore is saturated
-    if semaphore_pressure > 0.9:
-        return 0
-    
-    # Fewer retries if error rate is high
-    if recent_error_rate > 0.5:
-        return 1
-    
-    if recent_error_rate > 0.2:
-        return 2
-    
-    # Full retries if system is healthy
-    return 3
-```
-
-### Usage
-
-```python
-async def call_with_adaptive_retry(payload: dict):
-    max_retries = compute_retry_budget(
-        breaker_open=await breaker.is_open(),
-        queue_wait_seconds=metrics.get_average_queue_wait(),
-        recent_error_rate=metrics.get_error_rate(),
-        semaphore_pressure=get_semaphore_pressure(),
-    )
-    
-    for attempt in range(max_retries + 1):
-        try:
-            return await call_llm_with_breaker(payload)
-        except RetryableError:
-            if attempt == max_retries:
-                raise
-            await asyncio.sleep(backoff(attempt))
-```
-
----
-
-## 4. Load Shedding (🟢 Mostly Pod-Local)
-
-### What It Is
-
-**Intentional rejection** to protect the system.
-
-> "If THIS pod is unhealthy, it rejects early."
-
-### Where Load Shedding Belongs
-
-```
-Client
-  ↓
-Load shedding (local reject)
-  ↓
-Queue timeout
-  ↓
-Circuit breaker (global)
-  ↓
-Rate limiter
-```
-
-**Earlier = cheaper.** Reject before doing any work.
-
-### Queue-Length Shedding
-
-```python
-MAX_QUEUE_SIZE = 100
-
-
-@app.post("/llm")
-async def llm_endpoint(payload: dict):
-    if priority_queue.qsize() > MAX_QUEUE_SIZE:
-        raise HTTPException(429, "System overloaded - queue full")
-    
-    return await call_llm(payload)
-```
-
-### Latency-Based Shedding
-
-```python
-def should_shed_load() -> bool:
-    p95 = get_p95_latency()
-    return p95 > SLA_LATENCY * 0.9
-
-
-@app.post("/llm")
-async def llm_endpoint(payload: dict):
-    if should_shed_load():
-        raise HTTPException(503, "Service temporarily overloaded")
-    
-    return await call_llm(payload)
-```
-
-### Tier-Based Shedding
-
-```python
-def should_shed_for_tier(tier: str) -> bool:
-    pressure = get_system_pressure()
-    
-    if pressure > 0.9:
-        # Extreme pressure: only serve premium
-        return tier != "premium"
-    
-    elif pressure > 0.7:
-        # Moderate pressure: shed free tier
-        return tier == "free"
-    
-    return False
-
-
-@app.post("/llm")
-async def llm_endpoint(payload: dict, tier: str = "free"):
-    if should_shed_for_tier(tier):
-        raise HTTPException(429, f"Service under pressure - {tier} tier limited")
-    
-    return await call_llm(payload)
-```
-
----
-
-## 5. Local Metrics Tracking
-
-```python
-from collections import deque
-import time
-
-
-class LocalMetrics:
-    """Track local pod metrics for adaptive decisions."""
-    
-    def __init__(self, window_size: int = 100):
-        self.recent_calls = deque(maxlen=window_size)
-        self.queue_waits = deque(maxlen=50)
-    
-    def record_call(self, success: bool, duration: float):
-        self.recent_calls.append({
-            "success": success,
-            "duration": duration,
-            "timestamp": time.time(),
-        })
-    
-    def record_queue_wait(self, wait_seconds: float):
-        self.queue_waits.append(wait_seconds)
-    
-    def get_error_rate(self) -> float:
-        if not self.recent_calls:
-            return 0.0
-        errors = sum(1 for call in self.recent_calls if not call["success"])
-        return errors / len(self.recent_calls)
-    
-    def get_average_queue_wait(self) -> float:
-        if not self.queue_waits:
-            return 0.0
-        return sum(self.queue_waits) / len(self.queue_waits)
-
-
-# Per-pod instance
-local_metrics = LocalMetrics()
-```
-
----
-
-## 6. Complete End-to-End Flow
-
-```
-Request arrives
-  ↓
-1. Load shedding (local, fast reject)
-  ↓
-2. User rate limit check (global, Redis)
-  ↓
-3. Queue timeout (local, wait limit)
-  ↓
-4. Circuit breaker check (global, Redis)
-  ↓
-5. Global vendor rate limiter (Redis)
-  ↓
-6. Local rate limiter (optional, burst smoothing)
-  ↓
-7. Semaphore (local, capacity)
-  ↓
-8. Call timeout
-  ↓
-9. Vendor call (HTTP client with timeouts)
-  ↓
-10. Adaptive retry (local decision)
-```
-
----
-
-## 7. Combined Implementation
-
-```python
-async def complete_llm_call(
-    payload: dict,
-    user_id: str,
-    tier: str,
-) -> dict:
-    """Complete production LLM call with all safeguards."""
-    
-    # 1. Load shedding (local)
-    if should_shed_for_tier(tier):
-        raise HTTPException(429, "Service under pressure")
-    
-    # 2. User rate limit (global)
-    await check_user_rate_limit(user_id, tier)
-    
-    started = time.monotonic()
-    try:
-        # 3. Queue timeout
-        async with asyncio.timeout(5):
-            
-            # 4. Circuit breaker (global)
-            await breaker.allow()
-            
-            # 5. Global vendor rate limiter
-            await vendor_limiter.wait_and_acquire(timeout=3.0)
-            
-            # 6. Local rate limiter
-            async with llm_rate_local:
-                
-                # 7. Semaphore
-                async with llm_sem:
-                    
-                    # 8. Call timeout
-                    async with asyncio.timeout(30):
-                        response = await client.post(url, json=payload)
-                        response.raise_for_status()
-                        result = response.json()
-            
-            # Success
-            await breaker.record_success()
-            local_metrics.record_call(success=True, duration=time.monotonic() - started)
-            return result
-    
-    except CircuitBreakerOpen:
-        raise HTTPException(503, "Service temporarily unavailable")
-    
-    except VendorRateLimitExceeded:
-        raise HTTPException(429, "Vendor rate limit exceeded")
-    
-    except asyncio.TimeoutError:
-        await breaker.record_failure()
-        local_metrics.record_call(success=False, duration=time.monotonic() - started)
-        raise HTTPException(504, "Request timeout")
-    
-    except httpx.HTTPStatusError as e:
-        await breaker.record_failure()
-        local_metrics.record_call(success=False, duration=time.monotonic() - started)
-        raise HTTPException(502, f"Vendor error: {e.response.status_code}")
-```
-
----
-
-## 8. When to Add These Patterns
-
-### Start With (Baseline)
-
-- Semaphore (local capacity)
-- Call timeout
-- Queue timeout
-- Basic retry logic
-- User rate limiting (Redis)
-- Global vendor rate limiter (Redis)
-
-### Add When Needed
-
-**Circuit breaker** (Redis):
-- Frequent vendor outages
-- Cascading failures observed
-- Need coordinated failure across pods
-
-**Priority queues** (Redis):
-- Mixed workloads (realtime + batch)
-- Different SLAs
-- Long queues
-
-**Adaptive retry**:
-- High error rates
-- Variable latency
-- Need to reduce retry storms
-
-**Bulkheads**:
-- One dependency or tenant can exhaust shared capacity
-- Interactive and batch work have different SLAs
-- You need hard capacity fences, not just fair scheduling
-
-**Hedging**:
-- Tail latency matters more than marginal cost
-- The operation is idempotent/read-only
-- You can enforce a global duplicate-request budget
-
-**Load shedding**:
-- Traffic spikes
-- Tier-based service
-- Need graceful degradation
-
----
-
-## 9. Pod-Awareness Rules (Non-Negotiable)
-
-1. ✅ Circuit breakers **must be shared** (Redis)
-2. ✅ Vendor rate limiters **must be shared** (Redis)
-3. ✅ User rate limiters **must be shared** (Redis)
-4. ⚠️ Priority queues are shared **only if backlog exists**
-5. ✅ Hedge budgets **must be shared** if hedging can affect vendor capacity
-6. ❌ Adaptive retries are always **local**
-7. ❌ Load shedding is **early and local**
-8. ❌ Semaphores and bulkheads are usually **local**
-9. ❗ Never sleep while holding semaphores
-10. ❗ Never retry or hedge during overload
-11. ❗ Global limits protect vendors, local limits protect pods
-
----
-
-## Summary: What Lives Where
-
-| Mechanism | Scope | Storage | Purpose |
-|-----------|-------|---------|---------|
-| Semaphore | Local | In-memory | Pod capacity |
-| Local rate limiter | Local | In-memory | Burst smoothing |
-| Queue timeout | Local | In-memory | Admission control |
-| Load shedding | Local | In-memory | Early rejection |
-| Adaptive retry | Local | In-memory | Conditional retry |
-| Bulkhead | Local / partitioned | Separate semaphores, queues, workers | Failure isolation |
-| Hedge budget | Global | Redis | Bound duplicate traffic |
-| Circuit breaker | Global | Redis | Coordinated failure |
-| Vendor rate limiter | Global | Redis | Vendor contract |
-| User rate limiter | Global | Redis | Fairness |
-| Priority queue | Global | Redis | Global ordering |
-
----
-
-## References
-
-- [Azure Architecture Center - Bulkhead pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/bulkhead)
-- [Google Research - The Tail at Scale](https://research.google/pubs/the-tail-at-scale/)
-- [Google SRE - Handling Overload](https://sre.google/sre-book/handling-overload/)
-
----
-
-## Final Thought
-
-In distributed systems:
-
-> **Correctness is not local. Failure must be coordinated.**
-
-A pod-aware system ensures **all pods fail together, on purpose, and fast**.
-
-This prevents:
-- Cascading failures
-- Retry storms
-- Vendor limit violations
-- Resource exhaustion
-
-**The right architecture makes failure safe, predictable, and recoverable.**
-
----
-
----
-
-**Next**: [Part 7: Streaming Patterns](07_streaming_patterns.md) — how streaming changes timeout semantics, concurrency, and cancellation.
+For production, review this checklist with concrete dashboard values:
+
+- Each failure domain has a documented capacity and breaker partition, bounded waiters,
+  and an independently visible rejection reason.
+- Breaker transitions, current generation, probe age and ignored stale completions are
+  observable; alerts distinguish Redis failure from provider failure.
+- Hedge fraction, duplicate provider cost, cancelled-task cleanup latency and outstanding
+  owners are measured. Saturation disables speculative work before ordinary work.
+- Queue depth and oldest age have alerts. A full queue sheds promptly; a dead worker is
+  restarted by lifespan supervision, with durable work recovered from its real store.
+- Rollouts version script/key contracts; stopping a canary leaves no orphaned tasks.
+  Logs contain operation IDs and classifications, never credential headers or raw prompts.
+
+If A is open while B is healthy, inspect the partition key before tuning thresholds.
+If active permits remain nonzero after client cancellations, inspect ownership/join
+paths before raising capacity. More capacity can hide a leak briefly and amplify its cost.
+
+## Recap
+
+Bulkheads isolate scarce resources. Breakers suppress attempts using scoped evidence.
+Hedges spend extra admitted work to reduce tail latency. Priority queues bound waiting
+and do not provide durability. All four depend on explicit lifetime ownership.
+
+## Check yourself
+
+<details><summary>An old probe succeeds after a newer probe failed. Can it close the circuit?</summary>
+No. Its generation and token no longer own the transition. The atomic comparison must
+reject it even if the old result looks healthy; otherwise stale evidence defeats recovery.
+</details>
+
+<details><summary>A premium request waits 100 ms in a local queue and times out. Should A's breaker count it?</summary>
+No provider attempt occurred. Record an admission rejection; counting it as provider
+failure couples the breaker to your own saturation and can open a healthy dependency.
+</details>
+
+## Try it
+
+Change the hedge fixture so both factories fail, then cancel the caller before the delay.
+Before running it, predict the number of created tasks in each case. Add assertions for
+zero unfinished owned tasks and unchanged admission counts. Next, make a priority factory
+last longer than its *queue* deadline but shorter than its execution deadline: it should
+succeed if it began before the queue deadline. Explain why one timeout around both phases
+would violate that policy.
+
+Scaffold: in `test_cancel_hedge_before_delay_and_first_failure`, retain the primary
+`stopped` event and leave `assert stopped._____()` incomplete. For the all-failure case,
+use two factories that each raise `ValueError`.
+
+Hint: cleanup is joined before the caller sees cancellation; an all-failure result contains
+both observed errors rather than returning the first completed task as success.
+
+<details><summary>Reasoned solution</summary>
+Use `assert stopped.is_set()`. Before the delay only one provider task exists and it must
+be finished after the cancelled hedge is awaited. With both candidates failing, expect
+an `ExceptionGroup` containing both errors and no unfinished hedge tasks. A queue deadline
+checks when execution may start; it must not cancel work already executing within its own
+separate deadline.
+</details>
+
+**Next:** [Own a finite stream](07_streaming_patterns.md). **Back:** [learning map](README.md).

@@ -1,1020 +1,182 @@
 # Streaming in FastAPI
 
-<!-- length-justification: This is the canonical FastAPI streaming-mechanics reference; finite streams, Server-Sent Events, files, upstream proxying, disconnects, buffering, and tests remain together because they share one response-body lifetime. -->
+> **Role:** implementation guide. Prerequisites: async iteration, [response handling](./01_http_and_parameter_mapping.md), and [HTTPX client ownership](../httpx/README.md). Baseline: Python 3.14, FastAPI 0.162.0, Starlette 1.10.0 and HTTPX 0.28.1, checked 2026-10-30.
 
-> **Who this is for**: FastAPI engineers who understand ordinary HTTP responses and need to stream bounded data or events without leaking resources after disconnects.
+An export can produce its first row before its last row exists. Streaming lets the client consume that row immediately, but the request still owns the generator, database cursor or upstream response until completion or cancellation. This guide develops that lifetime, including fragmented records, failure after headers and cleanup. Fleet admission and multi-stream composition continue in [streaming patterns](./safe_and_scalable_api_calls/07_streaming_patterns.md) and [advanced streaming](./safe_and_scalable_api_calls/08_streaming_advanced.md).
 
-How streaming works at the HTTP level, and how FastAPI exposes it. This guide covers **mechanics** — the fundamental building blocks. For production concurrency patterns (semaphores, circuit breakers, admission control), see the Safe and Scalable API Calls streaming guides:
+## Run one owned stream
 
-> **Key insight**: A streaming response keeps work and resources alive after headers are sent, so cancellation, cleanup, and proxy buffering become part of the response contract.
-> - [07_streaming_patterns.md](./safe_and_scalable_api_calls/07_streaming_patterns.md) — SSE, streaming timeouts, semaphore duration
-> - [08_streaming_advanced.md](./safe_and_scalable_api_calls/08_streaming_advanced.md) — multi-stream, aggregation, streaming circuit breakers
+The complete [app](./examples/streaming_mechanics/app.py) uses a local mock provider: event 1 contains `café`, then a `done` event arrives after a delay. It opens and validates the upstream response **before** returning the downstream response. Its response object owns upstream closure even if sending the downstream headers fails.
 
----
+From the repository root, in a disposable environment:
 
-## 1. The Mental Model
-
-### What "Streaming" Actually Means
-
-In a normal HTTP response, the server builds the **entire** response body, then sends it:
-
-```
-Client request
-  ↓
-Server works (collects all data)
-  ↓
-Server sends complete body (Content-Length: 48392)
-  ↓
-Done
+```bash
+python3 -m venv /tmp/notes-streaming
+/tmp/notes-streaming/bin/python -m pip install fastapi==0.162.0 starlette==1.10.0 httpx==0.28.1 pytest==9.2.0 uvicorn==0.34.0
+/tmp/notes-streaming/bin/python -m pytest -q fundamentals/fastapi/examples/streaming_mechanics
+node fundamentals/fastapi/examples/streaming_mechanics/test_sse.mjs
+/tmp/notes-streaming/bin/python -m uvicorn fundamentals.fastapi.examples.streaming_mechanics.app:app --port 8000
 ```
 
-In a streaming response, the server sends the body **in pieces** as they become available:
+In a second terminal:
 
-```
-Client request
-  ↓
-Server sends chunk 1 (available immediately)
-  ↓
-Server sends chunk 2 (available 200ms later)
-  ↓
-Server sends chunk 3 (available 500ms later)
-  ↓
-Server sends empty chunk (signals "done")
-  ↓
-Done
+```bash
+curl --no-buffer http://127.0.0.1:8000/events
+curl -i 'http://127.0.0.1:8000/events?fail=true'
 ```
 
-### How It Works at the HTTP Level: Chunked Transfer Encoding
+Expect an SSE event with `id: 1` and then `event: done`; the second request returns 502 before any successful stream starts. Three Python tests prove pre-start status mapping, body A arriving while B is blocked, cancellation closure, and post-start failure propagation. The Node test splits an event at **every byte position**, including inside the UTF-8 encoding of `é`. HTTPX's in-process ASGI transport buffers bodies, so the incremental test observes ASGI messages directly. Use the live curl path to inspect network timing; these tests do not establish proxy buffering behavior.
 
-HTTP/1.1 supports this via `Transfer-Encoding: chunked`. Instead of declaring `Content-Length` upfront, the server sends each piece prefixed with its size in hex:
+## Follow data through the layers
 
-```
-HTTP/1.1 200 OK
-Transfer-Encoding: chunked
-Content-Type: text/plain
+A generator yield is an application production boundary. Starlette converts it into an ASGI `http.response.body` message. The ASGI server then chooses transport framing. An unknown-length HTTP/1.1 response commonly uses chunked transfer coding; HTTP/2 carries DATA frames and does not use HTTP/1.1 chunked coding. A known-length file can stream with `Content-Length`. Streaming does not require omitting that header.
 
-5\r\n
-Hello\r\n
-6\r\n
- World\r\n
-0\r\n
-\r\n
-```
+The event below can be split or combined at each transport layer:
 
-The `0\r\n\r\n` at the end signals "no more chunks." The client doesn't need to know the total size in advance.
-
-### Why Streaming Matters
-
-| Scenario | Without Streaming | With Streaming |
-|----------|-------------------|----------------|
-| 500MB file download | Server loads 500MB into memory, then sends | Server reads and sends 64KB at a time |
-| LLM response (GPT, Claude) | User waits 10s for complete response | User sees first token in 200ms |
-| CSV export (1M rows) | OOM crash or 30s wait | First rows appear in <1s |
-| Real-time notifications | Polling every N seconds | Instant push as events happen |
-
-The two key benefits:
-
-1. **Reduced time-to-first-byte (TTFB)** — the client starts receiving data before the server finishes producing it
-2. **Constant memory usage** — the server never holds the entire response in memory
-
----
-
-## 2. StreamingResponse — How It Works Internally
-
-### The Core Mechanism
-
-`StreamingResponse` accepts any **iterable or async iterable** and sends each yielded value as an HTTP chunk:
-
-```python
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-
-app = FastAPI()
-
-
-async def generate_numbers():
-    for i in range(5):
-        yield f"Number: {i}\n"
-
-
-@app.get("/numbers")
-async def stream_numbers():
-    return StreamingResponse(generate_numbers(), media_type="text/plain")
+```mermaid
+flowchart LR
+ G[Generator yields SSE event 42] --> A[ASGI body message]
+ A --> H[HTTP1 chunks or HTTP2 DATA frames]
+ H --> T[TCP bytes and TLS records]
+ T --> R[Browser reads arbitrary byte groups]
+ R --> D[Incremental UTF8 decoder]
+ D --> P[Carry buffer until blank line]
+ P --> E[Application event 42]
 ```
 
-What happens under the hood:
+The client may receive half of event 42 in one read and its remainder together with event 43 in another. TCP, HTTP chunks, and browser reads do not preserve application record boundaries. Parse records only after reconstructing their protocol delimiter. This is also why one `yield` does not promise one visible browser update.
 
-```
-1. FastAPI calls StreamingResponse(generator, media_type="text/plain")
-2. Starlette sets Transfer-Encoding: chunked (no Content-Length)
-3. For each `yield`:
-   a. The yielded string/bytes becomes one HTTP chunk
-   b. Starlette writes it to the ASGI send() interface
-   c. Uvicorn flushes it to the TCP socket
-4. When the generator exhausts, Starlette sends the final empty chunk
-```
+`StreamingResponse` sends `http.response.start` before iterating its body. It then forwards each yielded string/bytes value, and finally sends a body message with `more_body=False`. Async generators must await blocking I/O; a synchronous generator is advanced using Starlette's thread-pool machinery. An async generator that performs a long CPU loop still blocks the event loop. Streaming keeps memory bounded only when producers, parsers and downstream queues are also bounded.
 
-### Async vs Sync Generators
+## Choose a record contract
 
-`StreamingResponse` accepts both. But they behave very differently:
+| Representation | Record boundary | Client behavior |
+|---|---|---|
+| Plain bytes/file | Known length or end of stream | Write chunks without assuming semantic boundaries |
+| NDJSON (`application/x-ndjson`) | Newline after each complete JSON value | Retain an incomplete line; parse complete lines |
+| SSE (`text/event-stream`) | Blank line after event fields | Join `data:` lines, honor event type and optional cursor |
+| One JSON document | Complete JSON grammar | Incremental parser or collect a bounded document |
 
-```python
-# Async generator — runs on the event loop, non-blocking
-async def async_gen():
-    for i in range(100):
-        await asyncio.sleep(0.1)  # non-blocking sleep
-        yield f"chunk {i}\n"
+Labeling multiple JSON values `application/json` does not turn them into a valid single JSON document. For SSE, an event can contain `id`, `event`, multiple `data` lines and a reconnect `retry` value. A comment line beginning `:` can keep an idle connection active without creating a data event.
 
-# Sync generator — runs in a threadpool executor
-def sync_gen():
-    for i in range(100):
-        time.sleep(0.1)  # blocking sleep (but safe — runs in thread)
-        yield f"chunk {i}\n"
-```
-
-When you pass a **sync generator**, Starlette wraps it in `run_in_executor` so it doesn't block the event loop. This works, but has overhead. Prefer async generators for streaming.
-
-### media_type
-
-The `media_type` parameter sets the `Content-Type` header. Common values:
-
-| media_type | Use Case |
-|------------|----------|
-| `text/plain` | Plain text streams |
-| `text/event-stream` | Server-Sent Events (SSE) |
-| `application/json` | Streaming JSON (NDJSON) |
-| `text/csv` | CSV export |
-| `application/octet-stream` | Binary file download |
-| `application/pdf` | PDF file download |
-
-### Custom Headers
-
-```python
-@app.get("/export")
-async def export_data():
-    return StreamingResponse(
-        generate_csv(),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": "attachment; filename=export.csv",
-            "Cache-Control": "no-cache",
-        },
-    )
-```
-
----
-
-## 3. When to Use Streaming
-
-### Use Streaming
-
-- **Large file downloads** — don't load entire files into memory
-- **Large data exports** — CSV/JSON exports with millions of rows
-- **LLM token output** — show tokens as they're generated
-- **Real-time events** — live logs, notifications, progress updates
-- **Proxying upstream streams** — forwarding OpenAI/Anthropic responses
-
-### Don't Use Streaming
-
-- **Small JSON responses** — `return {"status": "ok"}` is fine
-- **Responses that need post-processing** — if you need to sort, paginate, or transform the complete result before sending
-- **Responses where you need the total count** — `Content-Length` isn't available with chunked encoding
-- **When you need HTTP status based on body content** — status code is sent with the first chunk, before you've processed all data
-
----
-
-## 4. Server-Sent Events (SSE)
-
-### What SSE Is
-
-SSE is a **protocol on top of HTTP** for pushing events from server to client. It's not a separate transport like WebSocket — it's just a streaming HTTP response with a specific text format.
-
-```
-Regular streaming:     raw bytes/text, any format, client must parse
-SSE:                   structured events with type/data/id fields, built-in browser API
-WebSocket:             bidirectional, binary or text, separate protocol
-```
-
-### The SSE Wire Format
-
-An SSE response is `Content-Type: text/event-stream`. Each event is a block of `field: value` lines, terminated by **two newlines** (`\n\n`):
-
-```
-data: This is a message
-
-data: This is another message
-
-event: custom_type
-data: {"key": "value"}
-
+```text
 id: 42
-event: update
-data: line one
-data: line two
-retry: 5000
+event: progress
+data: {"completed": 7,
+data: "total": 10}
 
 ```
 
-Field reference:
+Joining the two data lines with a newline produces valid JSON. The blank line finishes this event. An ID is only a cursor: recovery also requires a retained event log and a server implementation that honors `Last-Event-ID`, checks tenant access, and handles expired cursors with a snapshot/resync contract.
 
-| Field | Purpose | Required |
-|-------|---------|----------|
-| `data:` | The event payload. Multiple `data:` lines are joined with `\n` | Yes |
-| `event:` | Event type name. Default is `"message"` if omitted | No |
-| `id:` | Event ID. Browser sends `Last-Event-ID` header on reconnect | No |
-| `retry:` | Reconnection interval in milliseconds | No |
+### Decode a fragmented response
 
-### How Browsers Consume SSE
+The complete [SSE parser](./examples/streaming_mechanics/sse.mjs) accepts an async iterable of byte chunks. It keeps the UTF-8 decoder state between reads and a carry buffer between event boundaries. It enforces a 65,536-character record limit and rejects a truncated final event. Its contract deliberately supports LF/CRLF records from this server; use a standards-complete parser when accepting arbitrary SSE producers, including their line ending, retry and reconnect rules.
 
-Browsers have a built-in `EventSource` API:
+A browser integration is:
 
 ```javascript
-const source = new EventSource("/events");
+import {events} from './sse.mjs';
 
-// Default "message" events
-source.onmessage = (event) => {
-    console.log(event.data);
-};
-
-// Named events
-source.addEventListener("update", (event) => {
-    console.log("Update:", event.data);
-});
-
-// Connection management
-source.onerror = (event) => {
-    console.log("Connection lost, browser will auto-reconnect");
-};
-```
-
-Key `EventSource` behaviors:
-
-- **Auto-reconnects** on connection loss after a fixed delay (default ~3s; set it with the `retry:` field). The spec lets user agents add backoff, but it isn't guaranteed — for true exponential backoff use a library like `@microsoft/fetch-event-source`.
-- Sends `Last-Event-ID` header on reconnect (if you set `id:` fields)
-- Only supports **GET** requests (limitation — use `fetch()` for POST)
-- Cannot set custom headers (no `Authorization` — use query params or cookies)
-
-### SSE vs Fetch for Streaming
-
-For modern applications (especially LLM chat UIs), `fetch()` with a readable stream is more flexible:
-
-```javascript
-const response = await fetch("/chat/stream", {
-    method: "POST",
-    headers: {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer token123",
-    },
-    body: JSON.stringify({ message: "Hello" }),
-});
-
-const reader = response.body.getReader();
-const decoder = new TextDecoder();
-
-while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    const text = decoder.decode(value);
-    // Parse SSE format manually or use a library
-    for (const line of text.split("\n")) {
-        if (line.startsWith("data: ")) {
-            const data = line.slice(6);
-            if (data !== "[DONE]") {
-                console.log(JSON.parse(data));
-            }
-        }
+const controller = new AbortController();
+const response = await fetch('/events', {signal: controller.signal});
+if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
+try {
+    for await (const event of events(response.body)) {
+        if (event.type === 'done') break;
+        console.log(JSON.parse(event.data));
     }
+} finally {
+    controller.abort();
 }
 ```
 
----
+Native `EventSource` already supplies SSE parsing and reconnect behavior for GET. It does not offer an arbitrary request body or arbitrary authorization headers. Cookie authentication needs the normal origin/CSRF design; putting bearer credentials in URLs exposes them to URL logging. `fetch` allows POST and headers but makes parsing, retry, cursor management and cancellation your responsibility. See the [HTML event-stream specification](https://html.spec.whatwg.org/multipage/server-sent-events.html) for the full wire contract.
 
-## 5. SSE Implementation in FastAPI
+## Own the upstream before and after response start
 
-### Complete Working Example
+Suppose the upstream returns 503. Opening it inside the body generator is too late: the downstream response may already say 200. The runnable app performs `client.send(..., stream=True)`, validates status and media type, and only then transfers ownership to `OwnedStream`.
 
-```python
-import asyncio
-import json
-import time
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
-
-app = FastAPI()
-
-
-def format_sse(data: str, event: str | None = None, id: str | None = None, retry: int | None = None) -> str:
-    """Format a single SSE event according to the spec."""
-    lines = []
-    if id is not None:
-        lines.append(f"id: {id}")
-    if event is not None:
-        lines.append(f"event: {event}")
-    if retry is not None:
-        lines.append(f"retry: {retry}")
-    # data can be multiline — each line needs its own `data:` prefix
-    for line in data.split("\n"):
-        lines.append(f"data: {line}")
-    lines.append("")  # trailing newline
-    lines.append("")  # empty line = event boundary
-    return "\n".join(lines)
-
-
-async def event_generator(request: Request):
-    """Generate SSE events with proper formatting."""
-    event_id = 0
-
-    # Send retry interval on first event
-    yield format_sse(
-        data="connected",
-        event="status",
-        retry=5000,
-    )
-
-    while True:
-        # Check for client disconnect
-        if await request.is_disconnected():
-            break
-
-        event_id += 1
-        event_data = json.dumps({
-            "id": event_id,
-            "timestamp": time.time(),
-            "message": f"Event #{event_id}",
-        })
-
-        yield format_sse(
-            data=event_data,
-            event="update",
-            id=str(event_id),
-        )
-
-        await asyncio.sleep(1)
-
-
-@app.get("/events")
-async def sse_endpoint(request: Request):
-    return StreamingResponse(
-        event_generator(request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+```mermaid
+sequenceDiagram
+ participant C as Client
+ participant E as Endpoint
+ participant U as Upstream
+ participant R as OwnedStream
+ E->>U: Request with 2 second header deadline
+ U-->>E: Headers
+ alt Upstream status is 503
+ E->>U: Close upstream response
+ E-->>C: 502 before downstream start
+ else Upstream accepted
+ E->>R: Transfer open response ownership
+ R-->>C: response.start 200
+ U-->>R: Event bytes
+ R-->>C: Incremental bytes within 5 second body budget
+ Note over R: Disconnect, error or completion enters finally
+ R->>U: Shielded close, bounded to 1 second
+ end
 ```
 
-### What the Wire Looks Like
+The client is lifespan-owned; each response is request-owned. Closing one response releases its stream or connection slot without shutting down the shared client. Header and body deadlines are separate in this example: at most 2 seconds opening plus 5 seconds forwarding plus a bounded cleanup allowance. For one original end-to-end budget, carry a monotonic deadline through both phases as taught in [safe calls](./safe_and_scalable_api_calls/02_concurrency_and_timeouts.md).
 
-```
-HTTP/1.1 200 OK
-Content-Type: text/event-stream
-Cache-Control: no-cache
-Connection: keep-alive
-Transfer-Encoding: chunked
+A plain generator `finally` is useful after iteration begins, but it cannot guarantee closure of a resource acquired outside the generator if the response fails before iteration starts. The response object's `__call__` owns that broader lifetime. In AnyIO cancellation scopes, shield asynchronous cleanup and give it its own limit; `finally: await close()` alone does not make that await immune to cancellation. Cleanup timeout must remain observable and may require discarding the underlying resource rather than returning it as healthy.
 
-event: status
-retry: 5000
-data: connected
+After `response.start`, an exception cannot change 200 to 500. A typed SSE `error` event can report a recoverable application failure while the stream is writable. A broken transport cannot deliver even that event. Require an explicit `done` event or equivalent terminal record so clients distinguish successful completion from a truncated connection. The regression test asserts one response start and no successful final body after an injected failure.
 
-id: 1
-event: update
-data: {"id": 1, "timestamp": 1700000000.0, "message": "Event #1"}
+A generator path operation is not automatically a dependency with `yield`. Returning `StreamingResponse` explicitly selects raw body streaming. Current FastAPI also has typed streaming APIs: since 0.135.0, `fastapi.sse.EventSourceResponse` and `ServerSentEvent` can serialize SSE streams. That newer convenience does not remove response ownership, cursor storage or failure semantics. See the dated [FastAPI SSE tutorial](https://fastapi.tiangolo.com/tutorial/server-sent-events/) and [release notes](https://fastapi.tiangolo.com/release-notes/) (checked 2026-10-30).
 
-id: 2
-event: update
-data: {"id": 2, "timestamp": 1700000001.0, "message": "Event #2"}
+## Files and uploads use the same lifetime rules
 
-```
+Use `FileResponse` for a server-selected existing file when its range and metadata behavior fit. It normally reads file chunks through the framework's file I/O facilities; zero-copy `sendfile` depends on the exact server/framework extension support and is not a universal guarantee. Use `StreamingResponse` when producing or transforming content incrementally. Never trust a route filename to authorize a storage path: resolve an authenticated document ID to a server-owned path, prevent traversal/symlink escapes, and set a safe download filename independently. See [Starlette response source](https://github.com/Kludex/starlette/blob/main/starlette/responses.py) for version-specific implementation details.
 
----
+An upload needs its own unique storage key, byte limit, partial-file cleanup and publication decision. Writing every request to `raw_upload.bin` races concurrent writers; writing to `file.filename` grants the client path control. Multipart `UploadFile` may already have spooled bytes before your endpoint reads chunks. The complete [upload and object storage lesson](./12_file_uploads_and_object_storage.md) owns ingress limits, quarantine, immutable versions and scanner-gated publication. Streaming a request body is not evidence that every earlier proxy/parser avoided buffering.
 
-## 6. Streaming from Upstream APIs
+## Diagnose buffering and slow consumers
 
-### The Pattern: Proxy an Upstream Stream
+Awaiting ASGI `send` lets server flow control slow the producer when downstream buffers fill. An unbounded intermediate queue defeats that feedback: 100 events/second produced and 20 consumed adds 80 queued events/second. At 2 KiB/event that grows about 9.4 MiB/minute per connection, before object overhead. Bound the queue, stop production, drop an explicitly disposable update, or close and recover from a durable cursor. Do not silently drop state transitions.
 
-When your FastAPI server calls an upstream API (OpenAI, Anthropic, etc.) that returns a streaming response, you need to **forward chunks as they arrive** rather than buffering the entire response.
+`Cache-Control: no-cache` permits caching with revalidation; it does not universally disable proxy buffering. `X-Accel-Buffering: no` targets compatible Nginx behavior, and intermediaries may ignore it. Compression may also delay small outputs. Measure first-event latency and inter-event gaps through the actual ingress. Compare direct-to-app versus proxy: if direct events arrive every 100 ms but the proxy delivers one batch after 5 seconds, investigate proxy buffering/compression before changing the generator.
 
-### Using httpx.stream()
+| Symptom | Measurement | Response |
+|---|---|---|
+| 200 followed by abrupt EOF | Completed/done event absent; upstream error after start | Surface incomplete result, close resources, retry only with a recovery contract |
+| Memory rises with slow clients | Per-client queue depth/bytes and active streams | Bound queues and stream admission; close lagging consumers |
+| Open upstream responses grow after disconnect | Active responses versus live downstream streams | Inspect owner `finally`, cancellation and cleanup timeouts |
+| Healthy stream dies at fixed interval | Proxy idle/absolute timeout versus heartbeat cadence | Configure both sides; heartbeats do not defeat absolute lifetime limits |
+| Only deployed path batches events | First-event timings at each hop | Verify ingress/compression settings and retest |
 
-```python
-import httpx
-import json
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+For rollout, stop accepting new long streams, drain for a bounded interval, close the remainder with a documented reconnect policy, and retain old cursors for the compatibility window. Record active streams, queue bytes, first-event latency, completed versus aborted streams, cleanup failures and egress cost. Do not label metrics with user IDs or event IDs.
 
-client: httpx.AsyncClient = None
+Production readiness:
 
+- [ ] Authenticate and authorize before streaming; define reauthorization for long lifetimes.
+- [ ] Bound admission, records, queues, upstream waits and total stream lifetime.
+- [ ] Validate upstream status before starting the downstream response.
+- [ ] Prove normal, cancellation, pre-start and post-start cleanup.
+- [ ] Test fragmentation and explicit completion through the deployed proxy.
+- [ ] Define cursor expiry, reconnect recovery and rollout drain behavior.
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
-    )
-    yield
-    await client.aclose()
+## Recap and practice
 
+- Streaming moves the response completion boundary later; resources remain owned until that boundary or cancellation.
+- Application records must survive arbitrary network fragmentation.
+- Before headers, return an HTTP error. After headers, report within the protocol if possible and preserve failure observability.
 
-app = FastAPI(lifespan=lifespan)
+**Prediction:** The browser receives `caf` plus the first byte of `é`, then its remaining byte and the event terminator. Can it decode and parse each read separately?
 
+<details><summary>Answer</summary>
+No. The UTF-8 decoder must retain partial character state, and the parser must retain incomplete records. Only the complete blank-line-delimited event is eligible for JSON parsing.
+</details>
 
-async def proxy_openai_stream(payload: dict, request: Request):
-    """
-    Forward an OpenAI streaming response chunk by chunk.
+**Diagnosis:** The producer emits one event each second, but clients see all ten at once. Does `Cache-Control: no-cache` prove the proxy is innocent?
 
-    httpx.stream() does NOT buffer the response body — it yields
-    chunks as the upstream server sends them.
-    """
-    async with client.stream(
-        "POST",
-        "https://api.openai.com/v1/chat/completions",
-        json={**payload, "stream": True},
-        headers={"Authorization": f"Bearer {API_KEY}"},
-    ) as response:
-        response.raise_for_status()
+<details><summary>Answer</summary>
+No. It controls caching/revalidation, not all buffering. Compare direct and proxied first-event/inter-event timings and inspect proxy buffering and compression.
+</details>
 
-        async for line in response.aiter_lines():
-            if await request.is_disconnected():
-                break
+**Try it:** Copy `test_sse.mjs`, replace the two-chunk split loop with one-byte chunks, and keep the same assertions. Scaffold: `async function* chunks() { for (const byte of bytes) { /* yield a one-byte Uint8Array */ } }`. Hint: `Uint8Array.of(byte)` preserves byte values.
 
-            if line.startswith("data: "):
-                # Forward the SSE event as-is
-                yield f"{line}\n\n"
-
-
-@app.post("/chat")
-async def chat(request: Request):
-    payload = await request.json()
-    return StreamingResponse(
-        proxy_openai_stream(payload, request),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-```
-
-### Key httpx Methods for Streaming
-
-| Method | What It Yields | Use Case |
-|--------|---------------|----------|
-| `response.aiter_bytes()` | Raw bytes chunks | Binary data, files |
-| `response.aiter_text()` | Decoded text chunks | Text streams |
-| `response.aiter_lines()` | Lines (split by `\n`) | SSE, NDJSON, line-delimited formats |
-| `response.aiter_raw()` | Raw bytes without decompression | Proxying without re-encoding |
-
-### Common Mistake: Not Using stream()
-
-```python
-# ❌ Wrong — downloads entire response into memory first
-response = await client.post(url, json=payload)
-# At this point the entire body is in memory
-
-# ✅ Correct — streams chunk by chunk
-async with client.stream("POST", url, json=payload) as response:
-    async for chunk in response.aiter_lines():
-        yield chunk
-```
-
-The difference: `await client.post()` reads the complete response body before returning. `client.stream()` returns as soon as headers arrive, then you consume the body incrementally.
-
----
-
-## 7. File Downloads
-
-### Streaming a Large File Without Loading Into Memory
-
-```python
-from pathlib import Path
-import aiofiles
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
-
-app = FastAPI()
-
-CHUNK_SIZE = 64 * 1024  # 64KB chunks
-
-
-async def file_chunk_generator(file_path: Path):
-    """Read file in chunks — never holds more than CHUNK_SIZE in memory."""
-    async with aiofiles.open(file_path, "rb") as f:
-        while chunk := await f.read(CHUNK_SIZE):
-            yield chunk
-
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    file_path = Path("/data/exports") / filename
-
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return StreamingResponse(
-        file_chunk_generator(file_path),
-        media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            # Content-Length is optional but helps clients show progress bars
-            "Content-Length": str(file_path.stat().st_size),
-        },
-    )
-```
-
-### StreamingResponse vs FileResponse
-
-```python
-# FileResponse — let Starlette handle everything
-# Uses sendfile() syscall when possible (zero-copy, kernel-level)
-@app.get("/download/v1/{filename}")
-async def download_v1(filename: str):
-    return FileResponse(
-        path=f"/data/exports/{filename}",
-        filename=filename,              # Sets Content-Disposition
-        media_type="application/octet-stream",
-    )
-
-
-# StreamingResponse — when you need to transform data on the fly
-# No sendfile() optimization, but you control every byte
-@app.get("/download/v2/{filename}")
-async def download_v2(filename: str):
-    async def generate():
-        async with aiofiles.open(f"/data/exports/{filename}", "rb") as f:
-            while chunk := await f.read(64 * 1024):
-                # You could encrypt, compress, or transform here
-                yield chunk
-
-    return StreamingResponse(generate(), media_type="application/octet-stream")
-```
-
-**Rule of thumb**: Use `FileResponse` for serving files as-is. Use `StreamingResponse` when you need to process the data before sending (encryption, on-the-fly CSV generation, dynamic content).
-
-### Content-Disposition Explained
-
-```python
-# Inline — browser displays the file (images, PDFs in browser)
-"Content-Disposition": "inline"
-
-# Attachment — browser downloads the file with a save dialog
-"Content-Disposition": 'attachment; filename="report.csv"'
-
-# Filename with special characters
-"Content-Disposition": "attachment; filename*=UTF-8''r%C3%A9port.csv"
-```
-
----
-
-## 8. File Uploads — Streaming the Request Body
-
-### How UploadFile Works
-
-`UploadFile` does **not** load the entire file into memory by default. It uses a `SpooledTemporaryFile` that stays in memory up to 1MB, then spills to disk:
-
-```python
-from fastapi import FastAPI, UploadFile
-
-app = FastAPI()
-
-
-@app.post("/upload")
-async def upload_file(file: UploadFile):
-    # file.file is a SpooledTemporaryFile
-    # For files > 1MB, data is on disk, not in RAM
-    contents = await file.read()  # But THIS loads it all into memory
-    return {"size": len(contents)}
-```
-
-### Chunked Reading — The Right Way
-
-```python
-@app.post("/upload/large")
-async def upload_large_file(file: UploadFile):
-    """Process a large upload without loading it all into memory."""
-    total_size = 0
-    chunk_size = 64 * 1024  # 64KB
-
-    # Write to destination in chunks
-    async with aiofiles.open(f"/data/uploads/{file.filename}", "wb") as dest:
-        while chunk := await file.read(chunk_size):
-            await dest.write(chunk)
-            total_size += len(chunk)
-
-    return {"filename": file.filename, "size": total_size}
-```
-
-### Streaming Request Body Directly
-
-For maximum control, you can read the raw request body as a stream without `UploadFile`:
-
-```python
-from fastapi import Request
-
-
-@app.post("/upload/raw")
-async def upload_raw(request: Request):
-    """Stream the raw request body — no parsing, no temp files."""
-    total_size = 0
-
-    async with aiofiles.open("/data/uploads/raw_upload.bin", "wb") as f:
-        async for chunk in request.stream():
-            await f.write(chunk)
-            total_size += len(chunk)
-
-    return {"size": total_size}
-```
-
-### Comparison
-
-| Approach | Memory Usage | Features |
-|----------|-------------|----------|
-| `await file.read()` | Entire file in memory | Filename, content_type available |
-| `await file.read(chunk_size)` in loop | One chunk at a time | Filename, content_type available |
-| `request.stream()` | One chunk at a time | No parsing — raw bytes only |
-
----
-
-## 9. Client Disconnect Detection
-
-### Why This Matters
-
-When streaming a long response (LLM output, real-time feed, large export), the client can disconnect at any time:
-
-- User closes the browser tab
-- Mobile app goes to background
-- Network drops
-- Client-side timeout fires
-
-Without detection, your server keeps generating data for nobody — wasting CPU, memory, and upstream API costs (LLM tokens are expensive).
-
-### Using request.is_disconnected()
-
-```python
-from fastapi import Request
-from fastapi.responses import StreamingResponse
-
-
-async def expensive_stream(request: Request):
-    """Stream that checks for client disconnect."""
-    for i in range(10_000):
-        # Periodic disconnect check
-        if await request.is_disconnected():
-            # Client is gone — stop generating
-            print(f"Client disconnected after {i} chunks")
-            return
-
-        yield f"data: {generate_expensive_chunk(i)}\n\n"
-        await asyncio.sleep(0.05)
-
-
-@app.get("/stream")
-async def stream_endpoint(request: Request):
-    return StreamingResponse(
-        expensive_stream(request),
-        media_type="text/event-stream",
-    )
-```
-
-### Cleanup on Disconnect
-
-Use `try/finally` to ensure resources are released when the stream ends for any reason:
-
-```python
-async def stream_with_cleanup(request: Request):
-    """Cleanup runs whether client disconnects, errors, or stream completes."""
-    resource = await acquire_expensive_resource()
-
-    try:
-        async for item in resource.stream():
-            if await request.is_disconnected():
-                break
-            yield format_sse(item)
-    finally:
-        # Always runs: normal completion, disconnect, or exception
-        await resource.release()
-        await log_stream_end()
-```
-
-### Caveat: is_disconnected() Is Not Instant
-
-`request.is_disconnected()` checks whether the ASGI server has received a `disconnect` event. This detection depends on:
-
-- **Uvicorn's** polling interval
-- **TCP keepalive** settings
-- Whether the client sent a proper `FIN` or just disappeared
-
-In practice, there can be a delay of a few seconds between the actual disconnect and detection. Don't rely on it for sub-second cleanup.
-
----
-
-## 10. Backpressure
-
-### What Backpressure Means
-
-When the server produces data faster than the client can consume it:
-
-```
-Server: yield chunk → yield chunk → yield chunk → yield chunk → ...
-                                                          ↑
-Client: read chunk ................. read chunk ...........
-         (slow consumer)
-```
-
-The chunks pile up in buffers. Without backpressure, the server eventually runs out of memory.
-
-### How asyncio Handles It
-
-The flow control works through several layers:
-
-```
-Generator yield
-  ↓
-Starlette's StreamingResponse calls ASGI send()
-  ↓
-Uvicorn writes to asyncio transport
-  ↓
-asyncio transport writes to OS TCP send buffer
-  ↓
-OS TCP send buffer fills up → TCP window closes
-  ↓
-asyncio transport.write() starts returning backpressure signals
-  ↓
-Uvicorn's await send() blocks (pauses the coroutine)
-  ↓
-Your generator's yield pauses naturally
-```
-
-The key insight: **`yield` in an async generator is an implicit suspension point**. When the downstream can't accept more data, the `await` inside Starlette's send loop blocks, which means your generator doesn't resume, which means you stop producing data. This is automatic backpressure.
-
-### When Automatic Backpressure Isn't Enough
-
-If you're producing data from a separate task (not directly in the generator), you need explicit coordination:
-
-```python
-async def stream_with_bounded_buffer(request: Request):
-    """
-    Producer runs independently from the HTTP stream.
-    Queue provides explicit backpressure.
-    """
-    buffer: asyncio.Queue[str | None] = asyncio.Queue(maxsize=20)
-
-    async def producer():
-        try:
-            async for item in external_data_source():
-                await buffer.put(item)  # Blocks when buffer is full
-            await buffer.put(None)  # Sentinel: stream complete
-        except Exception:
-            await buffer.put(None)
-
-    task = asyncio.create_task(producer())
-
-    try:
-        while True:
-            if await request.is_disconnected():
-                break
-            chunk = await buffer.get()
-            if chunk is None:
-                break
-            yield f"data: {chunk}\n\n"
-    finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-```
-
-Without `maxsize`, the queue grows unbounded and you lose backpressure.
-
----
-
-## 11. Response Type Comparison
-
-### When to Use What
-
-| Type | Memory | Speed | Use Case |
-|------|--------|-------|----------|
-| `Response` | Entire body in memory | Fast for small responses | JSON, HTML, small payloads |
-| `JSONResponse` | Entire body in memory | Serializes with `json.dumps` | API responses (FastAPI default) |
-| `FileResponse` | Kernel-level sendfile | Fastest for static files | Serving existing files from disk |
-| `StreamingResponse` | One chunk at a time | Depends on generator | Large data, real-time streams, proxying |
-| `HTMLResponse` | Entire body in memory | Fast | HTML pages |
-
-### Decision Flowchart
-
-```
-Is it a file on disk?
-  ├── Yes → FileResponse
-  └── No
-      ├── Is the response small (<1MB) and fully available?
-      │   ├── Yes → JSONResponse / Response
-      │   └── No
-      │       └── StreamingResponse
-      └── Is it real-time / ongoing?
-          └── Yes → StreamingResponse (with SSE format for browser clients)
-```
-
-### StreamingResponse vs SSE — They're Not Separate Things
-
-SSE is not a different response class. It's `StreamingResponse` with:
-- `media_type="text/event-stream"`
-- Data formatted as `data: ...\n\n`
-- `Cache-Control: no-cache` header
-
-```python
-# "SSE endpoint" is just a StreamingResponse with specific format and headers
-return StreamingResponse(
-    my_generator(),
-    media_type="text/event-stream",
-    headers={"Cache-Control": "no-cache"},
-)
-```
-
----
-
-## 12. Common Mistakes
-
-### Forgetting `\n\n` in SSE
-
-```python
-# ❌ Wrong — client never receives events (no event boundary)
-yield f"data: {message}\n"
-
-# ❌ Wrong — events run together
-yield f"data: {message}"
-
-# ✅ Correct — double newline terminates each event
-yield f"data: {message}\n\n"
-```
-
-Without `\n\n`, the SSE parser on the client side never sees a complete event. Data accumulates in the buffer forever.
-
-### Not Setting Cache-Control
-
-```python
-# ❌ Wrong — proxies and browsers may buffer the entire stream
-return StreamingResponse(generator(), media_type="text/event-stream")
-
-# ✅ Correct — prevents buffering at every layer
-return StreamingResponse(
-    generator(),
-    media_type="text/event-stream",
-    headers={
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",  # nginx
-    },
-)
-```
-
-Without `Cache-Control: no-cache`, an HTTP cache or CDN might buffer your stream and deliver it all at once when complete — defeating the entire purpose.
-
-### Nginx/Proxy Buffering
-
-Nginx buffers responses by default. For streaming, you must disable it:
-
-```nginx
-# Option 1: Disable globally for a location
-location /stream {
-    proxy_buffering off;
-    proxy_cache off;
-}
-
-# Option 2: Let the app control it per-response (using X-Accel-Buffering header)
-# FastAPI sets: X-Accel-Buffering: no
-# Nginx respects this header automatically
-```
-
-Other proxies to watch for:
-
-| Proxy | How to Disable Buffering |
-|-------|--------------------------|
-| nginx | `proxy_buffering off;` or `X-Accel-Buffering: no` header |
-| AWS ALB | Chunked responses stream by default (no change needed) |
-| Cloudflare | Streams by default, but may buffer for bot detection |
-| HAProxy | `option http-no-delay` |
-| Traefik | Streams by default (no change needed) |
-
-### Using yield in a Sync def Endpoint
-
-```python
-# ❌ Wrong — sync endpoint with yield doesn't create a streaming response
-@app.get("/wrong")
-def wrong():
-    yield "this"
-    yield "does not"
-    yield "stream"
-
-# ✅ Correct — return a StreamingResponse wrapping a generator
-@app.get("/correct")
-def correct():
-    def generate():
-        yield "this "
-        yield "does "
-        yield "stream"
-    return StreamingResponse(generate(), media_type="text/plain")
-```
-
-Using `yield` directly in a FastAPI endpoint makes it a **dependency with yield** (setup/teardown), not a streaming response. You must always wrap generators in `StreamingResponse`.
-
-### Sending the Error After Streaming Starts
-
-```python
-# ❌ Problem — status code is already sent with the first chunk
-async def broken_stream():
-    yield "Starting...\n"
-    # ... later ...
-    if error:
-        # Too late to send 500 — client already got 200 with first chunk
-        raise HTTPException(status_code=500, detail="Something failed")
-
-# ✅ Better — validate before streaming begins
-@app.get("/export")
-async def export():
-    # Validation happens before StreamingResponse is returned
-    data_source = await get_data_source()
-    if not data_source.is_available():
-        raise HTTPException(status_code=503, detail="Data source unavailable")
-
-    # Only start streaming after validation passes
-    return StreamingResponse(data_source.stream(), media_type="text/csv")
-```
-
-Once the first byte is sent, the HTTP status code is locked at 200 (or whatever you set). You cannot change it mid-stream. Design your endpoints to fail fast **before** returning the `StreamingResponse`.
-
-### Buffering the Entire Stream Before Sending
-
-```python
-# ❌ Wrong — collects all chunks, then sends as one response (defeats streaming)
-@app.get("/bad")
-async def bad():
-    chunks = []
-    async for chunk in generate_data():
-        chunks.append(chunk)
-    return Response(content="".join(chunks))
-
-# ✅ Correct — yields chunks as they're produced
-@app.get("/good")
-async def good():
-    return StreamingResponse(generate_data(), media_type="text/plain")
-```
-
----
-
-## Quick Reference
-
-### Minimal SSE Endpoint
-
-```python
-async def event_stream(request: Request):
-    while not await request.is_disconnected():
-        data = await get_next_event()
-        yield f"data: {json.dumps(data)}\n\n"
-
-@app.get("/events")
-async def events(request: Request):
-    return StreamingResponse(
-        event_stream(request),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-```
-
-### Minimal File Download
-
-```python
-@app.get("/download/{name}")
-async def download(name: str):
-    return FileResponse(f"/data/{name}", filename=name)
-```
-
-### Minimal Upstream Proxy
-
-```python
-async def proxy(request: Request):
-    async with client.stream("POST", upstream_url, json=payload) as resp:
-        async for line in resp.aiter_lines():
-            if await request.is_disconnected():
-                break
-            yield f"{line}\n"
-
-@app.post("/proxy")
-async def proxy_endpoint(request: Request):
-    return StreamingResponse(proxy(request), media_type="text/event-stream")
-```
-
----
-
-## Key Takeaways
-
-1. **Streaming = chunked transfer encoding** — the server sends pieces, not the whole body
-2. **StreamingResponse wraps a generator** — each `yield` becomes an HTTP chunk
-3. **SSE is just a format convention** — `data: ...\n\n` over `text/event-stream`, not a separate protocol class
-4. **Always set `Cache-Control: no-cache` and `X-Accel-Buffering: no`** — or proxies will buffer your stream
-5. **Check `request.is_disconnected()`** — stop wasting resources when nobody is listening
-6. **Validate before streaming** — you can't change the status code after the first byte
-7. **Use `FileResponse` for files on disk** — it uses zero-copy `sendfile()` under the hood
-8. **Backpressure is mostly automatic** — `yield` naturally pauses when downstream is slow
+<details><summary>Solution</summary>
+Use `yield Uint8Array.of(byte)`. The parser must still emit exactly one event, cursor `42`, with JSON text `café`; no partial event is emitted. Then remove the final blank line and assert the truncation error. This tests a changed transport schedule without changing the application record.
+</details>

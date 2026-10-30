@@ -155,7 +155,8 @@ Server sends chunk 2 → timer reset
 Server sends chunk 3 → timer reset
 ```
 
-This makes streaming safe with reasonable timeouts.
+This bounds read inactivity. A finite streaming job still needs a total deadline and
+explicit response ownership.
 
 ### What Triggers `ReadTimeout`
 
@@ -166,7 +167,10 @@ This makes streaming safe with reasonable timeouts.
 ### What This Does NOT Cover
 
 - Total response time
-- Server processing time (before first byte)
+Read timeout **does** cover waiting for response headers while the server computes.
+A silent six-second computation can therefore fail with `read=5`, before the first byte.
+It does not bound the sum of many successful reads.
+[HTTPX timeouts](https://www.python-httpx.org/advanced/timeouts/) (checked 2026-10-30).
 
 ### Important Distinction
 
@@ -405,3 +409,19 @@ Both are needed for production safety.
 ---
 
 **Next**: [Advanced Features](04_advanced.md) — HTTP/2, streaming, retries
+
+## Check your understanding
+
+Phase limits bound individual waits. An outer monotonic deadline bounds the whole logical operation, including retries and backoff.
+
+**Prediction:** One byte arrives every four seconds for a minute; read=5 and total=20. What stops it?
+
+<details><summary>Answer</summary>
+The outer deadline around twenty seconds. Successful individual reads can keep satisfying the five-second inactivity limit.
+</details>
+
+**Diagnosis:** The server computes silently for six seconds before sending headers, with read=5. Is that computation excluded?
+
+<details><summary>Answer</summary>
+No. Waiting for response headers is a network read wait and can raise ReadTimeout before any body arrives.
+</details>

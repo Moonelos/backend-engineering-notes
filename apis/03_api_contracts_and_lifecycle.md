@@ -22,6 +22,20 @@ the trace above is the minimum mechanism they harden.
 
 ---
 
+During migration both client generations must work against the expanded response.
+
+```mermaid
+flowchart LR
+  O[Old consumer: customer_name] --> E[Expanded response: both names]
+  N[New consumer: display_name] --> E
+  N --> C[Contracted response: display_name only]
+  O -. missing customer_name .-> C
+```
+
+The old decoder must tolerate additive fields. Removing customer_name ends the overlap, so successful new-client tests alone do not authorize contraction.
+
+---
+
 ## 1. Treat the Contract as a Product
 
 The interface is the part consumers build against. A production contract includes more than a schema:
@@ -215,5 +229,30 @@ Governance should make the safe path easy. A style guide that is not enforced by
 - [WSDL 2.0 Primer](https://www.w3.org/TR/wsdl20-primer/)
 
 ---
+
+
+## Recap
+
+- Expansion permits old and new consumers to coexist only when decoders tolerate the addition.
+- Usage evidence establishes whether the old field can be retired.
+- Rollback must account for data already written under the new contract.
+
+## Check yourself
+
+**Both new-schema and old-schema tests pass, but an untracked client still reads customer_name. Can the field be removed?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The tests establish compatibility during expansion, not migration of every supported consumer. Usage/consumer evidence is required before contraction.
+
+</details>
+
+**Can an old binary safely read a newly added enum value just because JSON parsing succeeds?**
+
+<details><summary>Reasoned answer</summary>
+
+Only if its unknown-value policy handles that value. Wire shape and application semantics are separate compatibility checks.
+
+</details>
 
 **Next**: [SOAP Overview](04_soap_overview.md)

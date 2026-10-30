@@ -15,6 +15,9 @@
 |---------|-------------|
 | [testing/](testing/README.md) | pytest, AsyncClient, dependency overrides, fixtures, mocking, LLM evals |
 | [deployment/](deployment/README.md) | Docker, multi-stage builds, Uvicorn, Gunicorn, health checks, graceful shutdown |
+| [Incident response](incident_response/README.md) | On-call ownership, runbooks and postmortems |
+| [Cost management](cost_management/README.md) | Unit costs, attribution and budgets |
+| [Developer experience](developer_experience/README.md) | Repeatable setup, hooks, containers and seed data |
 
 ---
 

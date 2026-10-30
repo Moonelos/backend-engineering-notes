@@ -22,9 +22,26 @@ This is where FastAPI's testability pays off: the ASGI app is a callable, so you
 | Async fixtures (DB session, etc.) | Awkward — needs bridging | First-class |
 | When to use | Simple sync endpoints, scripts | Async endpoints, async fixtures, async DB |
 
-**Default to `AsyncClient`** in an async codebase. `TestClient` spins up a thread + event loop per call, which causes subtle issues when your fixtures are async.
+**Default to `AsyncClient`** in an async codebase. A context-managed `TestClient` owns a blocking portal and event loop for the context, reusing it across its requests. That loop is still different from the loop used by async pytest fixtures; do not pass a pooled async connection between them.
 
 ---
+
+This diagram tracks the owner of an async pool, not the spelling of the client API:
+
+```mermaid
+flowchart LR
+    subgraph T[Pytest test loop]
+        F[Async fixture creates pool] --> P[Pool connections]
+        A[AsyncClient and ASGITransport] --> R[Route borrows pool]
+        R --> P
+    end
+    subgraph S[TestClient portal loop]
+        C[Sync client context] --> L[Separate app lifespan and pool]
+    end
+```
+
+The upper path can share the fixture's pool. The lower path creates and closes its own resources;
+passing the upper pool into it crosses loop ownership even if both calls occur in the same process.
 
 ## Sync Testing with TestClient
 
@@ -105,8 +122,10 @@ from fastapi import FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.pool = await create_pool()
-    yield
-    await app.state.pool.close()
+    try:
+        yield
+    finally:
+        await app.state.pool.close()
 
 app = FastAPI(lifespan=lifespan)
 ```
@@ -193,6 +212,16 @@ For async WebSocket tests, `httpx` does not speak WebSocket — use `TestClient`
 
 ---
 
+## Test stream closure when upgrading Starlette
+
+**GA — Starlette 1.9:** `TestClient.stream()` returns before the application finishes; closing an
+unfinished stream cancels the application. A normal fully consumed response and an abandoned stream
+therefore have different cleanup paths. Pin the supported stack and test an event stream that yields
+one frame then waits; close it early and assert its generator's `finally` runs and its resources are
+released. A response-body assertion alone cannot prove disconnect cleanup. HTTPX2 migration and
+its transport fixtures are a separate compatibility check from this server lifecycle change.
+[Starlette release notes](https://starlette.dev/release-notes/), checked 2026-10-30.
+
 ## Choosing a Client: Decision Matrix
 
 | Your situation | Use |
@@ -209,3 +238,35 @@ Pick one and stick with it in `conftest.py`. See [07 — Fixtures](07_fixtures.m
 ## Next
 
 - [05 — Dependency Overrides](05_dependency_overrides.md) — swap real dependencies (DB, auth) for test doubles through FastAPI's DI system.
+
+## Recap and retrieval
+
+- ASGITransport drives request/response behavior without DNS, TCP or TLS.
+- Lifespan owns startup and shutdown; constructing an HTTP client alone does not send those events.
+- Async pooled resources and their tests must share a loop, or be constructed separately per loop.
+
+**The in-process health test passes but deployed TLS negotiation fails. What evidence is missing?**
+
+<details><summary>Reasoned answer</summary>
+
+A real-server/proxy TLS check. ASGITransport bypasses that boundary; the passing app test still supports its narrower claim.
+
+</details>
+
+**Two requests share with TestClient(app). Does each necessarily get a new loop?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The context owns a reusable portal/loop. Its loop is still distinct from an async pytest fixture loop.
+
+</details>
+
+**Try it:** Give lifespan an append-only startup/shutdown list and add two client requests. Leave the context manager blank.
+
+Hint: ASGITransport does not send lifespan messages.
+
+<details><summary>Worked solution</summary>
+
+Wrap AsyncClient inside LifespanManager; assert startup before requests and shutdown after exit. A separate real-server check is needed for TLS.
+
+</details>

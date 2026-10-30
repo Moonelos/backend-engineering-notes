@@ -43,6 +43,19 @@ The unversioned package currently installs the stable 3.x line. APScheduler 4.x 
 
 ---
 
+## Run one bounded firing and then explain it
+
+Start the PostgreSQL example in [minimal durable task](../../foundations/03_minimal_durable_task.md#run-one-job-before-studying-the-schema). From `background_work/examples/durable_job`, with `DATABASE_URL` still set:
+
+```bash
+.venv/bin/python -m pip install -r requirements-brokers.txt
+.venv/bin/python scheduled_once.py
+```
+
+The [complete script](../../examples/durable_job/scheduled_once.py) schedules one known UTC instant, waits at most five seconds, commits the same operation key on replay and shuts the scheduler down. It then runs the local worker and prints `one scheduled firing, one durable job, SUCCEEDED`. The scheduler only creates the durable row; the worker supplies completion. The following recipes change triggers, stores and process placement around that working boundary.
+
+---
+
 ## The scheduler type is decided by how your app runs
 
 | Scheduler | Use case | How it runs |
@@ -125,7 +138,7 @@ async def monthly_billing():
     await run_billing_cycle()
 ```
 
-Cron fields: `year`, `month`, `day`, `week`, `day_of_week`, `hour`, `minute`, `second`. Nearly every real schedule is built from three of them — **`hour`**, **`minute`**, and **`day_of_week`** — as in the four examples above. Any field you omit defaults to `*` for fields more granular than the finest one you set, so `hour=2, minute=30` means 02:30:00 daily, not once a second during 02:30.
+Cron fields: `year`, `month`, `day`, `week`, `day_of_week`, `hour`, `minute`, `second`. Nearly every real schedule is built from three of them — **`hour`**, **`minute`**, and **`day_of_week`** — as in the four examples above. Omitted fields more significant than the least-significant field you set use `*`; less-significant fields use their minimum, except `week` and `day_of_week`, which use `*`. Thus `hour=3, minute=0` implies `second=0` and fires at 03:00:00 each day. [APScheduler 3.x cron defaults](https://apscheduler.readthedocs.io/en/3.x/modules/triggers/cron.html), checked 2026-10-30.
 
 ### `date` — One-time Execution
 
@@ -237,10 +250,10 @@ To turn a swallowed failure into an alert, register a listener — this is the o
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, EVENT_JOB_MAX_INSTANCES
 
 def on_job_problem(event):
-    if event.exception:
+    if event.code == EVENT_JOB_ERROR:
         logger.error(
             "scheduled job failed",
-            extra={"job_id": event.job_id, "traceback": event.traceback},
+            extra={"job_id": event.job_id, "error_class": type(event.exception).__name__},
         )
     else:
         logger.warning("scheduled job missed or skipped", extra={"job_id": event.job_id})
@@ -252,7 +265,7 @@ scheduler.add_listener(
 )
 ```
 
-Without this, an exception inside a job is logged and forgotten; later firings continue as if nothing happened.
+`EVENT_JOB_MAX_INSTANCES` carries a `JobSubmissionEvent`, which has no `exception` field; only the execution-error branch reads it. Job logs/alerts use identifiers and error classes, not arbitrary arguments or exception text. Without a listener, later firings still continue after a failed job; logging alone is not an owned recovery action.
 
 ---
 
@@ -646,46 +659,37 @@ LOCK_TTL = 300          # seconds
 RENEW_EVERY = 100       # comfortably < LOCK_TTL / 2, so one missed tick is survivable
 
 
-async def _renew(lock: redis.lock.Lock, cancel: asyncio.Event) -> None:
+async def _renew(lock) -> None:
+    from redis.exceptions import RedisError
     while True:
         await asyncio.sleep(RENEW_EVERY)
         try:
-            # replace_ttl=True resets the TTL to LOCK_TTL rather than adding to it.
-            await lock.extend(LOCK_TTL, replace_ttl=True)
-        except redis.exceptions.LockNotOwnedError:
-            # We already lost it — another instance may be running right now.
-            # Stop the work instead of continuing to write concurrently.
-            logger.error("cleanup lock lost; cancelling this run")
-            cancel.set()
-            return
+            async with asyncio.timeout(10):
+                await lock.extend(LOCK_TTL, replace_ttl=True)
+        except (RedisError, TimeoutError) as exc:
+            # A network error makes ownership uncertain too, not only expiry.
+            raise RuntimeError("cleanup ownership could not be renewed") from exc
 
 
 async def cleanup_with_lock() -> None:
+    from redis.exceptions import RedisError
     lock = redis_client.lock("scheduler:cleanup-lock", timeout=LOCK_TTL)
     if not await lock.acquire(blocking=False):
-        logger.info("Another instance is running cleanup, skipping")
         return
-
-    cancel = asyncio.Event()
-    work = asyncio.create_task(do_cleanup())
-    renew = asyncio.create_task(_renew(lock, cancel))
-    lost = asyncio.create_task(cancel.wait())
     try:
-        done, _ = await asyncio.wait({work, lost}, return_when=asyncio.FIRST_COMPLETED)
-        if work not in done:                 # the lock died before the work finished
-            work.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await work
-            raise RuntimeError("cleanup aborted: lock lost mid-run")
-        await work                           # re-raise the job's own exception, if any
+        async with asyncio.TaskGroup() as group:
+            work = group.create_task(do_cleanup())
+            renew = group.create_task(_renew(lock))
+            await work
+            renew.cancel()
+        # Renewal failure cancels work; outer cancellation cancels both tasks.
     finally:
-        for t in (renew, lost):
-            t.cancel()
-        # Option 2: at minimum, do not let a lost lock hide the job's outcome.
         try:
-            await lock.release()
-        except redis.exceptions.LockNotOwnedError:
-            logger.error("cleanup lock expired mid-run; concurrent execution possible")
+            async with asyncio.timeout(10):
+                await lock.release()
+        except (RedisError, TimeoutError):
+            # Preserve the work/renewal exception rather than masking it.
+            logger.warning("cleanup lock release unconfirmed")
 ```
 
 **How you know it worked:** across a rolling restart of N replicas, exactly one `cleanup started` line per scheduled slot, and no `lock lost` lines. The tell that `LOCK_TTL` is too short is `lock lost; cancelling this run` appearing every night at roughly the same elapsed time.
@@ -707,80 +711,33 @@ def trigger_nightly_cleanup():
     nightly_cleanup_task.send()   # no firing identity: every send looks new
 ```
 
-There is nothing in that message to deduplicate *on*. The fix is to give the firing an identity, persist it under a unique constraint, and let the actor claim it:
+There is nothing in that message to deduplicate on. Persist `(schedule_id, scheduled_for)` before publication, then let the normal durable-job worker own attempts. A permanent `claimed_at` flag is not a worker claim: a crash after setting it would suppress every redelivery forever.
 
-```sql
-CREATE TABLE scheduled_firings (
-    firing_key   text PRIMARY KEY,   -- 'nightly-cleanup:2026-08-03T03:00:00+00:00'
-    claimed_at   timestamptz,
-    completed_at timestamptz
-);
+Use the [complete scheduler fixture](../../examples/durable_job/test_scheduler.py) from [scheduling and periodic work](../../execution/03_scheduling_and_periodic_work.md). It atomically creates firing, job and outbox, races two replicas, and replays a stale cursor after a crash. The `scheduled_for` argument is the calendar occurrence stored by the scheduler; it is never recomputed from callback wall time. Delayed callbacks and restart catch-up must still name the original slot.
+
+Follow one firing through two execution attempts. The second claim changes the token, while the firing and job IDs remain stable.
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant D as PostgreSQL
+    participant R as Relay
+    participant W as Worker
+    S->>D: Commit 03:00 firing, job-42, outbox
+    R->>D: Read unpublished job-42
+    R->>W: Deliver job-42
+    W->>D: Claim token A, lease 90s
+    Note over W: Worker exits before completion
+    R->>D: Recover expired lease, create hint
+    R->>W: Deliver same job-42
+    W->>D: Claim token B, complete if owned
 ```
 
-```python
-# scheduler_app.py
-from datetime import datetime, timezone
+The relay can repeat a publish after its own crash. The worker reloads the job and uses [claim, retry and completion predicates](../../examples/durable_job/store.py), so a duplicate cannot bypass ownership. If worker A resumes late, token A changes zero rows. A remote effect also needs its stable operation key; token fencing protects the local row, not a provider that never sees it.
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+For a full Dramatiq delivery run, use the [assembled FastAPI integration](../dramatiq/fastapi_integration.md#run-the-canonical-service-first). Its publisher repairs expired attempts and replaces lost delivery hints, while the DB budget terminalizes exhausted jobs. One scheduler callback creates an obligation; the broker, worker and reconciler discharge it.
 
-from myapp.tasks import nightly_cleanup_task   # Dramatiq actor
-
-# timezone is not optional — see "Pin the timezone" above.
-scheduler = AsyncIOScheduler(timezone="UTC")
-
-
-@scheduler.scheduled_job("cron", hour=3, misfire_grace_time=300, id="nightly-cleanup")
-def trigger_nightly_cleanup():
-    # The firing slot, truncated to the schedule's granularity. This runs in the
-    # scheduler process at fire time, so now() IS the firing moment — bounded by
-    # misfire_grace_time, never by how long a queue was backed up.
-    slot = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    firing_key = f"nightly-cleanup:{slot.isoformat()}"
-
-    # ONE transaction: the firing record and the request to execute it.
-    # ON CONFLICT DO NOTHING means replicas two and three insert nothing and
-    # send nothing — the unique constraint is the deduplication, not Dramatiq.
-    with db.begin() as tx:
-        inserted = tx.execute(text("""
-            INSERT INTO scheduled_firings (firing_key) VALUES (:k)
-            ON CONFLICT (firing_key) DO NOTHING
-        """), {"k": firing_key}).rowcount
-        if not inserted:
-            logger.info("firing_already_recorded", extra={"firing_key": firing_key})
-            return
-        tx.execute(insert(outbox).values(firing_key=firing_key))
-```
-
-```python
-# myapp/tasks.py — the actor claims the firing before doing any work
-@dramatiq.actor(max_retries=3)
-def nightly_cleanup_task(firing_key: str):
-    with db.begin() as tx:
-        claimed = tx.execute(text("""
-            UPDATE scheduled_firings SET claimed_at = now()
-             WHERE firing_key = :k AND claimed_at IS NULL
-        """), {"k": firing_key}).rowcount
-    if not claimed:
-        return          # duplicate delivery, or a redelivery of finished work
-
-    do_cleanup()
-
-    with db.begin() as tx:
-        tx.execute(text("UPDATE scheduled_firings SET completed_at = now() "
-                        "WHERE firing_key = :k"), {"k": firing_key})
-```
-
-⚠️ **Truncate to a granularity coarser than `misfire_grace_time`.** Above, the slot is truncated to the hour and the grace time is 5 minutes, so a late firing at `03:04` still keys to `03:00`. Truncate to the minute with a grace time of 300 s and a firing recovered at `03:04` keys to `03:04` — a second, distinct firing, and the cleanup runs twice.
-
-⚠️ **`claimed_at` alone does not survive a worker crash.** A worker that dies after claiming leaves `claimed_at` set and `completed_at` NULL forever, and every redelivery no-ops — the firing is silently dropped. Make the claim a time-bounded lease (`claimed_at` plus an expiry the reconciler can reclaim) if the cleanup must actually happen; see [leases, heartbeats, and fencing](../../reliability/02_leases_heartbeats_and_fencing.md).
-
-So the division of labour is:
-- APScheduler answers **"when"** (03:00 UTC), and only that.
-- The `scheduled_firings` unique constraint answers **"was this firing already recorded?"** — the scheduler's replica count stops mattering.
-- Dramatiq answers **"where"** (any available worker) and **"with what retry policy"**.
-- The actor's claim answers **"has this firing already been executed?"**
-
-**How you know it worked:** exactly one row per night in `scheduled_firings`, all with `completed_at` set, regardless of how many replicas run the scheduler. Rows with `claimed_at` set and `completed_at` NULL for more than the job's runtime are the alert.
+**How you know it worked:** one firing and job per scheduled instant; a crash after claim eventually produces a new attempt and a terminal row. Alert on oldest owed job, expired leases and unpublished outbox age. A single `cleanup started` log line is neither a completion test nor a proof of exactly-once effects.
 
 ---
 
@@ -788,8 +745,8 @@ So the division of labour is:
 
 APScheduler 4.x is a **complete rewrite** with a different API and architecture. Key changes:
 
-- **Built-in data stores** (PostgreSQL, MySQL, MongoDB, Redis) for distributed scheduling
-- **Built-in event broker** for coordinating multiple scheduler instances
+- **Data stores** include SQLAlchemy-backed relational databases, MongoDB and an in-memory store; choose persistent storage for recoverable schedules.
+- **Event brokers** coordinate scheduler instances; Redis is an event-broker option, not a built-in 4.x data store. See the [current API reference](https://apscheduler.readthedocs.io/en/master/api.html#data-stores), checked 2026-10-30.
 - **Async-first** design
 - **No more job stores confusion** — one unified store
 
@@ -913,7 +870,7 @@ APScheduler says:  "It's 3:00 AM, time to run cleanup"
                         │
                         ├── Simple case: run cleanup() right here in this process
                         │
-                        └── Distributed case: cleanup_task.send()  → Dramatiq handles it
+                        └── Distributed case: commit firing + job + outbox → relay → worker
 ```
 
 ---
@@ -933,5 +890,36 @@ Do not use APScheduler as the only durability layer for critical distributed wor
 ⚠️ Running a scheduler inside every API pod creates one firing per pod. A shared 3.x job store does not add leader election; run one scheduler process or use an external leader/locking design with idempotent jobs.
 
 ---
+
+## Recap and check yourself
+
+- APScheduler calculates eligibility; durable firing/job rows preserve the resulting obligation.
+- Replica-local max_instances limits do not coordinate process ownership.
+- A lease needs supervised renewal and token-bound effects; permanent claimed flags lose work after a crash.
+
+**Two replicas fire at 03:00 and the first worker dies after claim. Does max_instances=1 recover the job?**
+
+<details><summary>Answer</summary>
+
+No. It limits one scheduler process only. Unique firing intent, expiring attempt ownership and an idempotent effect recover the obligation.
+
+</details>
+
+**Redis renewal raises a network error rather than LockNotOwnedError. May cleanup continue?**
+
+<details><summary>Answer</summary>
+
+No. Ownership is uncertain. The renewal task fails and TaskGroup cancels cleanup; external effects still need fencing/idempotency because cooperative cancellation cannot undo them.
+
+</details>
+
+**Try it:** In the durable-job crash test, remove the completion token predicate and predict the assertion that detects the defect.
+
+<details><summary>Hint and worked solution</summary>
+
+Run the old completion after the new claim, not before it. `assert not store.complete(old, 999)` must fail; the mutation has lost fencing. Restore the predicate and require the new result to remain authoritative.
+
+</details>
+
 
 **Next**: [Airflow](../airflow/overview.md)

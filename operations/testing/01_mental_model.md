@@ -188,3 +188,25 @@ an explicit, bounded profile with separate credentials, cost, timeout, and clean
 ## Next
 
 - [02 — Setup](02_setup.md) — install dependencies, configure pytest, structure your test tree.
+
+## Recap and retrieval
+
+- A test boundary determines which real code can contradict the assertion.
+- A fake supplies a controlled behavior; it cannot prove the production database enforces the same rule.
+- Use a small integration check where the claimed guarantee belongs.
+
+**A fake repository accepts duplicate emails. Which extra test proves production uniqueness?**
+
+<details><summary>Reasoned answer</summary>
+
+Use the production database dialect, two competing inserts and an assertion about the unique-constraint outcome. Another fake endpoint test never exercises that constraint.
+
+</details>
+
+**All tests run in milliseconds. Are they necessarily unit tests?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Classification follows boundaries: an in-process route with replaced effects is an API slice, regardless of elapsed time.
+
+</details>

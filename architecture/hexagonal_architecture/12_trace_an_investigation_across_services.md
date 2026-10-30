@@ -41,7 +41,7 @@ certification of the sample's correctness.
 ### Read the existing shape against the current standard
 
 The source sample uses a different implementation shape from the current
-[Python Service Architecture rules](../../python-service-architecture/SKILL.md).
+[implementation convention taught in this course](README.md).
 Its `RequestInvestigations` and `InvestigateException` classes are existing source names,
 not the default action shape taught in the earlier chapters. Today, a stateless operation is a
 public async function; routes, workers, and tools pass its port collaborators explicitly from
@@ -313,6 +313,67 @@ or separate scaling creates the need for these additional owners.
 
 > **Key insight**: understand a service by following the durable facts it creates and the contracts
 > that move them forward; folders organize that story but do not supply its guarantees.
+
+---
+
+## 8. Map the patterns to the problem they solve
+
+The request trace above supplies concrete reasons for several pattern names. Start with the
+observed problem in the left column and follow its owner; the label helps communicate the choice.
+This is a map of responsibilities, not a claim that every named GoF class exists in the sample.
+
+| Pressure in the trace | Owner and pattern intent | What that boundary does not guarantee |
+|---|---|---|
+| HTTP and worker inputs should not contain provider or persistence policy | Application action / service boundary; [command-handler design](../design_patterns/04_commands_and_application_handlers.md) | A command value alone does not authorize, persist or deduplicate execution |
+| A provider/CTC API uses transport-specific fields and failures | Adapter; use an [Anti-Corruption Layer](../design_patterns/03_adapt_translate_and_simplify.md) when meanings differ | Translating names alone does not reconcile incompatible status or version semantics |
+| Acceptance changes several related records | Repositories inside the sample's Unit of Work; current alternative is one atomic store capability | An ordinary local transaction cannot roll back a remote upload or comment |
+| Concrete clients need settings and a lifetime owner | Factory plus dependency injection at bootstrap | A shared client is not automatically safe for every concurrent operation |
+| Accepted I-1 must eventually reach a worker | Outbox and durable integration contract | An in-process Observer cannot replace the recorded publication obligation |
+| A completed checkpoint changes the work remaining | Explicit state/transition policy | This does not prove the sample implements the object-oriented State pattern |
+| Duplicate attempts must not repeat completed effects | Checkpoints plus effect-specific idempotency/reconciliation | A local completed flag cannot close an unrecorded remote-effect window |
+
+The following runtime map separates the use-case path from construction. Read it alongside the
+source dependency rule in [chapter 3](03_dependencies_point_toward_business_policy.md): runtime
+calls to concrete adapters do not authorize the application to import their implementations.
+
+```mermaid
+flowchart TD
+    B["Bootstrap: construct clients and store"] -.->|"inject collaborators"| A["Accept investigation I-1"]
+    H["HTTP: request EX-1"] --> A
+    A -->|"atomic acceptance"| P["Persistence adapter"]
+    P --> D["Commit I-1 and outbox E-1"]
+    D --> O["Publisher relays E-1"]
+    O --> W["Worker invokes execution action"]
+    W --> V["Provider adapter: analyze EX-1"]
+    W --> C["Checkpoint outcome"]
+```
+
+Removing bootstrap would leave construction somewhere else; it would not remove those dependencies.
+Removing the outbox without replacing its guarantee would lose the recovery path after acceptance.
+Those are different kinds of coupling, so one interface cannot solve both problems.
+
+Some additional patterns are conditional. If retrieval must switch between keyword and hybrid
+algorithms, [Strategy](../design_patterns/02_select_behavior_and_build_dependencies.md) can supply
+that choice. If the report page needs a representation unlike the write model,
+[CQRS](../event_driven_architecture/03_cqrs_read_and_write_models.md) can supply a dedicated read
+model. If a local diagnostic view reacts to completion,
+[Observer-style dispatch](../event_driven_architecture/02_local_events_and_dispatch.md) can be enough
+when missed notifications are acceptable. These are possible extensions, not claims about the
+sample's current implementation.
+
+**Changed requirement:** the product adds a notification that must survive worker crashes. Is
+calling a local event handler after the final checkpoint enough?
+
+<details><summary>Reasoned answer</summary>
+
+No. A crash after the checkpoint commit but before the call leaves completed work with no retained
+notification obligation. Persist an appropriate notification/outbox intent atomically with the
+relevant completion transition, then deliver it through a retryable path. Delivery can repeat,
+so the consumer still needs an effect-specific idempotency or reconciliation policy. The local
+dispatch interface may remain convenient, but the durability comes from retained state and its
+recovery owner, not from the event class or the Observer label.
+
+</details>
 
 ---
 

@@ -46,47 +46,26 @@ Authorization tests should build at least two tenants by default so the unsafe q
 
 ---
 
-## 3. Contract Assertion Example
+## 3. Run the two-tenant contract fixture
 
-```python
-from fastapi.testclient import TestClient
+The [complete app and tests](../examples/rest_contract/) supply the missing route, two-tenant
+data, trusted-principal test override, problem response and public response model. From the
+repository root, in the FastAPI environment:
 
-from app.main import app
-
-
-client = TestClient(app)
-
-
-def test_unknown_order_uses_problem_details(auth_headers: dict[str, str]) -> None:
-    response = client.get("/orders/ord_missing", headers=auth_headers)
-
-    assert response.status_code == 404
-    assert response.headers["content-type"].startswith("application/problem+json")
-    assert response.json() == {
-        "type": "https://api.example.com/problems/order-not-found",
-        "title": "Order not found",
-        "status": 404,
-        "detail": "No visible order has that identifier.",
-        "instance": "/orders/ord_missing",
-        "code": "ORDER_NOT_FOUND",
-        "request_id": response.json()["request_id"],
-    }
-
-
-def test_openapi_has_stable_operation_ids() -> None:
-    schema = client.get("/openapi.json").json()
-    operation_ids = [
-        operation["operationId"]
-        for path_item in schema["paths"].values()
-        for method, operation in path_item.items()
-        if method in {"get", "post", "put", "patch", "delete"}
-    ]
-
-    assert len(operation_ids) == len(set(operation_ids))
-    assert all(" " not in operation_id for operation_id in operation_ids)
+```bash
+python -m pytest -q apis/examples/rest_contract
 ```
 
-Avoid asserting volatile timestamps or entire generated schemas in every test. Assert stable contract decisions and use a deliberate schema snapshot/diff workflow for the full document.
+Five cases pass: own order returns only public fields; another tenant's order and a missing
+order both return the same scoped problem contract; operation IDs are unique; and without
+the explicit test override the app returns 401. The override is a test fixture, never a
+production authentication policy. Install the real verified identity dependency before
+exposing this app. The in-memory dictionary proves route-policy behavior, while the
+[PostgreSQL tenant lab](../../fundamentals/database/13_multi_tenancy.md) proves database enforcement.
+
+In `app.py`, temporarily remove the tenant predicate and rerun the suite: the cross-tenant
+case fails. Restore it and the case passes. That failure distinguishes a useful authorization
+test from merely checking that any valid token gets a 200.
 
 ---
 
@@ -169,6 +148,24 @@ Killing workers mid-request increases ambiguous outcomes. Idempotency and reconc
 
 ---
 
+Shutdown must preserve resources until the requests that own them have drained.
+
+```mermaid
+sequenceDiagram
+ participant LB as Load balancer
+ participant API as API worker
+ participant DB as Database pool
+ API->>LB: readiness false
+ Note over LB,API: routing convergence interval
+ API->>API: drain existing requests within grace
+ API->>DB: close pool after work ends
+ API->>API: bounded telemetry flush and exit
+```
+
+Readiness changes propagate asynchronously. Keep the worker serving its admitted requests during routing convergence, then close the pool after dependent work finishes or its deadline expires. Forced termination still needs idempotent recovery.
+
+---
+
 ## 8. Incident Diagnosis Path
 
 ```text
@@ -192,6 +189,38 @@ Useful runbook data:
 
 ---
 
+### Work one incident from observation to recovery
+
+At 10:00 a release doubles connection hold time for `GET /orders/{order_id}`. This is a
+worked diagnostic scenario, not a reported production measurement:
+
+| Signal | Before | During incident | After admission cap and lease fix |
+|---|---:|---:|---:|
+| Request p99 | 180 ms | 2.4 s | 190 ms |
+| Pool-wait p95 | 4 ms | 1.8 s | 6 ms |
+| Query p95 after checkout | 25 ms | 26 ms | 25 ms |
+| Used connections / ceiling | 12/20 | 20/20 | 13/20 |
+
+The query duration barely changes, so adding an index cannot remove the dominant wait.
+Trace the connection checkout through response completion: a new code path retains it
+while waiting on another service. Cap admitted requests to stop the queue growing, then
+release the connection before remote I/O or revert the compatible code change. Retrying
+every queued request would add demand to the same finite pool.
+
+Suppose the latency objective allows 1% of valid requests above 500 ms. Over five minutes,
+600 of 10,000 valid requests exceed it: 6% bad / 1% allowed = 6x budget burn. The accepted
+traffic and rejected-overload traffic must follow the published SLI policy; dropping
+rejections from the chart cannot make the user experience healthy. Use a sustained window
+and the [multi-window SLO owner](../../infrastructure/observability/05_alerting_and_slos.md)
+to choose paging severity.
+
+Before reverting, check that old code can read values already written by the release.
+Drain the affected pods using the sequence above; keep the pool alive for existing requests.
+Recovery requires falling pool wait and restored latency without growing rejections.
+For writes that timed out, reconcile the original idempotency identities and compare effect
+counts before allowing customer retries. An empty incident queue alone does not prove no
+payment was duplicated.
+
 ## 9. Production Readiness Checklist
 
 - Contract, examples, and implementation pass conformance checks.
@@ -205,5 +234,38 @@ Useful runbook data:
 - Logs and traces are useful without leaking sensitive content.
 
 ---
+
+
+## Recap
+
+- Two-tenant tests expose unscoped lookups that a happy-path test misses.
+- Separating pool wait from query duration locates the dominant latency.
+- Recovery requires restored outcomes and reconciliation, not only a green process health check.
+
+## Check yourself
+
+**New pods accept a changed enum and write it to storage. Why can reverting the deployment still fail?**
+
+<details><summary>Reasoned answer</summary>
+
+Old code must read data already written by new code; binary rollback alone does not undo the data compatibility change.
+
+</details>
+
+**Queries remain fast but pool wait rises after a connection leak. Should retries increase?**
+
+<details><summary>Reasoned answer</summary>
+
+No. They increase demand on exhausted capacity. Bound admission and repair connection ownership; verify wait and rejection rates recover.
+
+</details>
+
+**Try it:** Add a third order belonging to tenant 8 to examples/rest_contract/app.py. In test_app.py, leave the expected GET status from a tenant-7 principal blank.
+
+Hint: Public IDs do not establish tenant authority.
+
+<details><summary>Solution</summary>
+Assert 404 and no protected fields for tenant 7, then override the trusted principal to tenant 8 and assert the allowed public response. This changes the resource identity while preserving the authorization rule.
+</details>
 
 **Next**: [WebSocket Deep Dive](../websockets/README.md)

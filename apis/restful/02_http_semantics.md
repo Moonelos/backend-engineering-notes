@@ -4,7 +4,7 @@
 
 ---
 
-## One request can be safe without being idempotent—or vice versa
+## An idempotent operation can still change state
 
 ```http
 PUT /orders/42/status HTTP/1.1
@@ -201,4 +201,33 @@ Common failures:
 
 ---
 
+
+## Recap
+
+- Safety concerns intended state change; standard safe methods are also idempotent.
+- Idempotency constrains intended effects, not identical status or response bytes.
+- Intermediaries participate in caching, deadlines and retries, so method semantics are shared contracts.
+
+## Check yourself
+
+**DELETE returns 204 then 404 on retry. Has idempotency failed?**
+
+<details><summary>Reasoned answer</summary>
+
+No: both leave the resource absent; idempotency constrains intended state effects, not identical status codes.
+
+</details>
+
+**Can a POST search be retried automatically by generic tooling merely because its implementation only reads?**
+
+<details><summary>Reasoned answer</summary>
+
+No. POST does not advertise safe or idempotent semantics by default. Document and configure the operation-specific policy, or validate support for QUERY.
+
+</details>
+
 **Next**: [Resource and URI Design](03_resource_and_uri_design.md)
+
+## QUERY for safe requests with a body
+
+RFC 10008 (June 2026) defines `QUERY` as a safe, idempotent method whose request content describes a query. For a complex search that exceeds a practical URL, it makes the safety/retry contract explicit instead of relying on undefined GET-body semantics. `Accept-Query` advertises supported query media types. Availability still depends on your framework, gateway, client and cache: test method routing and policy across all hops, and retain a documented POST-search fallback for clients that cannot send it. “Safe” forbids a requested business state change; it does not mean the query is cheap or needs no authorization/rate limit. [RFC 10008](https://www.rfc-editor.org/rfc/rfc10008.html), checked 2026-10-30.

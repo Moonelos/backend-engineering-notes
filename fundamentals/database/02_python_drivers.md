@@ -111,22 +111,29 @@ with conn.cursor() as cur:
 
 #### Bind values; compose allowed identifiers separately
 
-A placeholder binds a value, not an SQL table/column name. `SELECT %s FROM users` selects a constant value for each row; it does not dynamically choose a column. For a caller-selected report field, validate the choice, then quote it with psycopg's identifier composer. This excerpt uses the `conn` and users fixture from earlier:
+A placeholder binds a value, not an SQL table/column name. `SELECT %s FROM users` selects a constant value for each row; it does not dynamically choose a column. For a caller-selected report field, validate the choice, then quote it with psycopg's identifier composer. This independent example creates its own connection and temporary users fixture:
 
 ```python
+import os
+import psycopg
 from psycopg import sql
 
 field = "email"  # supplied by a caller
 if field not in {"email", "name"}:
     raise ValueError("unsupported report field")
-with conn.cursor() as cur:
-    cur.execute(
-        sql.SQL("SELECT {} FROM {} WHERE id = %s").format(
-            sql.Identifier(field), sql.Identifier("users")
-        ),
-        (1,),
-    )
-    print(cur.fetchone())
+with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
+    with conn.cursor() as cur:
+        cur.execute("CREATE TEMP TABLE users (id int PRIMARY KEY, email text, name text)")
+        cur.execute("INSERT INTO users VALUES (%s, %s, %s)",
+                    (1, "alice@example.com", "Alice"))
+        cur.execute(
+            sql.SQL("SELECT {} FROM {} WHERE id = %s").format(
+                sql.Identifier(field), sql.Identifier("users")
+            ),
+            (1,),
+        )
+        print(cur.fetchone())  # ('alice@example.com',)
+
 ```
 
 The allowlist controls what the report may expose; quoting controls SQL syntax. A value such as `email; DROP TABLE users` fails the allowlist rather than becoming executable SQL. Continue to bind data values even when the identifier is composed. [SQL composition](https://www.psycopg.org/psycopg3/docs/api/sql.html).

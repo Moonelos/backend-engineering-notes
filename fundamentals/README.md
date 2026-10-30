@@ -13,16 +13,25 @@
 
 | Section | Description |
 |---------|-------------|
-| [core_concepts/](core_concepts/README.md) | Python contracts, iteration, decorators, exceptions, logging, configuration |
+| [core_concepts/](core_concepts/README.md) | Python language, objects and attributes, typing, dataclasses/Pydantic, control flow, application runtime |
 | [concurrency/](concurrency/README.md) | Threads, processes, async/await, the GIL, event loops, contextvars, production patterns |
 | [httpx/](httpx/README.md) | HTTP client internals — pooling, timeouts, streaming |
 | [fastapi/](fastapi/README.md) | Framework patterns, DI, Pydantic, auth, middleware, WebSockets, streaming, API design |
 | [database/](database/README.md) | PostgreSQL, Python drivers, SQLAlchemy ORM, async patterns, connection pooling |
 | [auth/](auth/README.md) | JWT, OAuth 2.0, AWS Cognito |
+| [Python packaging](python_packaging/README.md) | Dependency intent, locks, wheels and reproducible release artifacts |
+| [Schema evolution](data_validation/README.md) | Reader/writer compatibility after the Pydantic foundation |
 
 ---
 
 ## Reading Order
+
+### Reading Unfamiliar Python
+
+Start with the [Core Python learning path](core_concepts/README.md#read-everyday-python): names
+and mutability, functions and scope, classes, attribute access, dataclasses, then Pydantic.
+The first two lessons let you explain shared-state and callback behavior; continue into object
+protocols when reading framework internals. This path assumes basic syntax, not advanced Python.
 
 ### New to Python Backend
 
@@ -46,12 +55,12 @@ configuration, or shutdown mechanisms.
 
 ### Building a Production API
 
-1. [core_concepts/configuration.md](core_concepts/configuration.md) — settings management
+1. [core_concepts/runtime/configuration.md](core_concepts/runtime/configuration.md) — settings management
 2. [fastapi/04_authentication.md](fastapi/04_authentication.md) — JWT, OAuth2
 3. [fastapi/05_middleware.md](fastapi/05_middleware.md) — request ID, CORS, timing
 4. [fastapi/07_error_handling.md](fastapi/07_error_handling.md) — consistent error shapes
 5. [fastapi/10_api_design.md](fastapi/10_api_design.md) — resources, pagination, versioning
-6. [core_concepts/structlog_guide.md](core_concepts/structlog_guide.md) — structured logging
+6. [core_concepts/runtime/logging/structlog_guide.md](core_concepts/runtime/logging/structlog_guide.md) — structured logging
 7. [concurrency/async/03_contextvars.md](concurrency/async/03_contextvars.md) — request-scoped state
 
 ### Calling External APIs / LLMs

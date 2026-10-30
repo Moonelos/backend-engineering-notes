@@ -215,4 +215,35 @@ Do not add an outbox when producer state and work already share a database job t
 
 ---
 
+## Recap and check yourself
+
+- The state transition must win before its dependent job and outbox rows exist.
+- UPDATE RETURNING makes the winning row the input to dependent inserts.
+- Publication may repeat after a crash, so recipients still need durable idempotency.
+
+**Optimistic approval updates zero rows. Should its job insert still execute?**
+
+<details><summary>Answer</summary>
+
+It may execute as SQL, but it must receive zero input from updated and insert no rows. A separate unconditional INSERT would create work for a losing transition.
+
+</details>
+
+**The outbox publisher sends successfully and dies before marking publication. What repeats?**
+
+<details><summary>Answer</summary>
+
+Delivery repeats. The business transition already committed once; consumer idempotency prevents the repeated hint from duplicating its effect.
+
+</details>
+
+**Try it:** Replace the dependent `INSERT ... SELECT FROM updated` with an unconditional values insert in a scratch transaction. Race two approvals and fill the expected count that exposes the bug.
+
+<details><summary>Hint and worked solution</summary>
+
+Both commands can execute SQL even though one updates zero rows. The correct count is one job; the flawed variant can create two. Keep dependent inserts tied to the winner relation.
+
+</details>
+
+
 **Next**: [Leases, Heartbeats, and Fencing](02_leases_heartbeats_and_fencing.md)

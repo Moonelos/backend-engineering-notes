@@ -50,6 +50,31 @@ by stable key may already make replay safe.
 
 ---
 
+## Recap
+
+- The placement of the checkpoint relative to the effect determines loss or replay.
+- An acknowledgement proves its own boundary, not every downstream business action.
+- At-least-once delivery needs an effect identity to collapse repeat execution.
+
+## Check yourself
+
+**Q: A worker commits its offset before writing the result, then crashes. Will Kafka redeliver the missing result?**
+
+<details><summary>Answer</summary>
+
+Normally no: the committed next offset tells the group to start later. Committing early traded duplicate risk for lost effects.
+
+</details>
+
+**Q: If the result commits first and the offset does not, why is that preferable with an inbox?**
+
+<details><summary>Answer</summary>
+
+The event replays, but the atomic inbox/effect transaction proves it already applied. Retrying a known identity can recover uncertainty without inventing another effect.
+
+</details>
+
+
 **Next**: [Durable Consumer-Effect Idempotency](02_durable_consumer_effect_idempotency.md), then
 [Kafka Idempotence and Transactions](02_idempotence_transactions_and_exactly_once.md) when every
 effect stays inside Kafka.

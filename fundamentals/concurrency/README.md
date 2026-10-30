@@ -46,10 +46,10 @@ can be shared safely across that model's boundary.
 3. **Build:** follow the selected [async](async/README.md), [thread](threads/README.md), or [process](processes/README.md) branch to its first runnable result.
 4. **Specialize only when measured:** evaluate [alternative runtimes](02_alternative_runtimes.md) after a default branch has a demonstrated CPU or isolation limit.
 
-After the decision guide, go directly to the async, thread, or process branch it selects. Stop when
-that branch's first example produces its named result. Continue to state safety only when work
-shares mutable data or crosses scheduler boundaries, and evaluate alternative runtimes only when
-measured CPU or isolation needs justify a non-default runtime.
+Read state and safety as the second entry before the selected async, thread, or process branch.
+Readers who can already explain aliasing, scheduler ownership and serialization may use its checklist
+as a prerequisite check. Stop after the selected branch produces its first named result; evaluate
+alternative runtimes only when measured CPU or isolation needs justify them.
 
 ---
 

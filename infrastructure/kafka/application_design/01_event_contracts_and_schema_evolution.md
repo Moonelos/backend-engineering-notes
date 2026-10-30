@@ -199,4 +199,56 @@ later revoke cleanly.
 
 ---
 
+## Read compatibility in both directions
+
+The reader is the actor interpreting retained bytes; the arrows below name which version must
+understand which payload.
+
+```mermaid
+flowchart LR
+    V1[Retained v1 event] -->|Backward compatibility| R2[New v2 reader]
+    V2[New v2 event with coupon_code] -->|Forward compatibility| R1[Old v1 reader ignores unknown field]
+    U[total_minor silently changes units] --> E[Semantic failure despite compatible integer type]
+```
+
+Full compatibility requires both reader directions. Neither arrow proves unchanged units or business
+meaning, so the semantic fixture remains a separate gate from schema parsing.
+
+## Recap
+
+- A retained event can outlive the producer and reader versions that first handled it.
+- Backward checks run new readers on old records; forward checks run old readers on new records.
+- Schema compatibility preserves shape, while domain assertions preserve meaning.
+
+## Check yourself
+
+**Q: An old reader accepts coupon_code. Does that prove changing total_minor from cents to euros is safe?**
+
+<details><summary>Answer</summary>
+
+No. Ignoring a new optional field says nothing about a changed unit. The integer 1250 would change from 12.50 to 1250.00 without a structural error. Use a new field or contract version and retain old-unit fixtures.
+
+</details>
+
+**Q: A new required field has no default. Which historical fixture reveals the problem?**
+
+<details><summary>Answer</summary>
+
+A retained v1 event lacking that field. A new reader must supply a documented default or reject it; testing only fresh v2 events misses the backward-compatibility break.
+
+</details>
+
+## Try it
+
+Extend the old/new fixture matrix with a retained event containing total_minor=1250. Leave the business-value assertion to implement.
+
+Hint: Compare the interpreted amount, not merely successful parsing.
+
+<details><summary>Worked solution</summary>
+
+Assert that both supported readers preserve 1250 minor units. Keep a negative fixture that changes units without changing the type; the semantic assertion must fail.
+
+</details>
+
+
 **Next**: [Python Producers and Consumers](02_python_producers_and_consumers.md)

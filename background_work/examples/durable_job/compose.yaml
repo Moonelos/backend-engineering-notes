@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: jobs
+    ports:
+      - "127.0.0.1:56432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lab -d jobs"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:56379:6379"
+    profiles: ["broker"]
+  init:
+    build: .
+    command: ["python", "main.py", "init"]
+    environment:
+      DATABASE_URL: postgresql://lab:lab@postgres:5432/jobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["dramatiq"]
+  api:
+    build: .
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8086"]
+    environment:
+      DATABASE_URL: postgresql://lab:lab@postgres:5432/jobs
+    ports: ["127.0.0.1:8086:8086"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    profiles: ["dramatiq"]
+  publisher:
+    build: .
+    command: ["python", "publisher.py", "dramatiq"]
+    environment:
+      DATABASE_URL: postgresql://lab:lab@postgres:5432/jobs
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    profiles: ["dramatiq"]
+  worker:
+    build: .
+    command: ["dramatiq", "dramatiq_tasks", "--queues", "parse.dramatiq", "--processes", "1", "--threads", "2"]
+    environment:
+      DATABASE_URL: postgresql://lab:lab@postgres:5432/jobs
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    stop_grace_period: 40s
+    profiles: ["dramatiq"]

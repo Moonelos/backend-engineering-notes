@@ -93,12 +93,7 @@ The stable `code` drives client behavior. The message is safe human text. Intern
 
 A message schema alone cannot describe which messages are legal now.
 
-```text
-connection
-UNAUTHENTICATED ──authenticate──> READY ──subscribe──> SUBSCRIBED
-       │                            │                      │
-       └──────── reject ────────────┴──── unsubscribe ─────┘
-```
+
 
 For each state define:
 
@@ -110,6 +105,23 @@ For each state define:
 - Close code for protocol/policy violations
 
 Reject a validly shaped `document.edit` if the connection has not subscribed or the principal lacks edit permission. Structural validation is only the first gate.
+
+---
+
+Authentication and subscription are distinct state transitions.
+
+```mermaid
+stateDiagram-v2
+ [*] --> UNAUTHENTICATED
+ UNAUTHENTICATED --> READY: authentication accepted
+ UNAUTHENTICATED --> CLOSED: auth rejected or timeout
+ READY --> SUBSCRIBED: authorized subscribe
+ SUBSCRIBED --> READY: unsubscribe
+ READY --> CLOSED: policy close
+ SUBSCRIBED --> CLOSED: disconnect
+```
+
+Unsubscribe returns to an authenticated READY channel; failed authentication goes to CLOSED and never grants READY. A channel may later subscribe again after a fresh resource authorization decision.
 
 ---
 
@@ -202,5 +214,30 @@ describe those contracts, but application state machines and recovery rules stil
 prose and tests.
 
 ---
+
+
+## Recap
+
+- A versioned envelope gives a transport message application meaning.
+- Correlation IDs pair out-of-order replies with pending requests.
+- Unsubscribe removes a subscription without undoing channel authentication.
+
+## Check yourself
+
+**ReplyB arrives before replyA on the same socket. Must the client treatB as the answer toA?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Transport order is not request completion order; request_id chooses the pending command, and events have separate identity.
+
+</details>
+
+**A client validates the JSON shape. May it subscribe to another user’s object?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Schema validation does not grant resource authority; evaluate that subscription against the authenticated principal.
+
+</details>
 
 **Next**: [Reliability, Reconnection, and Flow Control](03_reliability_reconnection_and_flow_control.md)

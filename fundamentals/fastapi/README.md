@@ -92,7 +92,7 @@ attribute 'http'`; constructing a client per request instead hides the error but
 |------|-------|-------------|
 | [01](01_http_and_parameter_mapping.md) | HTTP & Parameter Mapping | HTTP request structure, FastAPI's parameter resolution rules |
 | [02](02_dependency_injection.md) | Dependency Injection | `Depends` mental model, patterns, testing |
-| [03](03_pydantic.md) | Pydantic | Data validation, serialization, FastAPI integration |
+| [03](03_pydantic.md) | Pydantic at HTTP boundaries | Request/response models, validation errors and partial updates; general mechanics live in [Core Pydantic](../core_concepts/data_models/pydantic/README.md) |
 | [04](04_authentication.md) | Authentication & Security | JWT, OAuth2, CORS, password hashing, security headers |
 | [05](05_middleware.md) | Middleware | Request ID, timing, CORS, error handling, ordering |
 | [06](06_websockets.md) | WebSockets | Connections, rooms, auth, heartbeat, scaling |
@@ -101,6 +101,7 @@ attribute 'http'`; constructing a client per request instead hides the error but
 | [09](09_background_tasks_and_routers.md) | BackgroundTasks & APIRouter | Fire-and-forget after response, app structure, OpenAPI customization |
 | [10](10_api_design.md) | API Design Conventions | REST shape, methods, pagination, versioning, OpenAPI hygiene |
 | [11](11_api_security.md) | API Security | Object/function/property authorization, abuse controls, SSRF, webhooks, uploads, auditability |
+| [12](12_file_uploads_and_object_storage.md) | File uploads and object storage | Bound bytes, quarantine objects, verify content and authorize downloads |
 
 ### External API Calls
 
@@ -121,6 +122,10 @@ attribute 'http'`; constructing a client per request instead hides the error but
   | [11](safe_and_scalable_api_calls/11_idempotency.md) | Idempotency Keys | Safe POST retries, dedup state machine, Postgres + Redis backends |
 
 ---
+
+## Integration continuation
+
+For signed inbound events and outbound delivery, follow the existing [webhook course](../../apis/webhooks/README.md). It owns signature verification, replay protection, inbox/outbox, retry schedules, delivery logs and CI fixtures; a second FastAPI-specific webhook chapter would duplicate that path.
 
 ## Prerequisites
 

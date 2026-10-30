@@ -56,6 +56,8 @@ on the token exchange for all clients unless a provider contract explicitly says
 
 ```python
 import secrets, hashlib, base64
+from urllib.parse import urlencode
+import requests
 
 # Client generates before redirect
 code_verifier = secrets.token_urlsafe(64)
@@ -69,16 +71,11 @@ state = secrets.token_urlsafe(32)
 session["oauth_transaction"] = {"state": state, "code_verifier": code_verifier}
 
 # Include in authorization URL
-auth_url = (
-    "https://auth.example.com/oauth2/authorize"
-    f"?response_type=code"
-    f"&client_id={client_id}"
-    f"&redirect_uri={redirect_uri}"
-    f"&scope=openid+email+profile"
-    f"&code_challenge={code_challenge}"
-    f"&code_challenge_method=S256"
-    f"&state={state}"
-)
+auth_url = "https://auth.example.com/oauth2/authorize?" + urlencode({
+    "response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
+    "scope": "openid email profile", "code_challenge": code_challenge,
+    "code_challenge_method": "S256", "state": state,
+})
 
 # Callback: reject a forged or replayed authorization response before exchange.
 transaction = session.pop("oauth_transaction", None)
@@ -92,7 +89,8 @@ token_response = requests.post(token_url, data={
     "redirect_uri": redirect_uri,
     "client_id": client_id,
     "code_verifier": transaction["code_verifier"],
-})
+}, timeout=10)
+token_response.raise_for_status()
 ```
 
 Without `state`, an attacker can make a victim's browser complete the attacker's authorization
@@ -100,6 +98,31 @@ response, binding the wrong account or operation to the victim's session. The on
 binds the callback to the browser session that initiated it. In OpenID Connect (OIDC), the identity
 layer built on OAuth, a correctly validated `nonce` can also bind identity responses where the
 protocol profile permits it.
+
+The snippets above are protocol excerpts: `session` is your protected server session and callback
+values come from the HTTP request; they are not an executable browser application. Confidential
+clients must also authenticate at the token endpoint according to the issuer's contract.
+
+The verifier proves that the redeemer is the party that initiated this particular transaction:
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Auth as Authorization server
+    participant Thief
+    App->>Auth: Authorize with SHA256(verifier) and state
+    Auth-->>App: Redirect with one-time code and state
+    Auth-->>Thief: Intercepted code alone
+    Thief->>Auth: Redeem code without verifier
+    Auth-->>Thief: Reject challenge mismatch
+    App->>App: Compare state to one-time session transaction
+    App->>Auth: Redeem code with original verifier
+    Auth-->>App: Tokens after verifier and redirect checks
+```
+
+The challenge is public; knowing it does not reveal the random verifier. State binds the callback
+to the initiating browser session. Neither check authorizes arbitrary business operations after
+login: the API must still enforce scopes and resource ownership.
 
 ### 2. Client Credentials
 
@@ -123,15 +146,17 @@ token_response = requests.post(
         "client_secret": client_secret,
         "scope": "myapi/read myapi/write",
     },
+    timeout=10,
 )
+token_response.raise_for_status()
 access_token = token_response.json()["access_token"]
 ```
 
 Key facts:
 - No user, no user context — the token represents the **client/service itself**
-- `client_secret` is required (must be kept server-side, never in frontend code)
-- No refresh token — when it expires, just request a new one with client_id + secret
-- The token's `sub` claim is the client ID, not a user ID
+- A confidential client must authenticate. This example uses a shared secret; other issuer profiles use asymmetric credentials such as signed client assertions or mutual TLS.
+- A refresh token normally should not be issued for this grant; request another access token with the client's configured authentication method.
+- OAuth does not require JWT access tokens or a universal `sub` value. Use the issuer's documented machine-token profile; Cognito normally identifies the app client.
 
 ### 3. Refresh Token
 
@@ -155,7 +180,9 @@ token_response = requests.post(
         # Public clients (SPAs, mobile) omit it.
         # "client_secret": client_secret,
     },
+    timeout=10,
 )
+token_response.raise_for_status()
 new_access_token = token_response.json()["access_token"]
 ```
 
@@ -282,10 +309,10 @@ Auth Server issues token with exactly those scopes (if client is allowed)
 ```
 
 **When**: Backend ↔ backend, cron jobs, data pipelines, any service-to-service call.
-**Token contains**: client's identity, scopes, no user info.
+**Token represents**: authority granted to the client, without a human resource owner. Its serialized format and claims are provider-specific.
 **Refresh**: just request a new token with client_id + secret.
 
-### User-Based (Authorization Code / Password)
+### User-Based (Authorization Code + PKCE)
 
 ```
 ┌───────────┐   login    ┌──────────────┐
@@ -301,7 +328,7 @@ Auth Server issues token with exactly those scopes (if client is allowed)
 ```
 
 **When**: A human logs in and calls your API.
-**Token contains**: user's identity (`sub`), user attributes, groups, scopes.
+**Access token represents**: the authorized user/client and permitted API scopes according to the issuer profile. Profile attributes belong in an OIDC ID token or UserInfo response.
 **Refresh**: use the refresh_token to silently get new tokens.
 
 ---
@@ -340,3 +367,22 @@ Auth Server issues token with exactly those scopes (if client is allowed)
 
 - [jwt.md](./jwt.md) — JWT structure, JWKS, validation algorithm, Python code
 - [cognito/oauth-jwt-guide.md](./cognito/oauth-jwt-guide.md) — Applying OAuth with AWS Cognito
+
+
+## Retention and transfer
+
+**Recap:** choose the grant from whose authority the client needs, then apply the issuer's token
+profile and the API's permissions. OAuth defines the exchange; OIDC supplies identity semantics.
+
+**Check yourself:** can a nightly report service use a copied employee access token indefinitely?
+<details><summary>Answer</summary>No. It inherits the employee's scope and lifecycle. Give the
+service its own confidential client and least-privilege machine scope when it acts as itself.</details>
+
+**Try it:** a browser receives a valid code but its original session cookie is missing. Decide
+whether to exchange it, and which controls would still be missing even if PKCE succeeded.
+<details><summary>Answer</summary>Reject and restart login: the callback has lost its browser-bound
+transaction, including state and verifier. Accepting a pasted transaction risks account confusion;
+a successful exchange also does not replace API scope and object-ownership checks.</details>
+
+The client-authentication distinction follows [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749.html)
+and [OAuth Security BCP](https://www.rfc-editor.org/rfc/rfc9700.html), checked 2026-10-30.

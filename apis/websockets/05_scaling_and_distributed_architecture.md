@@ -59,6 +59,19 @@ Redis Pub/Sub is low latency but does not retain missed messages. Redis Streams,
 
 ---
 
+### Start with two gateways, then make routing more selective
+
+With two gateways and 100 small user events per second, broadcast sends 200 gateway
+copies per second. Each gateway filters for its own authorized connections; both gateways
+must receive their copy, so a competing-consumer group that divides events between them
+would lose notifications. Each socket still has exactly one live owner.
+
+At 200 gateways, the same stream creates 20,000 copies per second. If one hot tenant owns
+most traffic, first measure bytes and fan-out CPU. Tenant/topic subscriptions can reduce
+unrelated delivery; a per-user directory can target the exact gateway at the cost of leases,
+stale routes and reconnect races. Choose that extra state only when the observed broadcast
+cost justifies it. Neither routing choice supplies durable delivery by itself.
+
 ## 3. Routing Strategies
 
 ### Broadcast to every WebSocket instance
@@ -82,6 +95,27 @@ The directory is a hint, not a perfect source of truth. Entries can outlive cras
 ### Sticky sessions
 
 Affinity can keep reconnects on one backend and support connection-specific state, but it does not distribute events across pods, preserve state after failure, or eliminate skew. Keep important state external even with stickiness.
+
+---
+
+A remote directory cannot atomically observe a gateway process disappearing.
+
+```mermaid
+sequenceDiagram
+ participant C as user_7
+ participant D as Connection directory
+ participant P as ws-pod-12
+ participant R as Router
+ C->>P: Connect c1
+ P->>D: user_7 -> pod12 epoch 4
+ Note over P: Process crashes
+ R->>D: Lookup user_7
+ D-->>R: Stale pod12 epoch 4
+ R->>P: Route event
+ Note over C: Reconnect and resume from durable log
+```
+
+The directory is a leased routing hint. On reconnect, c9 registers epoch 5; a late cleanup for epoch 4 must delete only if its connection ID and epoch still match. Missed events are recovered from a durable cursor, not from a directory entry.
 
 ---
 
@@ -189,6 +223,27 @@ Choose consistency and routing intentionally:
 A single global total order is expensive and often unnecessary. Per-document or per-order ordering usually matches the domain better.
 
 ---
+
+### Replay a gateway crash through a rollout
+
+`user_7` processed event 43 on c1/epoch 4 at pod12. Pod12 crashes after event 44 commits to
+the durable log but before delivery. The directory temporarily still names pod12; routing
+44 there fails. The client reconnects as c9/epoch 5 on pod18, authenticates, registers its
+new route, and asks for events after 43. Event 44 is replayed and the client advances its
+cursor only after application processing.
+
+A late pod12 cleanup must use compare-and-delete on `(user_7,c1,4)`. An unconditional
+`DELETE user_7` erases c9's healthy route. During planned drain, stop new upgrades, tell
+clients to reconnect with jitter, and keep old sockets until a bounded deadline; the same
+epoch and replay rules cover the overlap. If event 44 has expired, use the snapshot/resume
+contract from the reliability lesson instead of claiming lossless replay.
+
+For regions, extend this only with an explicit command authority. A single active home
+region can fence commands with an ownership epoch before failover; replicas may still
+serve suitably fresh reads. Two active regions need a stated conflict policy for concurrent
+commands. Moving a WebSocket connection alone neither transfers database authority nor
+makes asynchronous replication current. Test failback with the same fencing and cursor
+checks as failover.
 
 ## 9. Failure Scenarios
 

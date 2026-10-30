@@ -214,7 +214,7 @@ user = r.hgetall("user:42")
 | **Partial read** | `HGET user:42 name` — reads one field | `GET user:42` — must deserialize entire JSON, extract field |
 | **Partial write** | `HSET user:42 name "Bob"` — updates one field | `GET` + deserialize + modify + serialize + `SET` — read-modify-write cycle |
 | **Atomic increment** | `HINCRBY user:42 views 1` — single command | Not possible without a transaction |
-| **Memory (small hashes)** | Optimized ziplist encoding for small hashes | No special optimization |
+| **Memory (small hashes)** | Redis 7+ listpack encoding (ziplist through 6.2) | No special optimization |
 | **Nested structures** | Not supported (values are flat strings) | Full JSON nesting |
 
 **Rule of thumb**: Use hashes when you need to read or update individual fields without fetching the whole object. Use JSON strings when you always read/write the entire object and want to preserve complex nested structures.
@@ -274,7 +274,7 @@ if result:
     print(f"Got {job} from {key}")
 
 # Get all items without popping
-all_jobs = r.lrange("queue:emails", 0, -1)  # ["email_2", "email_3"]
+all_jobs = r.lrange("queue:emails", 0, -1)  # ["email_3"] after both pops
 
 # Use as a bounded log (keep last 100 entries)
 r.lpush("log:api-requests", "GET /api/users 200 12ms")
@@ -379,7 +379,8 @@ r.sadd("friends:bob", "alice", "charlie", "eve")
 mutual = r.sinter("friends:alice", "friends:bob")  # {"charlie"}
 
 # Friends of alice but not bob (friend suggestions for bob)
-suggestions = r.sdiff("friends:alice", "friends:bob")  # {"diana"}
+suggestions = r.sdiff("friends:alice", "friends:bob")  # {"bob", "diana"}
+suggestions.discard("bob")  # do not suggest Bob to himself
 ```
 
 ### Use Cases
@@ -498,12 +499,15 @@ r.zadd("queue:priority", {
 })
 
 # Dequeue highest priority item (lowest score)
-items = r.zrange("queue:priority", 0, 0)  # get first item
+items = r.zpopmin("queue:priority", count=1)  # atomic select and remove
 if items:
-    task = items[0]
-    r.zrem("queue:priority", task)  # remove it
+    task, priority = items[0]
     print(json.loads(task))
 ```
+
+A crash after `ZPOPMIN` loses that popped item unless an independent durable intent can recreate
+it. Atomic pop prevents two consumers taking the same entry; it does not provide acknowledgement
+or recovery. Use the Streams recovery path when a task must survive worker failure.
 
 ### Sorted Sets for Delayed Job Scheduling
 

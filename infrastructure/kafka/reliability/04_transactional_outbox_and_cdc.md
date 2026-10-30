@@ -91,7 +91,7 @@ t3  relay-b claims and publishes evt-101 again  → possible duplicate, no loss
 t4  relay-b sets published_at and commits        → cleanup may later archive the row
 ```
 
-The key choice preserves the order of successive events for one aggregate:
+The key preserves Kafka arrival order for one aggregate; it does not establish database order:
 
 ```text
 evt-101(order_id=ord-42, order.created) ┐
@@ -99,12 +99,19 @@ evt-101(order_id=ord-42, order.created) ┐
 evt-109(order_id=ord-42, order.paid)    ┘
 ```
 
+If relay A locks `created` while relay B skips that lock and publishes `paid`, the shared key
+preserves the *wrong* arrival order. For the minimal ordered relay, run one relay under a
+transaction-scoped PostgreSQL advisory lock and fetch a small ordered batch without `SKIP LOCKED`.
+Use a persisted per-aggregate sequence assigned while holding the aggregate row lock; timestamps
+alone can tie or differ from commit order. The single relay costs throughput but makes the
+invariant explicit. A later scalable design assigns each aggregate to one fenced relay shard.
+
 Keying by unique `event_id` would spread these two events independently and lose that ordering
 relationship. `event_id` and `aggregate_id` solve different problems: deduplication and routing.
 
 ### Claim, acknowledge, mark, and reconcile
 
-One relay transaction handles a bounded row like this:
+For unordered independent events, one relay transaction handles a bounded batch like this:
 
 ```sql
 BEGIN;
@@ -118,6 +125,30 @@ LIMIT 10;
 UPDATE outbox_events SET published_at = now() WHERE event_id = $1;
 COMMIT;
 ```
+
+For events whose business meaning requires sequence, replace that claim step with this protocol:
+
+```sql
+BEGIN;
+-- Every relay uses the same namespace/key; only one publishes while this lock is held.
+SELECT pg_advisory_xact_lock(4242, 1);
+SELECT event_id, aggregate_id, event_type, payload
+FROM outbox_events
+WHERE published_at IS NULL
+ORDER BY aggregate_id, (payload->>'aggregate_version')::bigint
+FOR UPDATE
+LIMIT 10;
+-- Publish sequentially, wait for each acknowledgement, then mark that row.
+-- Fail the transaction on the first failed publication; do not publish later rows for that key.
+COMMIT;
+```
+
+This ordered variant requires every payload to contain a validated integer `aggregate_version`
+assigned under the aggregate row lock in the business transaction. Add a unique constraint on
+`(aggregate_id, aggregate_version)` when storing the version in its own column. The one-event
+integration test below verifies crash recovery, not this multi-event ordering protocol. Verify the
+latter with two relays and `created(version=1)`/`paid(version=2)`, blocking the first publish: the
+second relay must wait and the consumer must observe 1 before 2. A retry may repeat 1.
 
 The database lock prevents two polling relays from claiming the same row concurrently, but it does
 not make Kafka and PostgreSQL atomic. A crash after Kafka acknowledgment and before the update still
@@ -142,7 +173,7 @@ quick-start broker running, then start PostgreSQL:
 
 ```bash
 docker run --rm --name kafka-notes-postgres \
-  -e POSTGRES_PASSWORD=postgres -p 55439:5432 -d postgres:17
+  -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:55439:5432 -d postgres:17
 until docker exec kafka-notes-postgres pg_isready -U postgres; do sleep 1; done
 ```
 
@@ -182,6 +213,43 @@ Do not add an outbox when Kafka is already the authoritative input and all outpu
 Kafka transaction. Use the smaller atomic boundary.
 
 ---
+
+## Recap
+
+- Business state and publication intent commit locally together.
+- A relay acknowledgement can precede its published marker, so duplicate publication is expected.
+- A common Kafka key preserves arrival order; relay serialization must establish business order.
+
+## Check yourself
+
+**Q: Two relays lock different rows for ord-42. Does the common key force created before paid?**
+
+<details><summary>Answer</summary>
+
+No. The faster relay can publish paid first. Serialize the aggregate sequence before publication, or use the single-relay lock protocol with ordered versions; consumer version checks can detect but not invent missing transitions.
+
+</details>
+
+**Q: The relay times out after publishing. Should reconciliation mark the row complete to avoid duplicates?**
+
+<details><summary>Answer</summary>
+
+No. The acknowledgement is uncertain. Retry with the same event ID, wait for acceptance and let consumer deduplication collapse duplicates.
+
+</details>
+
+## Try it
+
+Hold the first relay before publishing version 1, then start a second relay for version 2. Complete the expected consumer sequence.
+
+Hint: A shared routing key alone is insufficient; exercise the advisory-lock protocol.
+
+<details><summary>Worked solution</summary>
+
+The second relay waits for the first transaction. The consumer observes version 1 before version 2, possibly with duplicate version 1 after a crash. Assert identities and versions, not only row count.
+
+</details>
+
 
 **Next**: use [CDC Outbox Relay](06_cdc_outbox_relay.md) when database-log capture is justified, or
 go directly to [Testing Kafka Services](05_testing_kafka_services.md) for a polling relay.

@@ -208,7 +208,7 @@ from redis.cluster import RedisCluster
 
 r = RedisCluster(host="cluster-endpoint.example.com", port=6379)
 r.set("user:42:name", "alice")
-r.set("user:{42}:name", "alice")   # hash-tagged; guaranteed slot 42
+r.set("user:{42}:name", "alice")   # same hash slot derived from the bytes "42", not slot number 42
 ```
 
 ---
@@ -219,7 +219,7 @@ r.set("user:{42}:name", "alice")   # hash-tagged; guaranteed slot 42
 |---------|-------------------|------------------|------------|
 | Primary crash, replica up to date | Promote replica, ~5–30s client-visible outage | Same, per-shard | Accept; retry writes |
 | Primary crash, replica behind by 200ms | Promote replica, lose those 200ms of writes | Same | Durability-critical data → Postgres, not Redis |
-| Network partition — primary isolated | Sentinels on majority side promote replica; old primary keeps accepting writes until partition heals, then becomes replica and loses its writes | Same | `min-replicas-to-write` reduces window; accept that Redis is AP, not CP |
+| Network partition — primary isolated | Majority-side Sentinels can promote a replica; an old primary may accept writes until demoted unless replica/write safeguards stop it | A minority-side Cluster primary stops serving after NODE_TIMEOUT; acknowledged writes before detection can still be lost | Trace the specific topology, detection interval and replica lag; test reconciliation |
 | Sentinel quorum lost | No failover — primary stays primary even if it dies | Cluster has its own gossip-based quorum | Deploy sentinels across ≥3 failure domains |
 | Out of memory | `maxmemory-policy` kicks in — evicts or rejects writes | Same per-shard | Set `maxmemory-policy` explicitly (`allkeys-lru` for cache, `noeviction` for source-of-truth) |
 | Slow `SAVE` / `BGSAVE` fork | Latency spike during snapshot | Same | Disable RDB in cache-only mode, or use `save ""` and rely on replication |
@@ -277,7 +277,32 @@ The `SET NX PX` lock lives on **one** primary. Because replication is asynchrono
 4. Worker B acquires the "same" lock on the new primary.
 5. **Two workers now hold the lock simultaneously.**
 
-No amount of client-side cleverness fixes this — it's inherent to Redis being an AP (available, eventually-consistent) store, not a CP consensus system.
+Asynchronous replication permits this particular lost-lock history. Cluster has an additional
+minority-side timeout and availability rules; a blanket AP label does not describe both Sentinel
+and Cluster. [Cluster specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/) (checked 2026-10-30).
+
+A second failure needs no Redis outage: the lease holder can pause beyond its own expiry.
+
+```mermaid
+sequenceDiagram
+    participant A as Worker A
+    participant L as Lease service
+    participant B as Worker B
+    participant D as Protected database
+    A->>L: Acquire generation 41
+    Note over A: Paused beyond lease expiry
+    B->>L: Acquire generation 42
+    B->>D: Write with fence 42
+    D-->>B: Accepted; greatest fence now 42
+    A->>D: Resume; write with fence 41
+    D-->>A: Rejected as stale
+```
+
+Even a consensus-backed lease can expire while A pauses. Safety comes from D atomically rejecting
+A's stale generation, not from A remembering that it once acquired the lease. If D cannot enforce
+fencing, use an idempotency key, compare-and-swap or a database constraint that owns the business
+invariant. A random release token prevents deleting another lock; it is not a monotonically ordered
+fence that can reject an old write.
 
 ### RedLock — and the contested debate
 
@@ -293,7 +318,7 @@ This is one of the more famous debates in distributed systems, and you should kn
 | Lock is for… | Use |
 |--------------|-----|
 | Avoiding duplicate work / "best effort" mutual exclusion (the common case) | Single-instance `SET NX PX` + token release. Simple and good enough. |
-| Correctness — two holders would corrupt data or double-charge | Don't rely on a Redis lock alone. Use a consensus store (etcd/ZooKeeper) **or** a fencing token the resource enforces. |
+| Correctness — two holders would corrupt data or double-charge | Don't rely on a Redis lock alone. Use an atomic invariant at the protected resource; lease coordination also needs monotonic fencing or conditional version checks there. |
 
 If you only remember one rule: **a Redis lock is a performance optimization, not a safety guarantee.** Design so that two simultaneous holders are merely wasteful, not catastrophic.
 
@@ -354,3 +379,48 @@ maxmemory-policy allkeys-lru
 - [04_python_clients.md](04_python_clients.md) — `redis-py` client, Sentinel and Cluster wrappers.
 - [03_caching_patterns.md](03_caching_patterns.md) — when losing Redis is cheap vs expensive.
 - [05_rate_limiting.md](05_rate_limiting.md) — rate-limiter data is source-of-truth-ish; persistence matters.
+
+## New backup path, same recovery obligation
+
+Redis 8.10's **GA** `BACKUP` family adds node backup using multi-part AOF. This is optional migration
+context for the Redis 7 baseline, not a drop-in replacement for its shown RDB/AOF procedure.
+Inventory compatible server/tool versions, restore to an isolated node, compare application data
+and explicitly rehearse replica/Cluster topology recovery. A node archive alone does not rebuild
+cluster identity or prove the destination's allowed loss window.
+[8.10 changes](https://redis.io/docs/latest/develop/whats-new/8-10/), checked 2026-10-30.
+
+## Recap
+
+- Local persistence and replica receipt are different durability boundaries.
+- Failover behavior depends on topology, replica lag and failure detection.
+- An expired holder can resume; only protected-resource fencing rejects its old write.
+
+## Check yourself
+
+**Q: The old primary used AOF always, but failed before its replica received a write. Does the promoted replica contain it?**
+
+<details><summary>Answer</summary>
+
+No. The old disk may hold data the replica never received. State the permitted loss window and reconcile; local fsync is not replica acknowledgement.
+
+</details>
+
+**Q: A consensus lease expires during a pause. Can the old holder safely write after resuming?**
+
+<details><summary>Answer</summary>
+
+Only if the protected resource atomically rejects its stale generation or another invariant makes the duplicate safe. A trustworthy lease grant does not stop an already-running process.
+
+</details>
+
+## Try it
+
+Change the lock trace so A resumes after B writes with generation 42. Fill in D's acceptance predicate.
+
+Hint: Compare generations in the same atomic operation as the protected write.
+
+<details><summary>Worked solution</summary>
+
+D accepts only a generation at least as new as its recorded fence, so 41 is rejected after 42. A client-side check before a separate write would still race.
+
+</details>

@@ -32,6 +32,70 @@ The database row is the handoff. The API does not need a worker to be online, an
 
 ---
 
+## Run one job before studying the schema
+
+The complete [local example](../examples/durable_job/main.py) pairs a FastAPI status endpoint with a PostgreSQL polling worker. It counts words in a bounded text document; [store.py](../examples/durable_job/store.py) implements submission, claims, retries, recovery and completion. The input and result live in database tables so the first result needs no object-store account. The later SQL expands the same protocol to object references.
+
+Use Python 3.11+ and Docker Compose from the repository root. This isolated lab binds only to loopback, has one fixed demonstration tenant and uses disposable credentials. Before exposing an API, add authenticated tenant derivation and authorization from [background-work security](../operations/01_security_and_authorization.md).
+
+```bash
+cd background_work/examples/durable_job
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+docker compose -p background-job-lab up -d --wait postgres
+export DATABASE_URL=postgresql://lab:lab@127.0.0.1:56432/jobs
+.venv/bin/python main.py init
+.venv/bin/python -m pytest -q test_lifecycle.py
+```
+
+The initializer prints `schema ready`; the four tests pass. The first sends two identical HTTP requests through the actual app, verifies one job ID, runs its worker, then reads `SUCCEEDED` with `words=3`. The remaining tests race two real database connections, reject a stale token, exhaust attempts, and terminate a child process after its claim. Tests use fresh operation keys and the dedicated lab database.
+
+For an interactive run, start the API in one terminal and retain the same `DATABASE_URL` in each terminal:
+
+```bash
+.venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8086
+```
+
+In another terminal in the example directory:
+
+```bash
+curl -i http://127.0.0.1:8086/document-parses \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: parse-42' \
+  -d '{"text":"one two three"}'
+.venv/bin/python main.py once
+```
+
+The POST returns `202` and a `Location` containing the generated UUID. `GET` that exact URL: it now reports `SUCCEEDED`, `attempt=1`, `words=3`. Repeat the POST with the same key and body; its ID remains unchanged. Changing the body under `parse-42` returns `409` because an operation identity cannot silently acquire different input.
+
+Follow job-42 across the commits; the response is deliberately after the first commit.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant D as PostgreSQL
+    participant W as Worker
+    C->>A: POST parse-42, one two three
+    A->>D: Commit input and PENDING job-42
+    A-->>C: 202 and status URL
+    W->>D: Claim job-42, token A
+    D-->>W: Committed RUNNING attempt 1
+    W->>D: Token A completes words=3
+    C->>A: GET status URL
+    A->>D: Read job-42 and result
+    A-->>C: SUCCEEDED, words=3
+```
+
+Stopping the API after `202` cannot erase the committed row. Stopping the worker after its claim leaves a lease, not an owner that lasts forever. To observe that failure manually, submit a fresh key, run `main.py claim-and-exit` (intentional exit status 17), wait two seconds, then run `main.py once`. Recovery clears the expired token; attempt 2 completes the same job. The database test also proves that attempt 1 cannot later overwrite it.
+
+The example's small result commits in the same transaction as completion. An external object or payment cannot share that transaction; section 5 explains that new boundary. The schema includes an outbox for the later broker continuation, but this first worker polls jobs directly and does not depend on a publisher. Production readiness also requires backup/restore, restricted database roles, monitoring and the operational checklist below. Remove only this lab's services when finished:
+
+```bash
+docker compose -p background-job-lab down -v
+```
+
+---
+
 ## 2. One row can own submission, attempts, and result lookup
 
 Start with four states rather than a workflow-sized graph:
@@ -243,5 +307,36 @@ Do not add workflow state merely to represent worker attempts. Move to a workflo
 **Stop here if** one independent task, one status URL, bounded retry, and replay-safe output satisfy the product. Use the [System Selection Guide](../frameworks/00_system_selection.md) to validate the transport and execution choice; continue into state machines and reliability deep dives only when a specific failure or lifecycle requirement justifies them.
 
 ---
+
+## Recap and check yourself
+
+- The POST commits a job before returning its status URL, so request-process loss cannot erase the obligation.
+- A fresh attempt token and expiry let another worker recover without granting a stale worker permission to finish.
+- Retry keeps the original job and business key while attempts and elapsed-time budgets remain bounded.
+
+**A retry creates a fresh job ID but uses the same text. Which contract breaks?**
+
+<details><summary>Answer</summary>
+
+The status URL, deduplication identity and retry budget no longer describe one obligation. Reschedule the same row and issue a new attempt token.
+
+</details>
+
+**The worker dies after its claim, and the broker already discarded its message. What can still recover?**
+
+<details><summary>Answer</summary>
+
+The database retains RUNNING and lease expiry. Recovery makes the same job pending or terminal when its budget is exhausted; polling or a new outbox hint brings it to another worker.
+
+</details>
+
+**Try it:** Complete the stale-worker test scaffold: after reclaiming the same job as token B, fill `assert store.complete(old_attempt, 999) is ...` before completing B.
+
+<details><summary>Hint and worked solution</summary>
+
+Ownership changed, not the job identity. Use `False`; the stale token matches zero rows. B can then complete and the stored result must be B’s value.
+
+</details>
+
 
 **Next**: [System Selection Guide](../frameworks/00_system_selection.md)

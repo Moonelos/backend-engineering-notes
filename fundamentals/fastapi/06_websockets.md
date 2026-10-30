@@ -1,1104 +1,178 @@
-# FastAPI WebSockets
+# WebSockets in FastAPI
 
-<!-- length-justification: This is the canonical FastAPI WebSocket reference; connection lifecycle, protocol messages, authentication, rooms, heartbeats, and scaling remain together because they share one long-lived ownership boundary. -->
+> **Role:** implementation guide. Prerequisites: HTTP requests, async tasks, cancellation, and [authentication](./04_authentication.md). The [API WebSocket path](../../apis/websockets/README.md) develops protocol selection and durable recovery. This lesson owns the FastAPI connection lifetime.
 
-> **Who this is for**: FastAPI engineers implementing and operating long-lived bidirectional
-> connections.
+A notification client needs to receive updates after its initial request ends. An ordinary HTTP response completes a request; that does **not** imply closing its TCP connection, because HTTP can reuse persistent connections. A WebSocket upgrade instead establishes a long-lived bidirectional conversation with message framing. The application must now own authentication, one reader, one writer, bounded queues and cleanup for the whole conversation.
 
-> **Key insight**: A WebSocket is a long-lived bidirectional connection whose ownership and cleanup
-> outlast a normal request handler.
+## Start with the complete bounded endpoint
 
-A complete guide to WebSockets in FastAPI — from mental model to production-ready patterns.
+Use the shared [notification implementation](../../apis/examples/websocket_notifications/app.py), rather than combining disconnected manager sketches. Its tests cover a signed subscription and ping, invalid credentials, queue saturation, send timeout, and removal from the connection registry. From the repository root:
 
-For the protocol itself, application message contracts, reconnection, flow control, browser security, and distributed connection architecture, see the **[WebSocket Deep Dive](../../apis/websockets/README.md)**. This chapter focuses on FastAPI implementation patterns.
-
-> ⚠️ **`BaseHTTPMiddleware` does not run on WebSocket connections.** If you relied on `@app.middleware("http")` or any `BaseHTTPMiddleware` subclass for logging, request IDs, timing, or error normalization, none of that code executes for WebSocket endpoints — the connection uses the `"websocket"` ASGI scope, which `BaseHTTPMiddleware` explicitly skips. For cross-cutting logic that needs to apply to WebSockets too, write **pure ASGI middleware** (see [05_middleware.md §9 Custom Middleware Class (ASGI)](./05_middleware.md#9-custom-middleware-class-asgi) for the pattern), or put the logic inside a FastAPI dependency that each WebSocket endpoint uses.
-
----
-
-## 1. The Mental Model
-
-### HTTP vs WebSocket
-
-HTTP is a **request-response** protocol. The client asks, the server answers, the connection is done.
-
-WebSocket is a **persistent bidirectional** channel. Both sides can send messages at any time, for as long as the connection stays open.
-
-```
-HTTP:
-  Client ──request──>  Server
-  Client <──response── Server
-  (connection closed)
-
-WebSocket:
-  Client ──upgrade──>  Server
-  Client <──accept───  Server
-  Client <──message──> Server    ← both directions, any time
-  Client <──message──> Server
-  ...                            ← stays open indefinitely
-  Client ──close──>    Server
+```bash
+python3 -m venv /tmp/notes-ws
+/tmp/notes-ws/bin/python -m pip install fastapi==0.162.0 starlette==1.10.0 httpx==0.28.1 pytest==9.2.0 uvicorn==0.34.0 websockets==15.0.1
+/tmp/notes-ws/bin/python -m pytest -q apis/examples/websocket_notifications fundamentals/fastapi/examples/test_ws_heartbeat.py
+export WS_SESSION_SECRET="$(openssl rand -hex 32)"
+/tmp/notes-ws/bin/python -m uvicorn apis.examples.websocket_notifications.app:app --ws websockets --ws-max-size 16384 --ws-max-queue 16 --ws-ping-interval 20 --ws-ping-timeout 10 --ws-per-message-deflate false
 ```
 
-### When to Use WebSockets
+Five tests should pass. The server endpoint is `/ws/notifications`; the [API implementation lesson](../../apis/websockets/06_implementation_testing_and_operations.md) gives the browser/test-client protocol. Tests use a local signed session; a real application obtains identity from its established login/session flow and rotates keys. The endpoint is a single-process notification transport. It does not pretend that its in-memory registry or test session provides durable notification storage.
 
-| Use Case | Protocol | Why |
-|----------|----------|-----|
-| Fetch a resource | HTTP | Single request, single response |
-| Submit a form | HTTP | One-shot operation |
-| Live chat | WebSocket | Continuous bidirectional messages |
-| Real-time notifications | WebSocket | Server pushes updates as they happen |
-| Collaborative editing | WebSocket | Multiple users, real-time sync |
-| Live dashboards | WebSocket | Continuous data stream from server |
-| File upload | HTTP | One-shot, better tooling for multipart |
-| Polling every 30s | HTTP | Interval is long enough that persistent connection wastes resources |
+The chosen Uvicorn WebSocket backend enforces frame/message limits and protocol Ping/Pong handling. These options are backend-specific; test them against the exact deployed backend. The application-level size check happens after the server has assembled the message, so it is defense in depth, not the earliest memory bound. See [Uvicorn settings](https://www.uvicorn.dev/settings/) (checked 2026-10-30).
 
-**Rule of thumb**: If the server needs to push data to the client **unprompted** and **frequently**, use WebSocket. Otherwise, HTTP (or SSE) is simpler.
+## Trace one connection from admission to cleanup
 
-### The Upgrade Handshake
+Before `accept()`, the endpoint checks the browser Origin, requested `notifications.v1` subprotocol, and signed session expiry. Origin validation protects a cookie-authenticated browser boundary; it does not authenticate non-browser callers, who can choose their own Origin header. A pre-accept close becomes a rejected handshake; after acceptance a close is a WebSocket protocol message.
 
-WebSocket connections start as HTTP. The client sends an HTTP `Upgrade` request, and the server responds with `101 Switching Protocols`. After that, the connection speaks the WebSocket protocol — not HTTP.
+The accepted connection has a user ID, an outbound queue of at most 100 messages, a stop event, and a close reason. The supervisor starts exactly one reader and one writer. Every application send passes through the writer; the supervisor only sends close after the writer stops.
 
-```
-GET /ws HTTP/1.1
-Upgrade: websocket
-Connection: Upgrade
-Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
-
-HTTP/1.1 101 Switching Protocols
-Upgrade: websocket
-Connection: Upgrade
-```
-
-This matters because:
-- **No HTTP headers** after the handshake — you cannot set `Authorization` headers per message
-- **No HTTP status codes** — errors are WebSocket close frames, not 4xx/5xx
-- **Load balancers must support WebSocket** — or the upgrade fails silently
-
----
-
-## 2. FastAPI WebSocket Basics
-
-### Minimal WebSocket Endpoint
-
-```python
-from fastapi import FastAPI, WebSocket
-
-app = FastAPI()
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        data = await websocket.receive_text()
-        await websocket.send_text(f"Echo: {data}")
+```mermaid
+sequenceDiagram
+ participant C as Client usr_123
+ participant S as Connection supervisor
+ participant R as Reader
+ participant Q as Queue of 100 messages
+ participant W as Writer
+ C->>S: Origin, session, notifications.v1
+ S-->>C: Accept after validation
+ S->>R: Start one reader
+ S->>W: Start one writer
+ C->>R: notifications.subscribe m1
+ R->>Q: Enqueue subscribed acknowledgment
+ Q->>W: Next message
+ W-->>C: Send with 5 second deadline
+ Note over S: Reader exits, writer fails or stop event fires
+ S->>R: Cancel and await
+ S->>W: Cancel and await
+ S->>S: Remove connection from registry
+ S-->>C: Bounded close attempt
 ```
 
-Three mandatory steps:
-1. **Accept** the connection — `await websocket.accept()`
-2. **Receive** messages — `await websocket.receive_text()` or `receive_json()`
-3. **Send** messages — `await websocket.send_text()` or `send_json()`
+If a reader receives `WebSocketDisconnect`, the owner stops the writer. If the writer times out while sending, it sets the independent stop event, so the supervisor can cancel a reader blocked on receive. If the endpoint itself is cancelled, its `finally` still cancels and joins all owned tasks. Merely calling `task.cancel()` without awaiting it leaves cleanup and exceptions unresolved.
 
-### Send and Receive Methods
+The tests observe that the registry is empty after closing a subscription. They also give the writer a socket whose send never completes: its five-second policy is shortened in the test, the stalled send is cancelled, and close code 1013 is selected. A restart drops the registry and connections; clients must reconnect and reconstruct state from an authoritative store, as developed below.
 
-| Method | Data Type | Use For |
-|--------|-----------|---------|
-| `receive_text()` | `str` | Plain text messages |
-| `receive_bytes()` | `bytes` | Binary data (images, files) |
-| `receive_json()` | `dict`/`list` | Structured data (most common) |
-| `send_text(data)` | `str` | Plain text responses |
-| `send_bytes(data)` | `bytes` | Binary responses |
-| `send_json(data)` | `dict`/`list` | Structured responses (most common) |
+## Bound fan-out without sharing one slow client's delay
 
-### Path and Query Parameters
+A broadcast that awaits each socket send in a loop lets the slowest client hold up every later client. Starting one send task per recipient removes serial waiting but creates an unbounded task burst and still waits for the slowest task. Neither mechanism is a bounded per-client queue.
 
-WebSocket endpoints support the same parameter extraction as HTTP endpoints:
+The canonical hub takes a recipient snapshot while holding its registry lock, releases the lock, then calls `put_nowait` on each client's queue. If a queue is full, it sets that client's stop event. The close decision does not have to fit into the already-full queue. One writer per client drains messages with a send deadline.
 
-```python
-@app.websocket("/ws/{room_id}")
-async def room_socket(websocket: WebSocket, room_id: str, token: str = None):
-    # room_id from path: /ws/general
-    # token from query:  /ws/general?token=abc123
-    await websocket.accept()
-    ...
+For a room with 1,000 members, queue capacity 100 and a 2 KiB serialized message limit, retained payloads alone can approach 195 MiB before Python object overhead. Bound bytes as well as count for production variable-sized messages. A process also needs a maximum accepted connection count and admission policy; bounding each connection does not bound an unlimited number of connections.
+
+For local room membership, keep `room_id -> set[connection]`. Authorize the join against tenant membership before adding it. Snapshot `tuple(members)` before any awaited broadcast work: a disconnect may mutate the original set during an await. Removal must be idempotent because disconnect, timeout and shutdown can race. Return copies from inspection helpers instead of exposing mutable internal sets.
+
+Decide what a slow client loses. Presence/typing updates can often be coalesced to the latest state. An invoice-paid notification needs durable event identity and a recovery read. Closing with 1013 tells a client to retry; it does not preserve the dropped event.
+
+## Distinguish sending a ping from receiving its pong
+
+A successful `send_json({"type": "ping"})` proves only that the local send completed. It does not prove that the peer application replied. Browser JavaScript cannot directly send WebSocket protocol Ping frames, although the browser handles protocol Ping/Pong internally. Application heartbeats are ordinary messages and need an explicit acknowledgment contract.
+
+The runnable [Heartbeat state machine](./examples/ws_heartbeat.py) creates a unique nonce, puts its ping into the single writer queue, and waits for the single reader to observe a matching pong. Queue admission and acknowledgment share one ten-second deadline. An old pong cannot satisfy a new probe. On expiry it signals the supervisor; it does not become a second socket writer.
+
+```mermaid
+stateDiagram-v2
+ [*] --> Idle
+ Idle --> Waiting: enqueue ping nonce N and start deadline
+ Waiting --> Idle: reader observes pong N
+ Waiting --> Waiting: stale pong M ignored
+ Waiting --> Closing: queue blocked or no pong by deadline
+ Closing --> [*]: supervisor cancels and joins tasks
 ```
 
----
+A peer that reads all pings but never sends pong reaches `Closing`. The test exercises that precise condition. To integrate periodic application probes, the supervisor owns an additional heartbeat task, the reader calls `heartbeat.observe(message)` for validated pong messages, and shutdown cancels/joins that task too. The minimal notification endpoint uses the selected server's transport heartbeat; this separate primitive demonstrates stronger application-level acknowledgment without silently adding a second reader or writer.
 
-## 3. Connection Lifecycle
-
-### The Full Lifecycle
-
-Every WebSocket connection goes through these phases:
-
-```
-CONNECTING  →  OPEN  →  CLOSING  →  CLOSED
-    │             │          │
-  accept()   message loop  close() or disconnect
-```
-
-### Production-Ready Lifecycle Pattern
-
-```python
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import logging
-
-app = FastAPI()
-logger = logging.getLogger(__name__)
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    client_id = id(websocket)
-    logger.info("ws_connected", extra={"client_id": client_id})
-
-    try:
-        while True:
-            message = await websocket.receive_json()
-            response = await handle_message(message)
-            await websocket.send_json(response)
-
-    except WebSocketDisconnect:
-        logger.info("ws_disconnected", extra={"client_id": client_id})
-
-    finally:
-        # Cleanup: remove from connection managers, release resources
-        logger.info("ws_cleanup", extra={"client_id": client_id})
-```
-
-### Why `try/finally` Is Non-Negotiable
-
-Without `finally`, disconnections leak resources:
-
-```python
-# ❌ BAD: resource leak on disconnect
-@app.websocket("/ws")
-async def bad_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    manager.add(websocket)
-    while True:
-        data = await websocket.receive_text()  # raises on disconnect
-        await websocket.send_text(data)
-    # manager.remove() never called if client disconnects
-```
-
-```python
-# ✅ GOOD: cleanup always runs
-@app.websocket("/ws")
-async def good_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    manager.add(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await websocket.send_text(data)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        manager.remove(websocket)
-```
-
----
-
-## 4. JSON Messaging Protocol
-
-### Why JSON Messages Need a Protocol
-
-Raw WebSocket gives you a pipe. You need structure on top — message types, request IDs, error formats. Without this, your client and server have no shared language.
-
-### Defining a Message Protocol
-
-```python
-from pydantic import BaseModel
-from typing import Literal
-from datetime import datetime, timezone
-
-class IncomingMessage(BaseModel):
-    type: str
-    payload: dict = {}
-    request_id: str | None = None
-
-class OutgoingMessage(BaseModel):
-    type: str
-    payload: dict = {}
-    request_id: str | None = None
-    timestamp: str
-
-    @classmethod
-    def create(cls, type: str, payload: dict = {}, request_id: str | None = None):
-        return cls(
-            type=type,
-            payload=payload,
-            request_id=request_id,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-```
-
-### Message Router Pattern
-
-```python
-from pydantic import ValidationError
-
-async def handle_message(websocket: WebSocket, raw: dict) -> None:
-    try:
-        message = IncomingMessage(**raw)
-    except ValidationError as e:
-        await websocket.send_json(
-            OutgoingMessage.create(
-                type="error",
-                payload={"detail": "Invalid message format", "errors": e.errors()},
-            ).model_dump()
-        )
-        return
-
-    handler = MESSAGE_HANDLERS.get(message.type)
-    if not handler:
-        await websocket.send_json(
-            OutgoingMessage.create(
-                type="error",
-                payload={"detail": f"Unknown message type: {message.type}"},
-                request_id=message.request_id,
-            ).model_dump()
-        )
-        return
-
-    result = await handler(message.payload)
-    await websocket.send_json(
-        OutgoingMessage.create(
-            type=f"{message.type}_response",
-            payload=result,
-            request_id=message.request_id,
-        ).model_dump()
-    )
-
-
-# Register handlers
-async def handle_chat(payload: dict) -> dict:
-    text = payload.get("text", "")
-    return {"reply": f"You said: {text}"}
-
-async def handle_subscribe(payload: dict) -> dict:
-    channel = payload.get("channel", "default")
-    return {"subscribed": channel}
-
-MESSAGE_HANDLERS = {
-    "chat": handle_chat,
-    "subscribe": handle_subscribe,
-}
-```
-
-### Example Message Flow
-
-```json
-// Client sends:
-{"type": "chat", "payload": {"text": "hello"}, "request_id": "abc-123"}
-
-// Server responds:
-{"type": "chat_response", "payload": {"reply": "You said: hello"}, "request_id": "abc-123", "timestamp": "2024-01-15T10:30:00"}
-
-// Client sends unknown type:
-{"type": "unknown_thing", "payload": {}}
-
-// Server responds:
-{"type": "error", "payload": {"detail": "Unknown message type: unknown_thing"}, "request_id": null, "timestamp": "2024-01-15T10:30:01"}
-```
-
----
-
-## 5. Connection Manager Pattern
-
-### Why You Need One
-
-In a real application, you need to:
-- Track who is connected
-- Broadcast messages to all clients
-- Send messages to specific rooms/channels
-- Clean up when clients disconnect
-
-A connection manager centralizes this logic.
-
-### Basic Connection Manager
-
-```python
-from fastapi import WebSocket
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-class ConnectionManager:
-    def __init__(self):
-        self._connections: dict[str, WebSocket] = {}
-
-    async def connect(self, client_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
-        self._connections[client_id] = websocket
-        logger.info("client_connected", extra={
-            "client_id": client_id,
-            "total_connections": len(self._connections),
-        })
-
-    def disconnect(self, client_id: str) -> None:
-        self._connections.pop(client_id, None)
-        logger.info("client_disconnected", extra={
-            "client_id": client_id,
-            "total_connections": len(self._connections),
-        })
-
-    async def send_to(self, client_id: str, message: dict) -> None:
-        websocket = self._connections.get(client_id)
-        if websocket:
-            await websocket.send_json(message)
-
-    async def broadcast(self, message: dict, exclude: str | None = None) -> None:
-        dead_connections = []
-        for client_id, websocket in self._connections.items():
-            if client_id == exclude:
-                continue
-            try:
-                await websocket.send_json(message)
-            except Exception:
-                dead_connections.append(client_id)
-
-        for client_id in dead_connections:
-            self.disconnect(client_id)
-
-
-manager = ConnectionManager()
-```
-
-### Room-Based Connection Manager
-
-```python
-from collections import defaultdict
-
-
-class RoomManager:
-    def __init__(self):
-        self._connections: dict[str, WebSocket] = {}
-        self._rooms: dict[str, set[str]] = defaultdict(set)
-
-    async def connect(self, client_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
-        self._connections[client_id] = websocket
-
-    def disconnect(self, client_id: str) -> None:
-        self._connections.pop(client_id, None)
-        # Remove from all rooms
-        for room_members in self._rooms.values():
-            room_members.discard(client_id)
-        # Clean up empty rooms
-        empty_rooms = [r for r, members in self._rooms.items() if not members]
-        for room in empty_rooms:
-            del self._rooms[room]
-
-    def join_room(self, client_id: str, room: str) -> None:
-        self._rooms[room].add(client_id)
-
-    def leave_room(self, client_id: str, room: str) -> None:
-        self._rooms[room].discard(client_id)
-
-    async def broadcast_to_room(
-        self, room: str, message: dict, exclude: str | None = None
-    ) -> None:
-        members = self._rooms.get(room, set())
-        dead = []
-        for client_id in members:
-            if client_id == exclude:
-                continue
-            websocket = self._connections.get(client_id)
-            if websocket:
-                try:
-                    await websocket.send_json(message)
-                except Exception:
-                    dead.append(client_id)
-
-        for client_id in dead:
-            self.disconnect(client_id)
-
-    def get_room_members(self, room: str) -> set[str]:
-        return self._rooms.get(room, set()).copy()
-
-    def get_rooms_for_client(self, client_id: str) -> list[str]:
-        return [r for r, members in self._rooms.items() if client_id in members]
-
-
-room_manager = RoomManager()
-```
-
-### Using the Room Manager
-
-```python
-@app.websocket("/ws/chat/{room_id}")
-async def chat_endpoint(websocket: WebSocket, room_id: str):
-    client_id = str(id(websocket))
-
-    await room_manager.connect(client_id, websocket)
-    room_manager.join_room(client_id, room_id)
-
-    try:
-        await room_manager.broadcast_to_room(
-            room_id,
-            {"type": "system", "payload": {"text": f"{client_id} joined"}},
-            exclude=client_id,
-        )
-
-        while True:
-            data = await websocket.receive_json()
-            await room_manager.broadcast_to_room(
-                room_id,
-                {"type": "chat", "payload": {"sender": client_id, "text": data["text"]}},
-            )
-
-    except WebSocketDisconnect:
-        room_manager.disconnect(client_id)
-        await room_manager.broadcast_to_room(
-            room_id,
-            {"type": "system", "payload": {"text": f"{client_id} left"}},
-        )
-
-    finally:
-        room_manager.disconnect(client_id)
-```
-
----
-
-## 6. Authentication
-
-### The WebSocket Auth Problem
-
-HTTP endpoints authenticate via headers:
-
-```
-GET /api/data HTTP/1.1
-Authorization: Bearer eyJhb...
-```
-
-WebSocket connections **cannot set custom headers** from browser JavaScript. The `WebSocket()` constructor does not accept an `Authorization` header. This is a browser limitation, not a protocol one.
-
-### Authentication Strategies
-
-| Strategy | How | Pros | Cons |
-|----------|-----|------|------|
-| Query parameter | `ws://host/ws?ticket=xxx` | Works in browsers | Use only a short-lived, one-time ticket; never a bearer JWT |
-| First message | Connect, then send `{"type": "auth", "token": "xxx"}` | Token not in URL | Window between connect and auth |
-| Cookie | Browser sends cookie automatically | Transparent | Requires cookie-based auth |
-| Ticket/one-time token | HTTP endpoint issues short-lived ticket, WS uses it | Secure, token expires | Extra HTTP round trip |
-
-### Bearer JWTs do not belong in the WebSocket URL
-
-URLs routinely appear in access logs, browser history, error telemetry, and proxy traces. A bearer
-JWT in `?token=` turns every one of those systems into a credential store. Exchange the fully
-validated HTTP credential—signature, pinned algorithm, expiry, issuer, audience, and token
-kind—for the one-time ticket below, or use a `Secure`, `HttpOnly` session cookie with origin and
-Cross-Site Request Forgery protections.
-
-### Ticket-Based Authentication (Production)
-
-More secure — the token never appears in WebSocket URLs or logs.
-
-```python
-import secrets
-from datetime import datetime, timedelta, timezone
-from fastapi import HTTPException
-
-# In-memory ticket store (use Redis in production)
-_tickets: dict[str, dict] = {}
-
-@app.post("/ws/ticket")
-async def create_ws_ticket(user: dict = Depends(get_current_user)):
-    """HTTP endpoint: exchange auth token for a short-lived WS ticket."""
-    ticket = secrets.token_urlsafe(32)
-    _tickets[ticket] = {
-        "user": user,
-        "expires": datetime.now(timezone.utc) + timedelta(seconds=30),
-    }
-    return {"ticket": ticket}
-
-
-async def validate_ticket(websocket: WebSocket) -> dict:
-    ticket = websocket.query_params.get("ticket")
-    if not ticket or ticket not in _tickets:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
-
-    entry = _tickets.pop(ticket)  # one-time use
-
-    if datetime.now(timezone.utc) > entry["expires"]:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
-
-    return entry["user"]
-
-
-@app.websocket("/ws")
-async def secure_endpoint(websocket: WebSocket):
-    user = await validate_ticket(websocket)
-    await websocket.accept()
-    ...
-```
-
-**Client-side flow:**
+Browser-side application reply, for the nonce protocol:
 
 ```javascript
-// Step 1: Get ticket via authenticated HTTP call
-const resp = await fetch("/ws/ticket", {
-    method: "POST",
-    headers: { "Authorization": "Bearer eyJhb..." },
-});
-const { ticket } = await resp.json();
-
-// Step 2: Connect WebSocket with ticket (short-lived, one-time)
-const ws = new WebSocket(`ws://localhost:8000/ws?ticket=${ticket}`);
-```
-
----
-
-## 7. Heartbeat / Ping-Pong
-
-### The Dead Connection Problem
-
-TCP connections can die silently:
-- Client loses network (laptop lid closed, WiFi drop)
-- NAT/firewall timeout (varies widely — home routers are often in the 30-60s range for UDP but much longer for established TCP; corporate firewalls and cloud NAT gateways can idle-time-out TCP at 350s+, and some hit you at ~2 minutes. Treat any specific number as "measure your path" guidance, not a standard)
-- Intermediate proxy drops the connection
-
-Without heartbeats, the server holds dead connections indefinitely — wasting memory and corrupting connection counts.
-
-### Application-Level Heartbeat
-
-The WebSocket protocol has built-in ping/pong frames, but not all proxies forward them reliably. Application-level heartbeats are more predictable.
-
-```python
-import asyncio
-from fastapi import WebSocket, WebSocketDisconnect
-
-HEARTBEAT_INTERVAL = 30  # seconds
-HEARTBEAT_TIMEOUT = 10   # seconds to wait for pong
-
-
-async def heartbeat_loop(websocket: WebSocket, stop_event: asyncio.Event):
-    """Send periodic pings, detect dead connections."""
-    try:
-        while not stop_event.is_set():
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            if stop_event.is_set():
-                break
-            try:
-                await asyncio.wait_for(
-                    websocket.send_json({"type": "ping"}),
-                    timeout=HEARTBEAT_TIMEOUT,
-                )
-            except (asyncio.TimeoutError, Exception):
-                logger.warning("heartbeat_failed, closing connection")
-                await websocket.close()
-                break
-    except asyncio.CancelledError:
-        pass
-
-
-@app.websocket("/ws")
-async def endpoint_with_heartbeat(websocket: WebSocket):
-    await websocket.accept()
-    stop_event = asyncio.Event()
-    heartbeat_task = asyncio.create_task(heartbeat_loop(websocket, stop_event))
-
-    try:
-        while True:
-            message = await websocket.receive_json()
-            if message.get("type") == "pong":
-                continue  # heartbeat response, ignore
-            await handle_message(websocket, message)
-
-    except WebSocketDisconnect:
-        pass
-
-    finally:
-        stop_event.set()
-        heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
-```
-
-### Client-Side Heartbeat Handling
-
-```javascript
-ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.type === "ping") {
-        ws.send(JSON.stringify({ type: "pong" }));
+socket.onmessage = ({data}) => {
+    const message = JSON.parse(data);
+    if (message.type === 'ping') {
+        socket.send(JSON.stringify({type: 'pong', nonce: message.nonce}));
         return;
     }
-    // handle other messages...
+    // Validate and dispatch other application messages here.
 };
 ```
 
-### Heartbeat Configuration Guidelines
+Heartbeat interval plus reply deadline must fit inside the proxy's idle policy with margin. Heartbeats do not eliminate an absolute connection lifetime limit. Reauthenticate or expire long sessions according to policy; validating a token once does not keep it valid forever.
 
-| Environment | Interval | Timeout | Rationale |
-|-------------|----------|---------|-----------|
-| Internal network | 30s | 10s | Low latency, detect fast |
-| Public internet | 25s | 15s | Stay under common 30s NAT timeouts |
-| Mobile clients | 20s | 15s | Unreliable networks |
-| Long-running tasks | 15s | 10s | Need fast failure detection |
+## Scale the same ownership model across processes
 
----
+An established upgraded connection already stays on its selected backend. Load-balancer sticky sessions across *new connections* are a separate choice, not a WebSocket requirement. A reconnect may land on another process. Prefer shared authoritative state and cursor-based recovery when that must work.
 
-## 8. Error Handling
+The following topology has two process-local registries and a shared durable notification log:
 
-### WebSocket Close Codes
-
-WebSocket has its own set of status codes (not HTTP codes):
-
-| Code | Name | Meaning |
-|------|------|---------|
-| 1000 | Normal Closure | Clean shutdown |
-| 1001 | Going Away | Server shutting down, client navigating away |
-| 1003 | Unsupported Data | Received data type server cannot handle |
-| 1008 | Policy Violation | Auth failure, forbidden action |
-| 1011 | Internal Error | Server encountered an unexpected condition |
-| 1012 | Service Restart | Server is restarting, client should reconnect |
-
-### Comprehensive Error Handling Pattern
-
-```python
-from starlette.websockets import WebSocketState
-
-@app.websocket("/ws")
-async def robust_endpoint(websocket: WebSocket):
-    try:
-        await websocket.accept()
-    except Exception:
-        logger.error("ws_accept_failed")
-        return
-
-    try:
-        while True:
-            try:
-                raw = await websocket.receive_json()
-            except ValueError:
-                # Client sent non-JSON data
-                await websocket.send_json({
-                    "type": "error",
-                    "payload": {"detail": "Invalid JSON"},
-                })
-                continue
-
-            try:
-                result = await process_message(raw)
-                await websocket.send_json(result)
-            except BusinessLogicError as e:
-                await websocket.send_json({
-                    "type": "error",
-                    "payload": {"detail": str(e)},
-                })
-            except Exception:
-                logger.exception("unhandled_error_in_message_handler")
-                await websocket.send_json({
-                    "type": "error",
-                    "payload": {"detail": "Internal server error"},
-                })
-
-    except WebSocketDisconnect:
-        logger.info("client_disconnected")
-
-    except Exception:
-        logger.exception("ws_unexpected_error")
-        if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.close(code=1011)
-
-    finally:
-        # Always clean up, regardless of how we got here
-        await cleanup_resources(websocket)
+```mermaid
+flowchart LR
+ L[Durable notification log and current snapshot] --> P[Publication signal]
+ P --> G1[Gateway 1 local registry]
+ P --> G2[Gateway 2 local registry]
+ G1 --> A[Client A cursor 43]
+ G2 --> B[Client B cursor 18]
+ A -->|Reconnect to gateway 2 after restart| G2
+ G2 -->|Authorized replay after cursor 43| L
 ```
 
-### Key Error Handling Rules
+Redis Pub/Sub can carry the publication signal, but disconnected subscribers miss messages. Persist the business event before signaling, make clients apply event IDs idempotently, and recover by querying after their last applied cursor. If retention no longer covers the cursor, send an explicit resync requirement and load a snapshot. Never infer durable delivery from successful `publish()` or socket send.
 
-**Do not let a single bad message kill the connection:**
+A gateway's Redis listener belongs to lifespan: retain its task handle, surface unexpected listener termination as degraded readiness, cancel and await the task at shutdown, then unsubscribe and close Pub/Sub and the client. An unreferenced `asyncio.create_task(listener())` can die while HTTP health remains green. The [distributed architecture lesson](../../apis/websockets/05_scaling_and_distributed_architecture.md) develops directory generations, replay ordering, cross-region choices and why a full broadcast mesh multiplies traffic.
 
-```python
-# ❌ BAD: one bad message kills the whole connection
-while True:
-    data = await websocket.receive_json()
-    result = might_throw(data)  # unhandled exception = connection dead
-    await websocket.send_json(result)
-```
-
-```python
-# ✅ GOOD: errors are handled per-message, connection survives
-while True:
-    data = await websocket.receive_json()
-    try:
-        result = might_throw(data)
-        await websocket.send_json(result)
-    except Exception as e:
-        await websocket.send_json({"type": "error", "payload": {"detail": str(e)}})
-```
-
-**Always check connection state before sending:**
-
-```python
-# ❌ BAD: sending to a possibly-closed connection
-async def broadcast(self, message: dict):
-    for ws in self._connections.values():
-        await ws.send_json(message)  # crashes if ws is closed
-```
-
-```python
-# ✅ GOOD: handle send failures gracefully
-async def broadcast(self, message: dict):
-    dead = []
-    for client_id, ws in self._connections.items():
-        try:
-            await ws.send_json(message)
-        except Exception:
-            dead.append(client_id)
-    for client_id in dead:
-        self.disconnect(client_id)
-```
-
----
-
-## 9. Scaling Considerations
-
-### The Statefulness Problem
-
-HTTP is stateless — any server can handle any request. WebSocket connections are **stateful** — the connection lives on a specific server process.
-
-```
-HTTP (stateless):
-  Client A ──req──> [Load Balancer] ──> Server 1   ← any server works
-  Client A ──req──> [Load Balancer] ──> Server 2   ← different server, fine
-
-WebSocket (stateful):
-  Client A ══ws══> [Load Balancer] ══> Server 1    ← must stay on Server 1
-  Client B ══ws══> [Load Balancer] ══> Server 2    ← must stay on Server 2
-```
-
-This creates three problems:
-1. **Sticky sessions**: The load balancer must route the WebSocket connection to the same backend for its entire lifetime
-2. **Cross-server messaging**: If Client A (on Server 1) wants to message Client B (on Server 2), the message must traverse servers
-3. **Uneven load**: Long-lived connections cause uneven distribution
-
-### Single-Server Architecture (Sufficient for Many Apps)
-
-If you have one server process, the `ConnectionManager` from Section 5 works directly. All connections are in-process.
-
-**This is fine when:**
-- You have fewer than ~10,000 concurrent connections
-- You run a single process (or one Uvicorn worker)
-- You do not need horizontal scaling
-
-### Multi-Server with Redis Pub/Sub
-
-For multiple server processes or pods, use Redis as a message bus between them.
-
-```
-┌────────────┐     ┌────────────┐     ┌────────────┐
-│  Server 1  │     │   Redis    │     │  Server 2  │
-│            │────>│  Pub/Sub   │<────│            │
-│ Client A   │<────│            │────>│ Client B   │
-│ Client C   │     │            │     │ Client D   │
-└────────────┘     └────────────┘     └────────────┘
-```
-
-```python
-import redis.asyncio as redis
-import json
-import asyncio
-
-REDIS_URL = "redis://localhost:6379"
-
-
-class RedisConnectionManager:
-    def __init__(self):
-        self._connections: dict[str, WebSocket] = {}
-        self._redis: redis.Redis | None = None
-        self._pubsub: redis.client.PubSub | None = None
-
-    async def startup(self):
-        self._redis = redis.from_url(REDIS_URL)
-        self._pubsub = self._redis.pubsub()
-        await self._pubsub.subscribe("ws:broadcast")
-        asyncio.create_task(self._listen_redis())
-
-    async def shutdown(self):
-        if self._pubsub:
-            await self._pubsub.unsubscribe("ws:broadcast")
-            await self._pubsub.close()
-        if self._redis:
-            await self._redis.close()
-
-    async def _listen_redis(self):
-        """Listen for messages from other server instances."""
-        async for message in self._pubsub.listen():
-            if message["type"] != "message":
-                continue
-            data = json.loads(message["data"])
-            # Deliver to local connections only
-            await self._deliver_local(data["payload"], exclude=data.get("exclude"))
-
-    async def _deliver_local(self, payload: dict, exclude: str | None = None):
-        dead = []
-        for client_id, ws in self._connections.items():
-            if client_id == exclude:
-                continue
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(client_id)
-        for client_id in dead:
-            self._connections.pop(client_id, None)
-
-    async def connect(self, client_id: str, websocket: WebSocket):
-        await websocket.accept()
-        self._connections[client_id] = websocket
-
-    def disconnect(self, client_id: str):
-        self._connections.pop(client_id, None)
-
-    async def broadcast(self, message: dict, exclude: str | None = None):
-        """Publish to Redis so ALL server instances deliver the message."""
-        await self._redis.publish(
-            "ws:broadcast",
-            json.dumps({"payload": message, "exclude": exclude}),
-        )
-
-
-redis_manager = RedisConnectionManager()
-```
-
-### Wiring Into FastAPI Lifespan
-
-```python
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await redis_manager.startup()
-    yield
-    await redis_manager.shutdown()
-
-app = FastAPI(lifespan=lifespan)
-```
-
-### Load Balancer Configuration
-
-Your load balancer must:
-1. **Support WebSocket upgrade** (most do: Nginx, HAProxy, AWS ALB)
-2. **Use sticky sessions** (or IP hash) for WebSocket routes
-3. **Set appropriate timeouts** (WebSocket idle timeout > your heartbeat interval)
-
-Nginx example:
+A WebSocket-capable reverse proxy forwards the upgrade and sets idle timeouts deliberately. This Nginx location is a configuration excerpt inside a configured server; it needs no `ip_hash` for an already-upgraded connection:
 
 ```nginx
-upstream backend {
-    ip_hash;  # sticky sessions
-    server app1:8000;
-    server app2:8000;
-}
-
-location /ws {
-    proxy_pass http://backend;
+location /ws/ {
+    proxy_pass http://notifications_backend;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
-    proxy_read_timeout 86400s;  # 24h — let heartbeats handle dead connections
-    proxy_send_timeout 86400s;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
 }
 ```
 
----
+## Diagnose and operate the service
 
-## 10. Common Mistakes
+| Symptom | Evidence to inspect | Action |
+|---|---|---|
+| One user lags, other users healthy | That connection's queued bytes, send duration, cursor lag | Disconnect/coalesce by policy; recover durable state |
+| All connections on one pod stop updating | Broker listener state and publication lag | Mark degraded, restart owned listener safely, reconcile missed events |
+| Reconnect succeeds but updates disappear | Cursor persistence and replay retention | Repair replay/snapshot contract; affinity alone cannot restore a dead process |
+| Memory grows while connection count stays flat | Queue bytes and inbound decompression/message limits | Enforce byte budgets and server ingress limits |
+| Shutdown hangs | Reader/writer/listener task stacks and close deadlines | Cancel, join and bound close; test with a stalled send |
 
-### Forgetting to Accept
+During rollout, stop new admissions, allow a bounded drain, then close remaining clients with a retry policy. Clients reconnect with jitter to avoid a connection/authentication storm. Check that the new version can read old protocol messages/cursors before switching traffic; retain compatibility for the longest supported reconnect window. Separate live connection gauges, authentication failures, close reasons, queue occupancy, send latency, missed heartbeat counts and replay lag. Avoid per-user metric labels.
 
-```python
-# ❌ BAD: sends before accepting — runtime error
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.send_text("hello")  # Error: connection not accepted
-```
+Production checklist:
 
-```python
-# ✅ GOOD: always accept first
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    await websocket.send_text("hello")
-```
+- [ ] Origin and identity validated before acceptance; authorization per action/room.
+- [ ] Message schema, protocol version, server byte limits and connection admission configured.
+- [ ] One reader/writer; bounded per-client count and byte queues; explicit overload policy.
+- [ ] Heartbeat observes the intended kind of reply; all tasks cancelled and joined.
+- [ ] Durable events recover through cursor replay or snapshot after restart.
+- [ ] Broker listener failures affect health; shutdown and rollout are bounded.
+- [ ] Load tests include slow readers, malformed input, reconnect storms and one failed gateway.
 
-### Not Handling Disconnect
+## Recap and practice
 
-```python
-# ❌ BAD: unhandled WebSocketDisconnect crashes the handler
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        data = await websocket.receive_text()  # raises when client leaves
-        await websocket.send_text(data)
-```
+- The supervisor owns every task from acceptance through disconnect; the registry is only a local routing index.
+- Queue bounds isolate slow clients, but need a defined loss/recovery policy.
+- A send completion, matching application pong and durable application acknowledgment prove different things.
 
-```python
-# ✅ GOOD: catch disconnect, clean up
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await websocket.send_text(data)
-    except WebSocketDisconnect:
-        pass
-```
+**Prediction:** The peer receives ping N but never replies. A send-only timeout succeeds. Is the peer healthy?
 
-### Blocking the Event Loop
+<details><summary>Answer</summary>
+Not according to an application acknowledgment contract. The matching-pong deadline must expire and signal closure; timing only send cannot establish that the peer application processed the ping.
+</details>
 
-```python
-# ❌ BAD: CPU-bound work blocks ALL other WebSocket connections
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        data = await websocket.receive_json()
-        result = heavy_computation(data)  # blocks the event loop
-        await websocket.send_json(result)
-```
+**Diagnosis:** A client reconnects to a different pod after a restart. Does enabling sticky sessions restore its missing events?
 
-```python
-# ✅ GOOD: offload CPU-bound work to a thread pool
-import asyncio
+<details><summary>Answer</summary>
+No. The original process may be gone, and affinity does not create durable state. Use an authorized replay cursor or snapshot. Existing upgraded connections already stay on their chosen backend.
+</details>
 
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    while True:
-        data = await websocket.receive_json()
-        result = await asyncio.to_thread(heavy_computation, data)
-        await websocket.send_json(result)
-```
+**Try it:** Extend `test_ws_heartbeat.py` to cancel a probe while it is waiting for a pong. Scaffold: start `probe`, consume its queued ping, call `task.cancel()`, then fill in the expected exception and pending-state assertion. Hint: the primitive's `finally` clears the nonce, while its supervisor owns socket cleanup.
 
-### Using `id(websocket)` as a Stable Client ID
-
-```python
-# ❌ BAD: id() is only unique for the object's lifetime, not globally unique
-client_id = str(id(websocket))
-```
-
-```python
-# ✅ GOOD: use a proper unique identifier
-import uuid
-client_id = str(uuid.uuid4())
-```
-
-### No Backpressure on Broadcast
-
-```python
-# ❌ BAD: slow client blocks broadcast to all other clients
-async def broadcast(self, message: dict):
-    for ws in self._connections.values():
-        await ws.send_json(message)  # if one client is slow, everyone waits
-```
-
-```python
-# ✅ GOOD: per-client send queues with timeout
-async def broadcast(self, message: dict):
-    async def _send(client_id: str, ws: WebSocket):
-        try:
-            await asyncio.wait_for(ws.send_json(message), timeout=5.0)
-        except (asyncio.TimeoutError, Exception):
-            self.disconnect(client_id)
-
-    await asyncio.gather(
-        *[_send(cid, ws) for cid, ws in self._connections.items()]
-    )
-```
-
-### Not Cleaning Up Background Tasks
-
-```python
-# ❌ BAD: heartbeat task leaks after disconnect
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    asyncio.create_task(heartbeat_loop(websocket))  # who cancels this?
-    while True:
-        data = await websocket.receive_json()
-```
-
-```python
-# ✅ GOOD: cancel background tasks on disconnect
-@app.websocket("/ws")
-async def endpoint(websocket: WebSocket):
-    await websocket.accept()
-    heartbeat = asyncio.create_task(heartbeat_loop(websocket))
-    try:
-        while True:
-            data = await websocket.receive_json()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        heartbeat.cancel()
-        try:
-            await heartbeat
-        except asyncio.CancelledError:
-            pass
-```
-
----
-
-## Quick Reference
-
-### Minimal Production Endpoint
-
-```python
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import asyncio
-import uuid
-import logging
-
-app = FastAPI()
-logger = logging.getLogger(__name__)
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    client_id = str(uuid.uuid4())
-    await manager.connect(client_id, websocket)
-
-    try:
-        while True:
-            raw = await websocket.receive_json()
-            try:
-                result = await handle_message(raw)
-                await websocket.send_json(result)
-            except Exception as e:
-                logger.exception("message_handler_error")
-                await websocket.send_json({
-                    "type": "error",
-                    "payload": {"detail": "Internal error"},
-                })
-
-    except WebSocketDisconnect:
-        logger.info("disconnected", extra={"client_id": client_id})
-
-    finally:
-        manager.disconnect(client_id)
-```
-
-### Checklist
-
-Before shipping WebSocket endpoints to production:
-
-- [ ] `await websocket.accept()` is called before any send/receive
-- [ ] `WebSocketDisconnect` is caught
-- [ ] `try/finally` ensures cleanup (connection manager, background tasks)
-- [ ] CPU-bound work is offloaded with `asyncio.to_thread()`
-- [ ] Heartbeats are implemented for idle connection detection
-- [ ] Authentication happens **before** `accept()` or **immediately after**
-- [ ] Broadcast handles slow/dead clients without blocking others
-- [ ] Background tasks are cancelled on disconnect
-- [ ] Load balancer is configured for WebSocket upgrade and sticky sessions
-- [ ] If multi-pod: Redis pub/sub (or similar) bridges cross-server messages
+<details><summary>Solution</summary>
+Await the task and assert `asyncio.CancelledError`, then assert `heartbeat.pending is None`. Do not swallow cancellation and start another probe. In the endpoint, cancel/join the reader and writer before attempting close; otherwise the new close can race an active send.
+</details>

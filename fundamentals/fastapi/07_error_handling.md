@@ -122,7 +122,8 @@ class UserService:
         return user
 ```
 
-This makes your service untestable outside of FastAPI and leaks transport concerns into business logic.
+The service remains unit-testable by asserting the exception. The cost is transport coupling:
+reuse outside HTTP must now interpret a FastAPI exception in business logic.
 
 ### Domain Exceptions
 
@@ -324,6 +325,7 @@ def _error_response(status_code: int, exc: AppException) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content=body.model_dump(),
+        headers={"WWW-Authenticate": "Bearer"} if status_code == 401 else None,
     )
 
 
@@ -458,13 +460,13 @@ FastAPI checks exception handlers from **most specific to least specific** (by c
 
 ```python
 @app.exception_handler(NotFoundError)       # checked first for NotFoundError
-async def handle_not_found(...): ...
+async def handle_not_found(request, exc): ...
 
 @app.exception_handler(AppException)        # checked for any other AppException
-async def handle_app_exception(...): ...
+async def handle_app_exception(request, exc): ...
 
 @app.exception_handler(Exception)           # fallback for everything else
-async def handle_generic(...): ...
+async def handle_generic(request, exc): ...
 ```
 
 When a `NotFoundError` is raised:
@@ -472,9 +474,29 @@ When a `NotFoundError` is raised:
 1. FastAPI checks: Is there a handler for `NotFoundError`? Yes -> use it.
 2. If not, it walks up the MRO: `AppException` -> `Exception`.
 
+A registered HTTP status handler can specialize an HTTPException; otherwise lookup follows
+the exception class hierarchy inside ExceptionMiddleware. Unhandled failures reach the
+outer ServerErrorMiddleware (including the special generic Exception/500 handler). A custom
+middleware outside the handled-exception layer must return its own intended response or let
+the error propagate. A broad `try/except` in a route can intercept the exception before any
+of those lookups. Registration order does not change these boundaries.
+
+```mermaid
+flowchart LR
+ S[ServerErrorMiddleware] --> U[User middleware]
+ U --> E[ExceptionMiddleware]
+ E --> R[Route and dependencies]
+ R -. handled exception by class or HTTP status .-> E
+ E -. unhandled failure .-> S
+ R -. after response.start .-> A[Log and abort; no replacement response]
+```
+
+The same exception raised before and after response start has different response options.
+Before start a handler can select a status/body; after start it cannot emit a second status.
+
 ### The Rule
 
-> **Register specific handlers before general ones. More specific exception types get priority.**
+> **Handler class lookup chooses the most specific registered type; registration order does not make a generic handler shadow it.**
 
 ### Practical Setup
 
@@ -506,12 +528,12 @@ async def unhandled_handler(request: Request, exc: Exception):
 ### Common Pitfall
 
 ```python
-# ❌ This handler catches everything — specific handlers never fire
+# Registration order does not prevent a later specific handler from matching.
 @app.exception_handler(Exception)
 async def catch_all(request, exc):
     return JSONResponse(status_code=500, content={"error": "fail"})
 
-@app.exception_handler(NotFoundError)  # Never reached if Exception catches first
+@app.exception_handler(NotFoundError)  # Selected for NotFoundError
 async def handle_not_found(request, exc):
     ...
 ```
@@ -570,7 +592,7 @@ async def app_exception_handler(request: Request, exc: AppException):
         status_code=status_code,
         path=request.url.path,
         method=request.method,
-        query_params=str(request.query_params),
+        query_keys=sorted(set(request.query_params.keys()))[:20],  # Values may contain credentials.
         client_ip=request.client.host if request.client else None,
         request_id=request.headers.get("X-Request-ID"),
     )
@@ -818,6 +840,7 @@ async def app_exception_handler(request: Request, exc: AppException):
     return _build_response(
         status_code, exc.code, exc.message,
         details=getattr(exc, "details", None),
+        headers={"WWW-Authenticate": "Bearer"} if status_code == 401 else None,
     )
 
 
@@ -972,12 +995,12 @@ FastAPI's `HTTPException` extends Starlette's, but middleware and other Starlett
 # ❌ Only handles FastAPI's HTTPException
 from fastapi import HTTPException
 @app.exception_handler(HTTPException)
-async def handler(...): ...
+async def handler(request, exc): ...
 
 # ✅ Handle both
 from starlette.exceptions import HTTPException as StarletteHTTPException
 @app.exception_handler(StarletteHTTPException)
-async def handler(...): ...
+async def handler(request, exc): ...
 ```
 
 ### Using String Error Codes Instead of Enums
@@ -1000,10 +1023,10 @@ class ErrorCode:
 ### Forgetting to Handle Background Task Errors
 
 ```python
-# ❌ Exception in background task is silently swallowed
+# A post-response failure propagates server-side; it cannot replace the sent response.
 @app.post("/send-email")
 async def send_email(bg: BackgroundTasks):
-    bg.add_task(send_notification)  # If this throws, nobody knows
+    bg.add_task(send_notification)  # Failure is logged/propagated server-side; later tasks stop.
     return {"status": "queued"}
 ```
 
@@ -1065,3 +1088,28 @@ Client Response (consistent JSON shape)
 ---
 
 **Next**: Explore middleware patterns for request ID injection and error correlation across services.
+
+## Check your understanding
+
+Exception lookup follows status/type rules and class hierarchy within its middleware boundary. A sent response cannot be replaced.
+
+**Prediction:** Register Exception first, NotFoundError second, then raise NotFoundError inside the endpoint. Which wins?
+
+<details><summary>Answer</summary>
+The specific registered type. Registration order does not make the general Exception handler shadow subclass handlers; an explicit broad try/except can intercept before that lookup.
+</details>
+
+**Diagnosis:** A response background task raises. Does the client receive the error handler's 500?
+
+<details><summary>Answer</summary>
+No. The response is already sent. The exception remains observable server-side, and later sequential callbacks do not run.
+</details>
+
+
+**Try it:** Extend [test_runtime_contracts.py](./examples/test_runtime_contracts.py) with middleware that raises before calling the endpoint. Leave the expected handler/status assertion blank, then add a streaming failure after the first body and count response.start messages.
+
+Hint: User middleware sits outside ExceptionMiddleware; a completed response start is irreversible.
+
+<details><summary>Solution</summary>
+The ordinary endpoint-specific handler cannot catch that outer middleware error; ServerErrorMiddleware supplies the generic 500 before start. For the post-start failure, assert exactly one response.start, observable exception propagation and resource cleanup, not a replacement 500. Compare the executable streaming_mechanics test for the raw ASGI harness.
+</details>

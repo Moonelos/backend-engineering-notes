@@ -32,6 +32,11 @@ guide or if the maintenance window cannot tolerate a broker rollback.
 
 ## Upgrade one broker, then earn the next restart
 
+Inventory dedicated controllers as well as brokers. Roll controllers one at a time according to
+the KRaft procedure for the exact source/target pair, preserving a majority and verifying leader,
+commit/apply lag and supported feature levels after each restart. Do not finalize metadata while
+an old dedicated controller remains. The broker loop below is the data-plane half of that plan.
+
 For each broker, one at a time:
 
 1. Prefer a broker without critical partition leaders or move leadership according to the platform
@@ -54,7 +59,7 @@ config while the metadata feature remains old. Roll back one broker at a time th
 health gates. If new application features already depend on 4.3 behavior, roll those applications
 back before brokers; binary compatibility does not make an application dependency disappear.
 
-When every broker runs 4.3 and the full observation window passes, inspect state again and make the
+When every broker and dedicated controller runs 4.3 and the full observation window passes, inspect state again and make the
 cutoff a separate approved change:
 
 ```bash
@@ -200,3 +205,14 @@ Do not self-host when no team owns 24/7 storage, quorum, upgrade, certificate, a
 ---
 
 **Next**: [Configuration and Topic Administration](05_configuration_and_topic_administration.md)
+
+## Patch and storage-format migration context
+
+Checked 2026-10-30: the 4.3.2 patch repairs retention-related loss cases; test old retained records
+through a broker restart and leader election before accepting it. See the
+[patch release](https://kafka.apache.org/blog/2026/10/23/apache-kafka-4.3.2-release-announcement/).
+For 4.4, a storage directory formatted by a newer `kafka-storage` tool requires an equal-or-newer
+broker even when an older `--release-version` was selected. Preserve the formatting tool version
+in deployment artifacts; do not test rollback by attaching an old binary to a newly formatted
+volume. Share-group DLQ adoption separately changes `share.version` and needs its own rollback
+review. [4.4 changes](https://kafka.apache.org/blog/2026/10/22/apache-kafka-4.4.0-release-announcement/).

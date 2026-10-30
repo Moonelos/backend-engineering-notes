@@ -7,6 +7,47 @@
 
 ---
 
+## Run the bounded notification channel
+
+From the repository root, use the supplied complete files:
+
+```bash
+python -m venv /tmp/notes-websocket-env
+source /tmp/notes-websocket-env/bin/activate
+python -m pip install 'fastapi==0.162.0' 'starlette==1.10.0' 'httpx==0.28.1' 'uvicorn[standard]' pytest
+cd apis/examples/websocket_notifications
+export WS_SESSION_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+python -m pytest -q
+```
+
+The local fixture signs a short-lived session, subscribes `usr_123`, and sends a ping
+whose response retains its request ID. It also rejects malformed signatures and proves
+that a never-completing send is cancelled within the send deadline. This in-process
+check does not exercise proxy buffering or server frame limits; use the Uvicorn launch
+below for those integration checks.
+
+## Why the reader, writer and supervisor have different jobs
+
+Keep one receive coroutine and one send coroutine per connection unless the WebSocket library explicitly supports more. Concurrent sends can interleave library state; concurrent receives commonly raise or produce undefined ownership.
+
+```text
+broker/business tasks ─┐
+heartbeat task ────────┼──> bounded outbound queue ──> one sender ──> socket
+command replies ───────┘
+
+socket ──> one receiver ──> validate/authorize/dispatch
+```
+
+Do not hold the hub lock while awaiting network I/O. Snapshot recipients under the lock, then enqueue outside it. For very large fleets, replace global scans with indexed local subscription maps.
+
+---
+
+A queue cap limits messages that have not started sending. It cannot interrupt the
+message currently stuck in `send_json`. The writer therefore has a deadline per send.
+Overflow sets an independent stop event; the supervisor observes it, cancels both
+I/O tasks, joins them, removes the hub entry, and attempts a separately bounded close.
+A close message queued behind a stuck send would never be reached.
+
 ## 1. Reference FastAPI Implementation
 
 This compact service demonstrates:
@@ -53,6 +94,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 SESSION_SECRET = os.environ["WS_SESSION_SECRET"].encode("utf-8")
+if len(SESSION_SECRET) < 32:
+    raise ValueError("Use a random session secret of at least 32 bytes")
+SEND_TIMEOUT = 5.0
+CLOSE_TIMEOUT = 1.0
 ALLOWED_ORIGINS = {"https://app.example.com"}
 SUBPROTOCOL = "notifications.v1"
 MAX_INBOUND_BYTES = 16 * 1024
@@ -81,7 +126,7 @@ def sign_session(user_id: str, expires_at: int) -> str:
 
 
 def verify_session(token: str | None) -> str | None:
-    if token is None:
+    if token is None or len(token) > 1024:
         return None
     try:
         user_id, expires_text, supplied_signature = token.split(".", maxsplit=2)
@@ -95,7 +140,13 @@ def verify_session(token: str | None) -> str | None:
         signed_value.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    if not hmac.compare_digest(supplied_signature, expected_signature):
+    try:
+        supplied_bytes = bytes.fromhex(supplied_signature)
+    except ValueError:
+        return None
+    if len(supplied_signature) != 64 or not user_id:
+        return None
+    if not hmac.compare_digest(supplied_bytes, bytes.fromhex(expected_signature)):
         return None
     if expires_at <= int(time.time()):
         return None
@@ -116,6 +167,9 @@ class ClientConnection:
         default_factory=lambda: asyncio.Queue(maxsize=MAX_OUTBOUND_MESSAGES)
     )
     subscribed: bool = False
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    close_code: int = 1000
+    close_reason: str = "connection finished"
 
 
 class ConnectionHub:
@@ -148,10 +202,9 @@ class ConnectionHub:
                 client.outbound.put_nowait(message)
             except asyncio.QueueFull:
                 # The event must also be recoverable from durable state.
-                client.outbound.get_nowait()
-                client.outbound.put_nowait(
-                    CloseInstruction(code=1013, reason="slow consumer")
-                )
+                client.close_code = 1013
+                client.close_reason = "slow consumer"
+                client.stop.set()  # Independent of the full queue and blocked send.
 
 
 hub = ConnectionHub()
@@ -161,9 +214,16 @@ async def send_messages(client: ClientConnection) -> None:
     while True:
         item = await client.outbound.get()
         if isinstance(item, CloseInstruction):
-            await client.websocket.close(code=item.code, reason=item.reason)
+            client.close_code, client.close_reason = item.code, item.reason
+            client.stop.set()
             return
-        await client.websocket.send_json(item)
+        try:
+            async with asyncio.timeout(SEND_TIMEOUT):
+                await client.websocket.send_json(item)
+        except TimeoutError:
+            client.close_code, client.close_reason = 1013, "send deadline"
+            client.stop.set()
+            return
 
 
 async def receive_messages(client: ClientConnection) -> None:
@@ -172,7 +232,8 @@ async def receive_messages(client: ClientConnection) -> None:
         # to buffer, assemble, decompress, and decode the message.
         raw_message = await client.websocket.receive_text()
         if len(raw_message.encode("utf-8")) > MAX_INBOUND_BYTES:
-            await client.websocket.close(code=1009, reason="message too large")
+            client.close_code, client.close_reason = 1009, "message too large"
+            client.stop.set()
             return
 
         try:
@@ -235,9 +296,10 @@ async def notifications_socket(websocket: WebSocket) -> None:
     sender = asyncio.create_task(send_messages(client), name=f"ws-send-{user_id}")
     receiver = asyncio.create_task(receive_messages(client), name=f"ws-receive-{user_id}")
 
+    stopper = asyncio.create_task(client.stop.wait(), name=f"ws-stop-{user_id}")
     try:
         done, pending = await asyncio.wait(
-            {sender, receiver},
+            {sender, receiver, stopper},
             return_when=asyncio.FIRST_COMPLETED,
         )
         for task in pending:
@@ -256,29 +318,20 @@ async def notifications_socket(websocket: WebSocket) -> None:
     finally:
         sender.cancel()
         receiver.cancel()
-        await asyncio.gather(sender, receiver, return_exceptions=True)
+        stopper.cancel()
+        await asyncio.gather(sender, receiver, stopper, return_exceptions=True)
         await hub.remove(client)
+        # The supervisor closes only after the sender has stopped.
+        try:
+            async with asyncio.timeout(CLOSE_TIMEOUT):
+                await websocket.close(code=client.close_code, reason=client.close_reason)
+        except (TimeoutError, RuntimeError, WebSocketDisconnect):
+            pass  # Already disconnected or the bounded close could not be delivered.
 ```
 
 The signed cookie is a focused example, not a replacement for the application's normal session/token service. Issue it from an HTTPS authentication flow with `Secure`, `HttpOnly`, and an appropriate `SameSite` policy. Support key rotation and revocation for real identities.
 
 `publish_to_user` must be called only after a durable business change or from a broker consumer. If the notification is important, clients recover it from a read API/event log after a slow-consumer close.
-
----
-
-## 2. Concurrency Rules
-
-Keep one receive coroutine and one send coroutine per connection unless the WebSocket library explicitly supports more. Concurrent sends can interleave library state; concurrent receives commonly raise or produce undefined ownership.
-
-```text
-broker/business tasks ─┐
-heartbeat task ────────┼──> bounded outbound queue ──> one sender ──> socket
-command replies ───────┘
-
-socket ──> one receiver ──> validate/authorize/dispatch
-```
-
-Do not hold the hub lock while awaiting network I/O. Snapshot recipients under the lock, then enqueue outside it. For very large fleets, replace global scans with indexed local subscription maps.
 
 ---
 
@@ -309,7 +362,7 @@ import time
 
 from fastapi.testclient import TestClient
 
-from app.main import app, sign_session
+from app import app, sign_session
 
 
 def test_subscribe_and_ping() -> None:
@@ -381,5 +434,38 @@ Logs include connection ID, principal/tenant, negotiated protocol, safe message/
 - Capacity tests include reconnect storms and worst-case fan-out, not only idle sockets.
 
 ---
+
+
+## Recap
+
+- One queue and one writer serialize accepted outbound messages.
+- A bounded queue limits pending messages; a send deadline bounds the in-flight write.
+- An independent stop signal lets the supervisor cancel, join and remove a stalled connection.
+
+## Check yourself
+
+**two messages for usr_123 are queued by different producers; what determines their send order?**
+
+<details><summary>Reasoned answer</summary>
+
+The single queue orders accepted entries and one sender drains it; separate producers do not call send_json concurrently.
+
+</details>
+
+**The writer is stuck and the close instruction is last in a full queue. When does it run?**
+
+<details><summary>Reasoned answer</summary>
+
+It may never run. Stop through the independent supervisor path, cancel the write and apply a separately bounded close.
+
+</details>
+
+**Try it:** Extend test_app.py with two subscribed users. Fill user A's queue until the hub selects overload closure, then publish to B. Leave B's queue and A's stop-state assertions blank.
+
+Hint: The hub snapshots recipients and never awaits a slow socket while publishing.
+
+<details><summary>Solution</summary>
+A has stop set with close code 1013 and a bounded queue; B receives its own event without waiting for A. Durable recovery still needs a log/snapshot outside this in-memory fixture.
+</details>
 
 **Next**: [Webhook Deep Dive](../webhooks/README.md)

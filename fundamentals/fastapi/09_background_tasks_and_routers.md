@@ -4,7 +4,7 @@
 
 > Three small but common things every FastAPI app needs. Collected here because each is too short for its own file, and they're all about *shape of the app* rather than request-handling mechanics.
 
-Verified against **FastAPI 0.141.1 / Starlette 1.3.1** (checked 2026-08-03).
+Runtime boundaries rechecked against **FastAPI 0.162.0 / Starlette 1.10.0** (2026-10-30); see the linked executable regression tests.
 
 ---
 
@@ -24,10 +24,27 @@ if self.background is not None:
 Three facts you will meet in production are all just that line, read carefully:
 
 1. **No response object → no tasks.** An endpoint that raises never builds one, so nothing is ever awaited.
-2. **The request's ASGI call is not finished until the tasks are.** A slow task keeps occupying the worker after the client has its answer.
+2. **The request's ASGI call is not finished until the tasks are.** A slow task keeps this ASGI call in flight after the client has its answer.
 3. **A task's exception is raised inside that request's ASGI call**, at a point where the client already has its `200`.
 
-> **The near-miss**: "fire-and-forget" suggests the request is over and the task now runs independently of it. It doesn't. The response *bytes* are gone, but the ASGI call for that request is still in flight until the last task returns. That is why a task's traceback is reported against that request, and why a 30-second task holds the worker for 30 seconds after the client has moved on.
+> **The near-miss**: "fire-and-forget" suggests the request is over and the task now runs independently of it. It doesn't. The response *bytes* are gone, but the ASGI call for that request is still in flight until the last task returns. That is why a task's traceback is reported against that request, and why a 30-second task retains its request task (and a thread slot if synchronous) for 30 seconds after the client has moved on.
+
+The client-completion and ASGI-completion boundaries differ:
+
+```mermaid
+sequenceDiagram
+ participant C as Client
+ participant R as Response ASGI call
+ participant A as Callback A
+ participant B as Callback B
+ R-->>C: Final response body
+ R->>A: Await A
+ A--xR: Raises
+ Note over B: Never invoked
+ Note over R: Exception remains observable after response start
+```
+
+The in-flight ASGI task remains occupied; an async callback does not exclusively occupy the whole server process. A sync callback also holds a thread-limiter slot while it runs. The [runtime contract test](./examples/test_runtime_contracts.py) proves that the already-sent client response stays 200 and B is skipped.
 
 ### Minimal version
 
@@ -149,9 +166,9 @@ async def on_http_error(request: Request, exc: HTTPException):
 
 Use **`async def` for I/O**. A sync `def` task is dispatched to anyio's default thread limiter, which has **40 tokens**; past 40 concurrent sync tasks the rest queue behind the limiter, and they compete with every other `def` handler in the app for the same 40 slots.
 
-For genuinely CPU-bound work, use **neither** — routing CPU-bound Python through `def` does not keep the event loop free, because the worker thread still holds the GIL. Move it to a process pool or a real queue. Source: [anyio threads](https://anyio.readthedocs.io/en/stable/threads.html), checked 2026-08-03.
+A sync CPU-bound function runs off the event-loop thread, so the loop can still schedule other work. On ordinary GIL-enabled CPython it contends for the GIL and does not provide parallel Python CPU throughput; tail latency can still suffer. Use a bounded process pool or durable worker service when CPU parallelism or recovery is required. Source: [anyio threads](https://anyio.readthedocs.io/en/stable/threads.html), checked 2026-08-03.
 
-> **Key insight**: `BackgroundTasks` is not a queue with one worker; it is a callback bolted onto a response object. Its reliability is therefore exactly the reliability of that response getting built and sent — which is why every one of its failure modes is, underneath, a response that never happened.
+> **Key insight**: `BackgroundTasks` is not a queue with one worker; it is a callback bolted onto a response object. Its work can fail even after a successful response. Process loss, task failure and sequential callback ordering therefore matter independently of client completion.
 
 ---
 
@@ -226,7 +243,7 @@ The `users.py` above happens to be in the right order. **Always declare literal 
 
 ⚠️ **The prefix belongs in exactly one of the two places.** If `admin.py` sets `prefix="/admin"` on its own `APIRouter(...)` — the way `users.py` does — *and* `main.py` passes `prefix="/admin"` to `include_router`, the two concatenate. Every `/admin/...` request then returns `404` and nothing warns you:
 
-```python
+```text
 paths -> ['/admin/admin/ping']      # from app.openapi()["paths"]
 GET /admin/ping -> 404
 ```
@@ -304,7 +321,7 @@ To set operation IDs app-wide instead of one endpoint at a time, pass `generate_
 from fastapi.routing import APIRoute
 
 def readable_operation_id(route: APIRoute) -> str:
-    return f"{route.tags[0]}-{route.name}"
+    return f"{route.tags[0] if route.tags else 'default'}-{route.name}"
 
 app = FastAPI(generate_unique_id_function=readable_operation_id)
 ```
@@ -337,9 +354,9 @@ def custom_openapi():
     # setdefault, not schema["components"]: get_openapi() only emits "components"
     # when there is something to put in it, so an app with no Pydantic models and
     # no security dependencies raises KeyError: 'components' here.
-    schema.setdefault("components", {})["securitySchemes"] = {
+    schema.setdefault("components", {}).setdefault("securitySchemes", {}).update({
         "ApiKey": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
-    }
+    })
     app.openapi_schema = schema
     return schema
 
@@ -385,3 +402,28 @@ Useful for public APIs where the docs order is part of the developer experience.
 - [07_error_handling.md](./07_error_handling.md) — `responses=` and exception-to-status mapping.
 - [Dramatiq](../../background_work/frameworks/dramatiq/overview.md) — broker-backed worker execution.
 - [Background Work](../../background_work/README.md) — durable tasks, stateful workflows, and architecture choices.
+
+## Check your understanding
+
+Response background tasks are sequential best-effort callbacks. Routers and schema metadata organize an API but do not supply durability or authorization.
+
+**Prediction:** Task A raises after the response; task B was registered after A. What happens?
+
+<details><summary>Answer</summary>
+The client retains the original response, A propagates an exception server-side, and B is never invoked because the sequential await loop stops.
+</details>
+
+**Diagnosis:** Would returning 202 make a background callback durable?
+
+<details><summary>Answer</summary>
+No. Durability needs committed admission and a recoverable worker owner; a status code does not survive process loss.
+</details>
+
+
+**Try it:** Change the first callback in test_runtime_contracts.py so its known best-effort failure is logged and the second callback runs. Scaffold: `try: operation()`, then fill in the narrow exception branch.
+
+Hint: Catch inside callback A, before its exception leaves the sequential callback chain.
+
+<details><summary>Solution</summary>
+Catch the expected operation exception in A, log sanitized context, and return normally; the trace becomes first, second. Do not catch BaseException or cancellation. This changes best-effort failure isolation only; use durable admission when neither callback may be lost.
+</details>

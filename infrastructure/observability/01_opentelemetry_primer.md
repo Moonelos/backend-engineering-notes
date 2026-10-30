@@ -155,3 +155,27 @@ already provides the required traces, metrics, log correlation, and retention—
 portability or multi-backend requirement—may gain only another SDK and failure path. Introduce OTel
 when the stable instrumentation boundary, cross-service propagation, or Collector routing solves a
 named problem.
+
+## Recap
+
+- Instrumentation records signals; SDK providers/readers/processors export them.
+- The Collector routes configured signals to backends independently of application instrumentation.
+- Telemetry must retain useful identity without unbounded cardinality or sensitive payloads.
+
+## Check yourself
+
+**Q: You change the Collector trace exporter but leave the application MeterProvider unchanged. Must application counters be rewritten?**
+
+<details><summary>Answer</summary>
+
+No. Instrumentation ownership and backend routing are separate, assuming the new pipeline supports those emitted signals. A trace-exporter change does not configure a missing metrics pipeline.
+
+</details>
+
+**Q: The API creates a counter but no reader/exporter is installed. Is an increment visible in the backend?**
+
+<details><summary>Answer</summary>
+
+No. The API call alone does not provide an export path. Follow the metric from instrument to provider, reader/exporter and backend before blaming a dashboard query.
+
+</details>

@@ -166,6 +166,8 @@ and the cache may hold data that is never read.
 ### 3. Write-Behind (Write-Back)
 
 Writes go to cache only. Cache flushes to DB asynchronously (in batches or on a timer).
+The following is a deliberately lossy telemetry-buffer sketch, not a durable write-acknowledgement
+protocol. Use a database outbox or retained journal when an accepted write must survive a process crash.
 
 ```
 Write path:
@@ -226,7 +228,7 @@ class WriteBehindCache:
 ```
 
 **Pros:** Extremely fast writes. Batch DB writes reduce load.
-**Cons:** **Data loss risk** if Redis crashes before flush. Complex to implement correctly. Rarely used with Redis directly.
+**Cons:** **Data loss risk** even if Redis survives: `dirty_keys` exists only in this worker's memory, so a crash loses publication intent; TTL/eviction can also remove values before flush. Complex to implement correctly. Rarely used with Redis directly.
 
 **Use sparingly**. Write-behind is suited for counters (page views, analytics) where losing a few data points is acceptable. Do not use it for financial transactions or anything requiring durability.
 
@@ -296,19 +298,21 @@ user = await cache.get("user", "42")
 | Strategy | Read speed | Write speed | Freshness | Complexity |
 |----------|-----------|------------|-----------|------------|
 | Cache-Aside | Fast (hit) / Slow (miss) | Normal | Stale possible | Low |
-| Write-Through | Always fast | Slower (2 writes) | Always fresh | Medium |
+| Write-Through | Fast on hit; misses still possible | Slower (2 writes) | Best effort unless versions/atomic boundary enforce more | Medium |
 | Write-Behind | Always fast | Very fast | Eventually consistent | High |
 | Read-Through | Fast (hit) / Slow (miss) | Normal | Stale possible | Medium |
 
 ```
 Mental model:
 Cache-aside     = "I'll check the cache myself"
-Write-through   = "Always keep cache fresh on write"
+Write-through   = "Update cache on write; handle partial failure and ordering"
 Write-behind    = "Cache now, persist later"
 Read-through    = "Cache fetches for me"
 ```
 
-> **Rule of thumb:** Start with cache-aside. It handles 90% of cases. Move to write-through only if stale reads are unacceptable.
+> Start with a stated freshness requirement. Cache-aside is simple when bounded staleness is
+> acceptable. Write-through alone cannot satisfy a no-stale-read contract across two independent
+> stores; read authoritative state for correctness-critical decisions or supply an atomic protocol.
 
 ---
 
@@ -532,7 +536,10 @@ async def get_with_early_refresh(
 
 ### Solution 3: Background Refresh
 
-Never let the cache expire. A background task refreshes before TTL runs out:
+A background task tries to refresh hot keys before expiry. This reduces misses; it cannot promise
+none. The sweep is sequential and sleeps ten seconds, so total loader time plus that sleep must fit
+inside the refresh margin. Time out each loader and fall back to a bounded direct source read on a
+miss. Measure sweep duration, loader failures, oldest source version and cache-miss rate:
 
 ```python
 class BackgroundCacheRefresher:
@@ -573,7 +580,7 @@ class BackgroundCacheRefresher:
 |----------|-----------|----------|
 | **Mutex lock** | Low | Most applications. Simple and effective. |
 | **XFetch** | Medium | High-throughput systems. No waiting, no locks. |
-| **Background refresh** | Medium | Known set of hot keys. Proactive, no miss ever. |
+| **Background refresh** | Medium | Known hot keys; reduced misses within measured sweep/loader budgets. |
 
 ---
 
@@ -621,10 +628,48 @@ Writer: commits "Bob"; DELETE cache
 Reader: SET cache to old "Alice"  <-- stale value reappears after the delete
 ```
 
-Choose the guarantee explicitly: accept bounded staleness with a short TTL, store a database
-version and reject older cache fills, or issue a delayed second invalidation after the longest
-expected read/fill interval. A transactional outbox plus versioned invalidation is the usual
-choice when stale data would violate a business rule.
+Choose the guarantee explicitly. A TTL bounds the lifetime of one cached value, not the age of
+all repeated fills. A delayed second delete still depends on a genuine upper bound on old readers.
+A durable outbox prevents lost invalidation intent, but its delivery latency remains a stale-read
+window. Use authoritative reads for business rules that tolerate no such window.
+
+### Reject a delayed fill after a newer version has been observed
+
+For a cache that tolerates invalidation lag but must not regress *after* applying an invalidation,
+store an authoritative integer row version in the database and publish it with the outbox event.
+Redis keeps a monotonic version floor separately from the expiring payload:
+
+```mermaid
+sequenceDiagram
+    participant R as Reader
+    participant D as Database
+    participant C as Cache with version floor
+    participant W as Writer and outbox relay
+    R->>D: Read Alice at version 7
+    W->>D: Commit Bob version 8 plus invalidation intent
+    W->>C: Advance floor to 8; discard older cached payload
+    R->>C: Attempt fill Alice version 7
+    C-->>R: Reject 7 below floor 8
+    R->>D: Reload Bob version 8
+    R->>C: Fill version 8 with TTL
+```
+
+The comparison and write must be one server operation. A separate GET-floor followed by SET has
+the same race as the original cache-aside code. The complete [versioned_cache.py](examples/versioned_cache.py)
+contains two short Lua operations: `ADVANCE` takes the maximum of existing and incoming floors and
+drops an older payload; `FILL` accepts only a version at least as new as the floor and the cached
+value. Both keys share the same Cluster hash tag. A repeated version-7 invalidation after version 8
+cannot lower the floor. The executable demonstration deliberately resumes a delayed version-7 fill
+after advancing to 8 and checks rejection.
+
+Keep floors for as long as old readers/events can return; do not expire them with payload TTL.
+If fencing state is missing after eviction or restore, `FILL` returns -1 rather than assuming zero.
+Bypass the cache, rebuild the floor from authoritative data and replay outstanding invalidations
+before trusting it again. Cache reads must also bypass values whose floor is missing or whose
+version falls below it. Configure capacity/eviction to protect floor state, alert on missing-floor
+counts and relay age, and rehearse Redis state loss. This is a monotonic cache after observed events,
+not an instantaneous cross-store transaction. Integer versions must remain exactly representable in
+Lua numbers (below 2^53), or use an encoding/comparison that supports the full database range.
 
 ### Event-Driven with Pub/Sub
 
@@ -678,24 +723,44 @@ async def update_user_versioned(r, user_id: str, data: dict):
 Group related cache keys under tags. Invalidate all keys in a tag at once.
 
 ```python
+from redis.exceptions import WatchError
+
 async def cache_with_tags(r, cache_key: str, tags: list[str], data: str, ttl: int = 300):
-    """Store data in cache and associate it with tags."""
-    async with r.pipeline() as pipe:
-        pipe.set(cache_key, data, ex=ttl)
-        for tag in tags:
-            pipe.sadd(f"tag:{tag}", cache_key)
-            pipe.expire(f"tag:{tag}", ttl + 60)  # tag set outlives its members
-        await pipe.execute()
+    """Bounded standalone-Redis tag sets; all keys must share a slot on Cluster."""
+    if ttl <= 0 or not tags:
+        raise ValueError("positive ttl and at least one tag required")
+    tag_keys = [f"tag:{tag}" for tag in tags]
+    while True:
+        async with r.pipeline() as pipe:
+            try:
+                await pipe.watch(*tag_keys)
+                remaining = [await pipe.ttl(key) for key in tag_keys]
+                pipe.multi()
+                pipe.set(cache_key, data, ex=ttl)
+                for key, old_ttl in zip(tag_keys, remaining):
+                    pipe.sadd(key, cache_key)
+                    if old_ttl != -1:  # preserve persistent tags; never shorten old membership
+                        pipe.expire(key, max(old_ttl, ttl + 60))
+                await pipe.execute()
+                return
+            except WatchError:
+                continue
 
 async def invalidate_by_tag(r, tag: str):
-    """Delete all cache keys associated with a tag."""
-    cache_keys = await r.smembers(f"tag:{tag}")
-    if cache_keys:
+    tag_key = f"tag:{tag}"
+    while True:
         async with r.pipeline() as pipe:
-            for key in cache_keys:
-                pipe.delete(key)
-            pipe.delete(f"tag:{tag}")
-            await pipe.execute()
+            try:
+                await pipe.watch(tag_key)
+                keys = await pipe.smembers(tag_key)
+                pipe.multi()
+                if keys:
+                    pipe.delete(*keys)
+                pipe.delete(tag_key)
+                await pipe.execute()
+                return
+            except WatchError:
+                continue  # a concurrent member forces a fresh snapshot before deleting the set
 
 # Usage
 await cache_with_tags(r, "cache:product:1", ["products", "category:electronics"], product_json)
@@ -710,7 +775,7 @@ await invalidate_by_tag(r, "category:electronics")  # deletes product:1 and prod
 
 | Strategy | How | Pros | Cons |
 |----------|-----|------|------|
-| **Delete on write** | `r.delete(key)` after DB write | Simple, correct | Cache miss after every write |
+| **Delete on write** | `r.delete(key)` after DB write | Simple invalidation | Delayed fills can restore stale data; miss after write |
 | **Update on write** | `r.setex(key, ...)` after DB write | No miss penalty | Write amplification, race conditions |
 | **Event-driven** | Pub/sub or CDC triggers invalidation | Decoupled, works across services | More infrastructure |
 | **Versioned keys** | `user:123:v5` — increment version on write | Old versions naturally expire | Key proliferation |
@@ -750,3 +815,39 @@ async def get_user_with_negative_cache(r, user_id: str) -> Optional[dict]:
 ## Summary
 
 > Start with cache-aside + delete-on-write + `allkeys-lru`. Add complexity only when you have evidence you need it.
+
+## Recap
+
+- Caching strategies choose where reads and writes happen; none automatically creates a cross-store transaction.
+- A delayed read can repopulate an old value after delete-on-write.
+- An atomic monotonic floor rejects stale fills after observed invalidation; missing floors require repair.
+
+## Check yourself
+
+**Q: A reader loads v7, a writer commits v8 and deletes cache, then the reader stores v7. Did deletion guarantee freshness?**
+
+<details><summary>Answer</summary>
+
+No. Delete does not fence the in-flight fill. The version-floor protocol compares v7 to the observed floor 8 atomically and rejects it.
+
+</details>
+
+**Q: The v8 database commit succeeded but its outbox invalidation has not reached Redis. Can the floor protocol promise current reads?**
+
+<details><summary>Answer</summary>
+
+No. The cache may still serve v7 during relay lag. Use authoritative reads for a no-staleness rule; monitor and bound lag for the explicitly weaker cache contract.
+
+</details>
+
+## Try it
+
+Run demonstrate from versioned_cache.py against a fresh pair of tagged keys, then simulate loss of the floor.
+
+Hint: A missing floor must not silently become version zero.
+
+<details><summary>Worked solution</summary>
+
+The old fill returns 0 after v8 invalidation and -1 when the floor is missing. Bypass the cache, load authoritative version 8, advance the floor and only then allow the v8 fill.
+
+</details>

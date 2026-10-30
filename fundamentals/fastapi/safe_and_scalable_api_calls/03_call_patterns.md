@@ -1,637 +1,218 @@
-# Part 3: Call Patterns and Retry Logic
+# Part 3: One tested call owner from admission through retry
 
-<!-- length-justification: This is the canonical external-call implementation note; admission, per-attempt execution, retry classification, backoff, and complete composition stay together because their nesting order is the mechanism being taught. -->
+> **Who this is for**: Readers of [capacity](01_core_concepts.md) and
+> [deadline scopes](02_concurrency_and_timeouts.md). The runnable baseline uses Python 3.11+
+> and HTTPX 0.28.1; it makes no external provider call.
 
-> **Who this is for**: FastAPI engineers composing bounded admission, downstream calls, and eligible
-> retries into one safe call path.
+A GET for `ord_42` receives 503, releases its resources, and retries once successfully.
+A locally saturated caller never reaches the provider. Both outcomes use the same implementation,
+so the production continuation does not quietly introduce another exception policy.
 
-> **Principle**: Retries must happen outside the semaphore. Never sleep while holding resources.
+## Run one operation before studying the policy
 
-> **Key insight**: Queue admission, downstream execution, and retry are separate phases with
-> separate failure semantics.
+From the repository root:
 
----
+```bash
+python -m venv /tmp/notes-calls-env
+source /tmp/notes-calls-env/bin/activate
+python -m pip install 'httpx==0.28.1' 'fastapi==0.162.0' 'starlette==1.10.0' pytest
+python fundamentals/fastapi/safe_and_scalable_api_calls/examples/demo.py
+python -m pytest -q fundamentals/fastapi/safe_and_scalable_api_calls/examples
+```
 
-## 1. The Gold-Standard Call Pattern
+The demo prints:
 
-This is the **recommended baseline** for LLM or external API calls:
+```text
+{'order': 'ord_42', 'status': 'paid'}
+attempts 2 active 0
+local_overload; provider_attempts 2
+```
+
+The complete [caller](examples/bounded_calls.py), [demo](examples/demo.py),
+[behavioral checks](examples/test_bounded_calls.py) and [FastAPI app](examples/safe_call_app.py)
+are ordinary files. The mock establishes application policy and resource ownership, not DNS,
+TLS or HTTP connection-pool behavior. Use a loopback/provider staging test for those boundaries.
+The pinned Starlette stack currently warns about its HTTPX TestClient backend; see the
+[HTTPX2 migration discussion](../../httpx/05_httpx_vs_aiohttp.md).
+
+## Derive the retry sequence from the first failure
+
+```mermaid
+sequenceDiagram
+ participant U as Logical operation Q1
+ participant G as Local and optional shared admission
+ participant P as Provider
+ U->>G: Acquire attempt 0 within admission budget
+ G-->>U: Own permits; admission timer ends
+ U->>P: GET ord_42
+ P-->>U: 503
+ U->>G: Close response and release ownership
+ Note over U: Sleep full jitter or valid Retry-After
+ U->>G: Re-admit attempt 1 under original total clock
+ U->>P: GET ord_42
+ P-->>U: 200 paid
+ U->>G: Close response and release
+```
+
+The failed response is closed before retry sleep. Otherwise even a sleeping retry could
+retain a scarce transport connection or application permit. Ten sleeping owners in a
+20-slot gate leave only ten slots for useful work. That wastes capacity; it is not by
+itself a deadlock, and no fixed `size / retry_count` formula predicts effective throughput.
+
+The loop re-enters admission for each actual provider attempt. It does not reset the total
+clock or receive a new logical operation identity. A failed admission is returned immediately;
+there is no useful downstream attempt to recover by repeating local contention.
+
+## Inspect the narrow owner rather than copying a second version
+
+`BoundedCaller` receives the lifespan-owned `AsyncClient`. Its gate counts active owners
+and pending waiters; a full waiting budget rejects immediately. `_admit` acquires local
+capacity, optional start spacing and optional external admission inside one short deadline.
+The deadline exits before yielding the admitted region. An exit stack owns the external
+lease through response closure, and `finally` returns the local permit.
+
+Inside that region, the attempt deadline encloses request and complete body consumption.
+The JSON response has a byte budget and must decode to an object. The caller closes the
+response on success, status failure, body failure or cancellation. It logs no credentials,
+request body or full query URL. Production metrics should count attempts, overload,
+timeouts and bounded status categories; add route/provider labels with finite values.
+
+The public invocation is small because the complete owner is in the linked source file:
 
 ```python
-import asyncio
-import httpx
-import random
-import uuid
-from typing import Optional
-from aiolimiter import AsyncLimiter
-
-
-class RetryableError(Exception):
-    """Transient errors that may succeed on retry"""
-    pass
-
-
-class FinalFailure(Exception):
-    """Permanent failure after all retries exhausted"""
-    pass
-
-
-class AdmissionTimeout(Exception):
-    """Local capacity was unavailable; retrying would amplify overload."""
-
-
-class AttemptDeadlineExceeded(Exception):
-    """One admitted downstream attempt exceeded its wall-clock budget."""
-
-
-# === GLOBAL PRIMITIVES (must be created once at app startup) ===
-llm_sem = asyncio.Semaphore(50)                   # Local concurrency control
-llm_rate = AsyncLimiter(60, 60)                   # Local rate limiting (60/min)
-client: Optional[httpx.AsyncClient] = None        # Initialized in startup event
-
-
-def backoff(attempt: int) -> float:
-    """Exponential backoff with FULL jitter (AWS-style).
-
-    Sleep is drawn uniformly from [0, min(cap, base * 2**attempt)],
-    so retries spread across the whole window instead of clustering
-    at a fixed offset. This is what actually defeats the thundering herd.
-    """
-    cap = 32
-    return random.uniform(0, min(cap, 2 ** attempt))
-
-
-async def call_llm(payload: dict):
-    """
-    Gold standard LLM call with:
-    - Queue timeout (admission control)
-    - Rate limiting (throughput control)
-    - Semaphore (concurrency control)
-    - Call timeout (latency control)
-    - Retry logic with proper exception handling
-    """
-    idempotency_key = str(uuid.uuid4())  # one logical operation; reused by every attempt
-    try:
-        # Total budget includes admission, attempts, and retry sleep.
-        async with asyncio.timeout(75):
-            for attempt in range(3):
-                try:
-                    # Admission has its own scope and exception. Never classify
-                    # local overload as a retryable vendor timeout.
-                    try:
-                        async with asyncio.timeout(5):
-                            await llm_rate.acquire()
-                            await llm_sem.acquire()
-                    except TimeoutError as exc:
-                        raise AdmissionTimeout("local capacity unavailable") from exc
-
-                    try:
-                        try:
-                            async with asyncio.timeout(30):
-                                response = await client.post(
-                                    "https://vendor.example/api",
-                                    json=payload,
-                                    headers={"Idempotency-Key": idempotency_key},
-                                )
-                        except TimeoutError as exc:
-                            raise AttemptDeadlineExceeded from exc
-
-                        response.raise_for_status()
-                        return response.json()
-                    finally:
-                        llm_sem.release()
-
-                except AdmissionTimeout:
-                    raise  # fail fast; another local attempt adds pressure
-                except (httpx.TimeoutException, AttemptDeadlineExceeded):
-                    if attempt < 2:
-                        await asyncio.sleep(backoff(attempt))
-                        continue
-                    raise FinalFailure("downstream timeout after retries")
-                except httpx.HTTPStatusError as exc:
-                    if 500 <= exc.response.status_code < 600 and attempt < 2:
-                        await asyncio.sleep(backoff(attempt))
-                        continue
-                    raise FinalFailure(f"HTTP error: {exc.response.status_code}") from exc
-
-            raise FinalFailure("all retries exhausted")
-    except TimeoutError as exc:
-        # This can only be the outer 75-second budget; inner deadlines were
-        # converted to distinct exception types in their own scopes.
-        raise FinalFailure("total call budget exhausted") from exc
-```
-
----
-
-## 2. Why This Pattern Works
-
-### Layer Order
-
-```
-1. for attempt in range(3):     ← retry loop OUTSIDE everything
-2.   timeout(5): acquire rate + semaphore  ← admission timeout; never retried
-3.   timeout(30): client.post              ← downstream attempt deadline
-4.   release semaphore                     ← before retry sleep
-```
-
-**Critical**: Retry loop is **outermost**. Semaphore is released before sleeping.
-
-### What Each Layer Does
-
-| Layer | Purpose | Failure = |
-|-------|---------|-----------|
-| Retry loop | Transient failure recovery | Exhaust retries |
-| Queue timeout | Admission control | System overloaded |
-| Rate limiter | Vendor quota compliance | Throughput exceeded |
-| Semaphore | Concurrency control | Capacity reached |
-| Call timeout | Per-attempt budget | Vendor slow |
-
----
-
-## 3. Retry Rules (Critical)
-
-### ✅ Retry These
-
-- Transient network errors (`httpx.ConnectError`)
-- 5xx responses (server errors)
-- Vendor slowness (`httpx.TimeoutException`)
-- Call timeout (`asyncio.TimeoutError` after first attempt)
-- 429 responses — retry **only after** honoring `Retry-After` (see §6)
-
-### ❌ Do NOT Retry These
-
-- Queue timeouts (system is overloaded)
-- 4xx responses other than 429 (client errors)
-- Authentication errors (401, 403)
-- Validation errors (400, 422)
-
-**Rule of thumb**:
-
-> If the system is already overloaded, retries make it worse.
-
-> ⚠️ **Retries require idempotency.** A `httpx.TimeoutException` does not mean the vendor *didn't* process the request — it may have completed server-side after your read timeout fired. Retrying a non-idempotent POST (a charge, an order, a token-consuming LLM call) can execute it twice. Pair every retryable call with an idempotency key. See [Part 11: Idempotency](11_idempotency.md).
-
----
-
-## 4. Semaphore + Retry: Non-Negotiable Rule
-
-> **Retries must happen OUTSIDE the semaphore scope.**
-
-### ✅ Correct
-
-```python
-for attempt in range(3):
-    async with llm_sem:
-        result = await call_vendor()
-    
-    if needs_retry:
-        await asyncio.sleep(backoff(attempt))
-        continue
-    
-    return result
-```
-
-The semaphore is released **before** sleeping.
-
-### ❌ Incorrect
-
-```python
-async with llm_sem:
-    for attempt in range(3):
-        result = await call_vendor()
-        if needs_retry:
-            await asyncio.sleep(backoff(attempt))  # SLEEPING WHILE HOLDING SEM!
-```
-
-### Why This Matters
-
-If you sleep while holding a semaphore:
-- Throughput **collapses**
-- Other requests are blocked unnecessarily
-- Effective concurrency = `sem_size / avg_retries`
-- Deadlocks appear under load
-
----
-
-## 5. Rate Limiter Behavior
-
-`AsyncLimiter` (and most rate limiters):
-- **Waits** (does not reject immediately)
-- Does NOT return 429 to client
-- Queues callers fairly
-
-```python
-from aiolimiter import AsyncLimiter
-
-llm_rate = AsyncLimiter(60, 60)  # 60 calls per minute
-
-async with llm_rate:  # waits until token available
-    await client.post(...)
-```
-
-This means:
-- FastAPI requests may wait
-- Workers are not blocked (async)
-- Latency increases instead of hard failing
-
-**If you want hard rejection**, implement it:
-
-```python
-async def call_with_hard_reject():
-    # Acquire one permit within the rejection budget. AsyncLimiter permits are
-    # consumed, not held/released like a semaphore, so do not acquire again.
-    try:
-        async with asyncio.timeout(0.1):  # very short
-            await llm_rate.acquire()
-    except TimeoutError:
-        raise HTTPException(429, "Rate limit - try later")
-
-    return await client.post(...)
-```
-
----
-
-## 6. Backoff Strategies
-
-### Exponential Backoff with Jitter
-
-```python
-import random
-
-def backoff(attempt: int) -> float:
-    """
-    Exponential backoff with FULL jitter.
-
-    Sleep is uniform over [0, min(cap, 2**attempt)]:
-    attempt 0: 0-1 sec
-    attempt 1: 0-2 sec
-    attempt 2: 0-4 sec
-    ...
-    capped at 0-32 sec
-    """
-    cap = 32
-    return random.uniform(0, min(cap, 2 ** attempt))
-```
-
-**Why FULL jitter (not "base + small jitter")?** A deterministic exponential base with only ±1s of added jitter still leaves every retrying client clustered in roughly the same 1-second window — a synchronized herd. Full jitter draws the delay uniformly across the *entire* `[0, backoff]` window, turning a synchronized spike into a steady trickle. See [AWS: Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/).
-
-### Decorrelated Jitter (Better for High Contention)
-
-```python
-def decorrelated_backoff(attempt: int, prev_backoff: float) -> float:
-    """
-    Decorrelated jitter for better spread.
-    """
-    return min(32, random.uniform(1, prev_backoff * 3))
-```
-
-### Conservative (429 Responses)
-
-```python
-def respect_retry_after(response: httpx.Response, attempt: int) -> float:
-    """Use vendor's Retry-After header if present, else fall back to exponential backoff."""
-    retry_after = response.headers.get("Retry-After")
-    if retry_after:
-        # Retry-After may be seconds (integer) or an HTTP-date; handle seconds here.
-        try:
-            return float(retry_after)
-        except ValueError:
-            pass
-    return backoff(attempt)
-```
-
----
-
-## 7. Exception Classification
-
-```python
-async def classify_and_handle(e: Exception, attempt: int):
-    """
-    Classify exception and decide whether to retry.
-    """
-    max_retries = 3
-    
-    # Transport errors — usually retry
-    if isinstance(e, httpx.TimeoutException):
-        if attempt < max_retries - 1:
-            return "retry"
-        return "fail"
-    
-    if isinstance(e, httpx.ConnectError):
-        if attempt < max_retries - 1:
-            return "retry"
-        return "fail"
-    
-    # HTTP errors — depends on status code
-    if isinstance(e, httpx.HTTPStatusError):
-        code = e.response.status_code
-        
-        # 5xx — retry
-        if 500 <= code < 600:
-            if attempt < max_retries - 1:
-                return "retry"
-            return "fail"
-        
-        # 429 — retry with backoff
-        if code == 429:
-            if attempt < max_retries - 1:
-                return "retry_with_longer_backoff"
-            return "fail"
-        
-        # 4xx — don't retry
-        return "fail_no_retry"
-    
-    # Application timeout — context dependent
-    if isinstance(e, asyncio.TimeoutError):
-        # Only retry once for timeouts
-        if attempt == 0:
-            return "retry"
-        return "fail"
-    
-    # Unknown — don't retry
-    return "fail_no_retry"
-```
-
----
-
-## 8. Complete Production Call Pattern
-
-```python
-import asyncio
-import httpx
-import uuid
-from typing import Optional
-import structlog
-
-logger = structlog.get_logger()
-
-
-async def call_llm_production(
-    payload: dict,
-    *,
-    request_id: Optional[str] = None,
-) -> dict:
-    """
-    Production-grade LLM call with:
-    - Structured logging
-    - Proper exception handling
-    - Retry logic
-    - All timeout layers
-    """
-    
-    log = logger.bind(
-        request_id=request_id,
-        payload_keys=list(payload.keys()),
-    )
-    
-    idempotency_key = request_id or str(uuid.uuid4())
-
-    for attempt in range(3):
-        log = log.bind(attempt=attempt)
-        
-        try:
-            # Admission owns only queue/permit acquisition. Local saturation must
-            # not be reported as a downstream timeout.
-            try:
-                async with asyncio.timeout(5):
-                    log.debug("acquiring_rate_limit")
-                    await llm_rate.acquire()
-                    log.debug("acquiring_semaphore")
-                    await llm_sem.acquire()
-            except TimeoutError as exc:
-                raise AdmissionTimeout("local capacity unavailable") from exc
-
-            try:
-                async with asyncio.timeout(30):
-                    log.info("calling_vendor")
-                    response = await client.post(
-                        "https://vendor/api",
-                        json=payload,
-                        headers={
-                            "Idempotency-Key": idempotency_key,
-                            **({"X-Request-ID": request_id} if request_id else {}),
-                        },
-                    )
-                    response.raise_for_status()
-                    result = response.json()
-                    log.info("vendor_success", status_code=response.status_code)
-                    return result
-            finally:
-                llm_sem.release()
-        
-        except AdmissionTimeout:
-            raise
-        except (httpx.TimeoutException, TimeoutError) as e:
-            log.warning("vendor_timeout", error=str(e))
-            
-            if attempt < 2:
-                wait = backoff(attempt)
-                log.debug("retrying", wait_seconds=wait)
-                await asyncio.sleep(wait)
-                continue
-            
-            raise FinalFailure(f"Vendor timeout after {attempt + 1} attempts")
-        
-        except httpx.HTTPStatusError as e:
-            log.warning("vendor_http_error", status_code=e.response.status_code)
-            
-            if 500 <= e.response.status_code < 600:
-                if attempt < 2:
-                    wait = backoff(attempt)
-                    await asyncio.sleep(wait)
-                    continue
-            
-            raise FinalFailure(f"Vendor error: {e.response.status_code}")
-        
-        except asyncio.TimeoutError:
-            log.warning("application_timeout")
-            
-            if attempt == 0:
-                wait = backoff(attempt)
-                await asyncio.sleep(wait)
-                continue
-            
-            raise FinalFailure(f"Timeout after {attempt + 1} attempts")
-    
-    raise FinalFailure("All retries exhausted")
-```
-
----
-
-## 9. SDK Retries: Disable or Account For
-
-Many vendor SDKs (OpenAI, Anthropic, etc.) have **built-in retries**.
-
-### The Problem
-
-```
-Your retry × SDK retry = retry multiplication
-
-3 × 3 = 9 actual attempts
-```
-
-Effects:
-- Rate limits blown
-- Latency multiplied  
-- Cascading failures
-
-### Solution 1: Disable SDK Retries (Recommended)
-
-```python
-# OpenAI
-client = openai.AsyncClient(
-    max_retries=0,  # YOU control retries
-    timeout=30.0,
-)
-
-# Anthropic
-client = anthropic.AsyncAnthropic(
-    max_retries=0,
+# Excerpt: caller is created once in the application's lifespan.
+result = await caller.request_json(
+    "GET", "/orders/ord_42", total_timeout=5.0, max_attempts=3,
 )
 ```
 
-### Solution 2: Account for SDK Retries
-
-If you can't disable them, do not add an outer retry — let the SDK's internal retries be your only retry layer:
-
-```python
-# SDK already retries internally (e.g., up to 3 attempts).
-# Do NOT wrap it in another retry loop — that multiplies attempts
-# (3 × 3 = 9) and blows through rate limits.
-try:
-    result = await sdk_call()
-except Exception:
-    # Let it propagate. The SDK has already retried.
-    raise
-```
-
-**Rule**: One retry layer. Yours *or* the SDK's — never both. Control it explicitly.
-
----
-
-## 10. FastAPI Integration
+For POST, passing `max_attempts=3` does not grant retry safety. The implementation makes
+one attempt unless the adapter explicitly asserts a documented provider deduplication
+contract and supplies the stable key:
 
 ```python
-from fastapi import FastAPI, HTTPException
-import asyncio
-
-app = FastAPI()
-
-
-@app.post("/llm")
-async def llm_endpoint(payload: dict):
-    """
-    Complete LLM endpoint with SLA boundary protection.
-    """
-    try:
-        # SLA boundary: absolute maximum latency
-        async with asyncio.timeout(60):
-            return await call_llm_production(payload)
-    
-    except asyncio.TimeoutError:
-        raise HTTPException(504, "Request timeout")
-    
-    except FinalFailure as e:
-        raise HTTPException(502, f"Upstream failure: {str(e)}")
-    
-    except Exception as e:
-        logger.exception("Unexpected error")
-        raise HTTPException(500, "Internal server error")
+# Only for a provider whose documented operation honors this header and retention window.
+result = await caller.request_json(
+    "POST", "/reports", payload={"order_id": "ord_42"},
+    idempotency_key="tenant7:report:op42", provider_deduplicates=True,
+    operation_id="op42",
+)
 ```
 
-### What Clients See
+The key must survive caller/process retries of the same operation; creating a fresh UUID
+for each inbound retry loses this guarantee. A header ignored by a provider does nothing.
+[Part 11](11_idempotency.md) owns durable local identity, request fingerprints, stale owners
+and provider-key namespacing. A locally cancelled POST can have an unknown remote outcome.
 
-| Situation | HTTP Status | Client Experience |
-|-----------|-------------|-------------------|
-| Queue overload | 504 / 429 | Fast fail |
-| Vendor slow | 200 | Retry succeeded (transparent) |
-| Vendor down | 502 | Controlled failure |
-| System healthy | 200 | Normal latency |
-| SLA timeout | 504 | Gateway timeout |
+## Retry only the failure classes this operation can recover
 
----
-
-## 11. Common Mistakes
-
-### ❌ Semaphore inside retry
-
-```python
-async with llm_sem:
-    for attempt in range(3):
-        result = await call()
-        await asyncio.sleep(backoff(attempt))  # WRONG
+```mermaid
+flowchart TD
+ E[Failure] --> L{Admission or PoolTimeout?}
+ L -- yes --> O[Return overload without local retry]
+ L -- no --> T{Total deadline exhausted?}
+ T -- yes --> S[Stop logical operation]
+ T -- no --> I{GET or documented deduplication?}
+ I -- no --> U[Return terminal or unknown outcome]
+ I -- yes --> R{Eligible transient failure and attempts left?}
+ R -- yes --> B[Release; bounded sleep; re-admit]
+ R -- no --> S
 ```
 
-### ❌ No queue timeout
+The baseline retries 408, 429, 502, 503 and 504, plus selected connection/read/write failures
+and an attempt deadline, **only** under the safe-operation condition. It does not assume
+all 500s are transient. Authentication, validation, malformed provider data and local
+pool/admission failures stop. Caller cancellation is propagated rather than converted
+into a retry. Extend the exact status/exception list only from the provider contract and
+observed failure, with a regression test for the new decision.
 
-```python
-async with llm_rate:
-    async with llm_sem:
-        # Request might wait forever here
-        await call()
-```
+A third attempt that fails raises its retained failure immediately. It neither returns
+`None` nor sleeps after exhaustion. The FastAPI adapter maps admission to 503, deadline
+to 504, and provider failures to a sanitized 502. Tenant quota exhaustion, owned later by
+the shared admission policy, can instead map to the documented 429 response.
 
-### ❌ Catching only `asyncio.TimeoutError`
+## Make backoff and rate policies explicit
 
-```python
-try:
-    await client.post(...)
-except asyncio.TimeoutError:  # MISSES httpx timeouts!
-    ...
-```
+For attempt index n, full jitter draws uniformly from zero to
+`min(base * 2**n, cap)`. It spreads retry starts over an interval. Decorrelated jitter uses
+the previous delay to choose the next range; it is an alternative distribution, not a
+universal improvement. Choose one policy and measure retry amplification.
 
-### ❌ Retrying queue timeouts
+`Retry-After` can be integer delay-seconds or an HTTP-date. The supplied parser handles
+both, and the caller waits at least that delay and its jitter. If that wait cannot fit
+inside the original total budget, it fails without starting the next request. A malformed
+header uses the local jitter policy. Clock skew affects HTTP-date interpretation, so keep
+hosts synchronized and bound the logical operation independently.
 
-```python
-except asyncio.TimeoutError:
-    await asyncio.sleep(backoff(attempt))
-    continue  # System is overloaded, this makes it worse
-```
+`StartSpacing` is optional process-local smoothing without a token-bucket burst. Other
+limiters may permit bursts and favor smaller weighted acquisitions; neither mechanism
+alone promises tenant fairness. Holding a local permit while waiting for start permission
+makes ownership simple but can reduce utilization. Bound that wait and measure it before
+introducing a more complex atomic admission scheduler. [Part 9](09_distributed_admission_control.md)
+provides the shared policy boundary; local counters cannot protect a fleet quota.
 
-### ❌ Per-request primitives
+## Prevent retry multiplication across SDK layers
 
-```python
-@app.post("/llm")
-async def endpoint():
-    sem = asyncio.Semaphore(50)  # USELESS - new every request
-    async with sem:
-        ...
-```
+If the application makes three attempts and the SDK internally makes three, the provider
+can see nine, while application metrics might report only three. Prefer one retry owner.
+When wrapping a provider SDK, disable its automatic retries through that SDK's documented
+configuration and retain the outer policy. If that is impossible, include internal attempts
+in rate, token and retry budgets and verify the observed provider request count under a
+forced failure. A new SDK default is an upgrade gate, not an implementation detail.
 
----
+## Verify changed conditions, then harden the boundary
 
-## 12. Summary: Retry Decision Tree
+The tests exercise admission finishing before execution, waiter cancellation, overload,
+unsafe POST, stable operation keys, resource release before backoff, trickled responses,
+HTTP-date parsing and caller cancellation. The app tests inject a provider-wide 503 while
+`/live`, `/ready` and `/local` continue succeeding. A remote outage should not automatically
+remove every otherwise healthy pod from service.
 
-```
-Exception occurred
-    │
-    ├─ httpx.TimeoutException?
-    │   └─ Yes → Retry (if attempts remain)
-    │
-    ├─ httpx.ConnectError?
-    │   └─ Yes → Retry (if attempts remain)
-    │
-    ├─ httpx.HTTPStatusError?
-    │   ├─ 5xx → Retry (if attempts remain)
-    │   ├─ 429 → Retry with Retry-After header
-    │   └─ 4xx → Do NOT retry
-    │
-    ├─ asyncio.TimeoutError?
-    │   ├─ First attempt → Retry once
-    │   └─ Subsequent → Do NOT retry (overloaded)
-    │
-    └─ Other → Do NOT retry
-```
+Before replacing the mock, supply verified TLS, a fixed/allowlisted provider origin,
+secret-manager credentials, endpoint authorization, a total body limit, and the provider's
+actual retry/idempotency profile. Never forward arbitrary user-supplied URLs or credentials.
+Exercise real pool exhaustion, connection closure and nonresponsive peers in staging.
+A mock-backed pass does not certify those transport behaviors.
 
----
+## Recap
 
-## Key Principles
+- One owner closes each response and releases all permits before retry sleep.
+- Local overload stops locally; operation safety and remaining budget govern provider retries.
+- Stable identity crosses attempts, while each attempt consumes its own provider capacity.
+- The executable source, adapter and tests share one exception policy.
 
-1. **Retry loop outside semaphore** — never sleep while holding resources
-2. **Queue timeout is not retryable** — overload should fail fast
-3. **httpx exceptions ≠ asyncio exceptions** — handle both
-4. **SDK retries multiply** — disable or account for them
-5. **Backoff with jitter** — prevent thundering herd
+## Check yourself
 
----
+**The first POST times out after the provider may have committed, but that provider ignores
+Idempotency-Key. Does setting the header make a retry safe?**
 
-**Next**: [Part 4: Kubernetes](04_kubernetes.md) — multi-pod concerns and distributed systems.
+<details><summary>Reasoned answer</summary>
+
+No. The provider must implement the contract. Keep `provider_deduplicates=False` and
+reconcile the remote operation through a supported status/identity mechanism.
+
+</details>
+
+**A 429 asks for 20 seconds of delay but only three seconds remain. Should the caller sleep
+three seconds and send anyway?**
+
+<details><summary>Reasoned answer</summary>
+
+No. That would violate the server's delay and exceed the useful operation budget. Stop
+without another attempt; a later user retry remains subject to the same logical identity.
+
+</details>
+
+### Try it
+
+Change the demo's second response to 401. Add assertions for the final attempt count and
+remaining active permits. Hint: status failures still pass through response cleanup.
+
+<details><summary>Solution</summary>
+
+Expect `ProviderFailure(status=401)`, two starts total and `caller.gate.active == 0`.
+The first 503 is eligible; the second 401 is terminal and must not cause a third attempt.
+
+</details>
+
+**Next**: [Preserve a quota across replicas](04_kubernetes.md).

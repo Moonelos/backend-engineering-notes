@@ -269,4 +269,35 @@ Do not use leases to coordinate a short database-only transaction; a row lock al
 
 ---
 
+## Recap and check yourself
+
+- A lease grants temporary ownership; expiry makes abandoned work reclaimable.
+- A new attempt token distinguishes a replacement from an old process that resumes late.
+- Every mutation and heartbeat checks current ownership, while external effects use their own stable key.
+
+**A returns a valid provider result after B claims token-b. May A complete using token-a?**
+
+<details><summary>Answer</summary>
+
+No. A no longer owns the local mutation; its conditional UPDATE changes zero rows. Reconcile provider evidence under the stable business key.
+
+</details>
+
+**A heartbeat receives zero affected rows but the worker is otherwise healthy. Continue?**
+
+<details><summary>Answer</summary>
+
+No. Liveness does not imply ownership. Stop local work and make no terminal write; another actor or cancellation may have replaced the token/state.
+
+</details>
+
+**Try it:** Use the canonical lifecycle fixture to expire A, recover, claim B, then complete A. Fill the two assertions for A’s return and B’s stored result.
+
+<details><summary>Hint and worked solution</summary>
+
+A valid computed value does not grant current ownership. A returns false; B alone writes its result. Keep the lease-live condition as well as the token condition.
+
+</details>
+
+
 **Next**: [Idempotency and External Effects](03_idempotency_and_external_effects.md)

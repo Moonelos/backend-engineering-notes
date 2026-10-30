@@ -222,6 +222,22 @@ Rules:
 
 ---
 
+A condition wait temporarily releases ownership and must recheck after reacquiring:
+
+```mermaid
+sequenceDiagram
+ participant W as Waiter
+ participant C as Condition and ready predicate
+ participant S as Setter
+ W->>C: acquire; ready false; wait releases lock
+ S->>C: acquire; set ready true; notify_all
+ S->>C: release lock
+ W->>C: reacquire; recheck ready
+ C-->>W: predicate true; proceed
+```
+
+Notification makes the waiter eligible to resume. It neither transfers the lock nor proves the predicate remains true; rechecking under the lock closes that race.
+
 ## 8. Events Are Level-Triggered Signals
 
 Use `threading.Event` for one-way readiness or shutdown signals.
@@ -492,5 +508,29 @@ defaults do not express the required coordination.
 - [`concurrent.futures`](https://docs.python.org/3/library/concurrent.futures.html)
 
 ---
+
+
+## Recap
+
+- Locks protect invariants, conditions protect predicates and queues preserve individual obligations.
+- A stop Event is one boolean state, not a count of messages.
+
+## Check yourself
+
+**Q: Five Event.set calls happen before a waiter runs. Does it consume five events?**
+
+<details><summary>Answer</summary>
+
+No. The Event only remembers a signalled state. Use a queue if each occurrence must be processed.
+
+</details>
+
+**Q: Does notify_all mean every waiter may act without checking again?**
+
+<details><summary>Answer</summary>
+
+No. Each reacquires the lock and rechecks; another waiter may already have consumed the condition.
+
+</details>
 
 **Next**: [Processes and CPU Parallelism](../processes/README.md)

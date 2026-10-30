@@ -261,4 +261,29 @@ Document whether the top-level HTTP status represents transport/batch acceptance
 
 ---
 
+
+## Recap
+
+- Separate public input and output types from internal storage fields.
+- Schema validation precedes authorization and transactional business invariants.
+- Stable problem codes explain failures without exposing internal exception details.
+
+## Check yourself
+
+**Two requests both pass a uniqueness check before either commits. Did schema validation protect the invariant?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Each observed old state; a transactional constraint arbitrates their competing writes. Schema checks alone cannot serialize requests.
+
+</details>
+
+**The input schema omits fraud_score but the response serializes the whole ORM row. Is the field protected?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Output filtering is an independent boundary; use an explicit public response schema.
+
+</details>
+
 **Next**: [Pagination, Filtering, and Search](05_pagination_filtering_and_search.md)

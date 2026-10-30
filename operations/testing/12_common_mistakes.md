@@ -25,8 +25,12 @@ def test_b():
 # ✅ Always clean up — use an autouse fixture
 @pytest.fixture(autouse=True)
 def cleanup_overrides():
-    yield
-    app.dependency_overrides.clear()
+    previous = app.dependency_overrides.copy()
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
 ```
 
 See [05 — Dependency Overrides](05_dependency_overrides.md) for the full cleanup strategy.

@@ -17,6 +17,8 @@
 | Build your first Python API | [FastAPI quick start](fundamentals/fastapi/README.md#quick-start-one-route-and-one-owned-http-client) | Run a route with validated input and an owned HTTP client |
 | Call external APIs or LLMs safely | [HTTPX](fundamentals/httpx/README.md) | Build a reusable client with bounded connections and timeouts |
 | Move work outside the request | [Minimal Durable Task](background_work/foundations/03_minimal_durable_task.md) | Submit, claim, retry, and inspect a recoverable job |
+| Choose practical Python design patterns | [Design patterns](architecture/design_patterns/README.md) | Select behavior, translate integrations and reuse application actions with explicit dependencies |
+| Organize a growing codebase | [Architecture decision guide](architecture/01_architecture_decision_guide.md) | Choose layers, slices, modules and ports from concrete requirements |
 | Separate business logic from transports | [Hexagonal Architecture](architecture/hexagonal_architecture/README.md) | Run one application action through API and worker adapters |
 
 ---
@@ -27,7 +29,7 @@
 
 | Area | Covers | Start here |
 |---|---|---|
-| [Core Python](fundamentals/core_concepts/README.md) | Typing, iteration, data models, resource lifetimes, exceptions, logging, configuration, signals | [Type-checking workflow](fundamentals/core_concepts/typing_workflow.md) |
+| [Core Python](fundamentals/core_concepts/README.md) | Typing, iteration, data models, resource lifetimes, exceptions, logging, configuration, signals | [Type-checking workflow](fundamentals/core_concepts/typing/typing_workflow.md) |
 | [Concurrency](fundamentals/concurrency/README.md) | Asyncio, threads, processes, shared-state safety, and runtime choices | [Decision guide](fundamentals/concurrency/00_decision_guide.md) |
 | [HTTP clients](fundamentals/httpx/README.md) | HTTPX request lifecycle, pooling, timeouts, streaming, and client selection | [Mental model](fundamentals/httpx/01_mental_model.md) |
 | [FastAPI](fundamentals/fastapi/README.md) | HTTP mapping, dependency injection, Pydantic, authentication, middleware, streaming, and API security | [Quick start](fundamentals/fastapi/README.md#quick-start-one-route-and-one-owned-http-client) |
@@ -49,12 +51,30 @@
 | Area | Covers | Start here |
 |---|---|---|
 | [Background Work](background_work/README.md) | Durable tasks, queues, scheduling, stateful workflows, reliability, operations, and framework selection | [Minimal durable task](background_work/foundations/03_minimal_durable_task.md) |
+| [Modular Monolith](architecture/modular_monolith/README.md) | Business ownership, module APIs, slices, shared transactions, enforcement and extraction | [Define module boundaries](architecture/modular_monolith/01_define_module_boundaries.md) |
 | [Hexagonal Architecture](architecture/hexagonal_architecture/README.md) | Ports, adapters, transactions, composition, APIs, workers, GenAI, shared libraries, and a service case study | [Why hexagonal architecture](architecture/hexagonal_architecture/01_why_hexagonal_architecture.md) |
 | [Long-Running Tasks](architecture/long_running_tasks/README.md) | Orchestration, client delivery, worker patterns, infrastructure, sagas, and outbox | [Overview](architecture/long_running_tasks/README.md) |
 | [Testing](operations/testing/README.md) | pytest, endpoint tests, dependency overrides, fixtures, databases, mocking, CI, and LLM tests | [Testing setup](operations/testing/02_setup.md) |
 | [Deployment](operations/deployment/README.md) | Docker, Uvicorn, Gunicorn, health checks, graceful shutdown, and production rollout | [Docker and deployment](operations/deployment/docker_and_deployment.md) |
 
 Each area index contains its complete ordered catalog of guides.
+
+---
+
+## Production extensions
+
+The production branches assume the linked Python, HTTP, SQL and async foundations. Each chapter states its baseline, failure boundaries and verification requirements. [Glossary](GLOSSARY.md) provides lookup for the new concepts.
+
+| Goal | Path |
+|---|---|
+| Ship and recover safely | [Releases](operations/deployment/02_ci_cd_and_releases.md) → [Kubernetes when needed](operations/deployment/03_kubernetes_runtime.md) → [SLOs](infrastructure/observability/05_alerting_and_slos.md) → [Incidents](operations/incident_response/README.md) |
+| Preserve data correctness and isolation | [Query performance](fundamentals/database/11_query_performance.md) → [Constraints](fundamentals/database/12_data_modeling_and_constraints.md) → [Tenancy](fundamentals/database/13_multi_tenancy.md) → [Uploads](fundamentals/fastapi/12_file_uploads_and_object_storage.md) |
+| Select durable messaging | [Broker guide](infrastructure/messaging/README.md) → [Events and projections](architecture/event_driven_architecture/README.md) |
+| Build an LLM feature | [LLM systems](architecture/llm_systems/README.md), with [search](infrastructure/search/README.md) when evidence retrieval is needed |
+| Bound operational risk | [Resilience](architecture/resilience/README.md), [secrets](infrastructure/secrets/README.md), [load testing](operations/testing/14_load_and_performance_testing.md), [cost management](operations/cost_management/README.md) |
+| Maintain application contracts | [Packaging](fundamentals/python_packaging/README.md), [schema evolution](fundamentals/data_validation/README.md), [SaaS lifecycle](architecture/saas_patterns/README.md), [developer workflow](operations/developer_experience/README.md) |
+
+Stop after the branch that meets your workload; these additions do not require adopting Kubernetes, multiple regions, a separate search cluster or every broker.
 
 ---
 
@@ -89,12 +109,12 @@ logging, configuration, or shutdown mechanisms.
 
 1. [API Fundamentals and Selection](apis/README.md) — contracts and interaction choices
 2. [RESTful APIs](apis/restful/README.md) — HTTP semantics, resources, reliability, security, and operations
-3. [Configuration](fundamentals/core_concepts/configuration.md) — settings management
+3. [Configuration](fundamentals/core_concepts/runtime/configuration.md) — settings management
 4. [Authentication](fundamentals/fastapi/04_authentication.md) — JWT, OAuth2
 5. [Middleware](fundamentals/fastapi/05_middleware.md) — request ID, timing, CORS
 6. [Error Handling](fundamentals/fastapi/07_error_handling.md) — consistent error responses
 7. [API Design](fundamentals/fastapi/10_api_design.md) — FastAPI resource implementation
-8. [Structured Logging](fundamentals/core_concepts/structlog_guide.md) — structlog
+8. [Structured Logging](fundamentals/core_concepts/runtime/logging/structlog_guide.md) — structlog
 9. [Docker](operations/deployment/docker_and_deployment.md) — containerization
 
 **Stop here if** the deployed API has explicit authorization, error, observability, and shutdown
@@ -108,7 +128,7 @@ or a specific failure mode requires them.
 **Working result by entry 2**: choose the interaction boundary and run a reusable bounded HTTP client.
 
 1. [API Styles and Selection](apis/02_api_styles_and_selection.md) — understand the integration boundary
-2. [HTTPX Guide](fundamentals/httpx/README.md) — understand the HTTP client
+2. [HTTPX first client](fundamentals/httpx/README.md#first-bounded-client) — run the bounded local example, then inspect reuse and deadlines
 3. [Safe API Calls](fundamentals/fastapi/safe_and_scalable_api_calls/README.md) — production patterns
 4. [Webhooks](apis/webhooks/README.md) — durable callbacks when a provider pushes events
 5. [Testing LLM Code](operations/testing/13_testing_llm_code.md) — prompt builders, adapters, schemas, evals

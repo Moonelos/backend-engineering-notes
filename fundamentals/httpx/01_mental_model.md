@@ -89,11 +89,14 @@ Request 2 → reuse socket → HTTP only
 Request 3 → reuse socket → HTTP only
 ```
 
-Subsequent requests skip handshakes entirely.
+Subsequent requests skip handshakes when they reuse an available compatible connection.
 
 ### When Does a New Handshake Occur?
 
-A new handshake happens only when:
+A compatible idle connection can be reused. A new handshake is needed when no usable
+connection exists, including:
+- A request targets a different origin
+- Concurrent HTTP/1.1 work occupies all compatible connections below the configured ceiling
 - Server closes the connection (timeout, max requests)
 - OS closes the connection (idle timeout)
 - Pool limit forces closure (too many idle connections)
@@ -257,3 +260,19 @@ The request waits until:
 ---
 
 **Next**: [Connection Pooling](02_connection_pooling.md) — detailed pool configuration
+
+## Check your understanding
+
+A client owns the pool; a request borrows compatible transport capacity. Sequential reuse and concurrent demand are different.
+
+**Prediction:** Two same-origin HTTP/1.1 requests overlap and the first connection is busy; the pool limit is ten. Must the second reuse the first?
+
+<details><summary>Answer</summary>
+No. It may open another compatible connection below the limit. Reuse requires an available connection; HTTP/2 multiplexing is a different capacity model.
+</details>
+
+**Diagnosis:** A fresh client is created for each request. Why do handshakes stay high?
+
+<details><summary>Answer</summary>
+Each client has a separate pool and closing it discards reuse opportunities. Share a lifecycle-owned client instead.
+</details>

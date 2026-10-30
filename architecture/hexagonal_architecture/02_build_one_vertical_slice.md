@@ -275,3 +275,35 @@ requires SDK types in the port, revisit which side owns the translation.
 ---
 
 **Next**: [Part 3 — Dependencies Point Toward Business Policy](03_dependencies_point_toward_business_policy.md)
+
+## Recap and retrieval
+
+- One action provides a result that both HTTP and worker entry points can use.
+- The caller-owned port fixes the values the action understands.
+- Replacing an adapter changes external mechanics while preserving action semantics.
+
+**A classifier returns an SDK object instead of str. Does matching the method name satisfy the port?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The port’s result contract is str. Translate the SDK object inside the adapter and assert both handlers observe the same domain result.
+
+</details>
+
+**A new provider needs tenant identity. Where must trusted identity originate?**
+
+<details><summary>Reasoned answer</summary>
+
+At the authenticated entry boundary and application input, not from untrusted model/provider output.
+
+</details>
+
+**Try it:** Replace the classifier with a scaffold whose classify method returns str, and assert both HTTP and worker outputs.
+
+Hint: Translate provider-specific fields before returning from the adapter.
+
+<details><summary>Worked solution</summary>
+
+Implement classify to return the domain label string; inject it into the same action used by both handlers. Assert their domain outcome agrees while preserving their distinct transport envelopes.
+
+</details>

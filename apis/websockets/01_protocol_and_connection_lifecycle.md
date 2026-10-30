@@ -168,4 +168,29 @@ Do not send large file uploads over WebSocket unless the application truly needs
 
 ---
 
+
+## Recap
+
+- The upgrade establishes a channel, not a message-processing guarantee.
+- Frames and messages are different units; the application owns message semantics.
+- A lost peer can vanish without close, so liveness and cleanup need deadlines.
+
+## Check yourself
+
+**A phone sleeps and no close frame arrives. Can presence remain true indefinitely?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The connection can disappear without a handshake; liveness deadlines/leases and exceptional cleanup must release its state.
+
+</details>
+
+**Does the Sec-WebSocket-Key handshake value authenticate a user?**
+
+<details><summary>Reasoned answer</summary>
+
+No. It participates in protocol negotiation. A separate session/token decision establishes user identity.
+
+</details>
+
 **Next**: [Message Protocols and Contracts](02_message_protocols_and_contracts.md)

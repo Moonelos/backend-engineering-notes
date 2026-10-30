@@ -158,7 +158,7 @@ The worker contract therefore requires the following. **The first three cannot b
 
 ⚠️ **The heartbeat has a hard ceiling.** An SQS message's visibility timeout cannot be extended beyond **12 hours from first receipt**, and each extension does not reset that clock. A job that runs longer than 12 hours is redelivered while the original worker is still running it — the same failure shape as the Redis `visibility_timeout` loop above, just with a longer fuse. The escape hatch is structural: split the work into steps that each finish well inside the window, or hand the long-lived coordination to a workflow engine (§5). Source: [SQS visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html), checked 2026-08-03.
 
-⚠️ **A DLQ does not reset the retention clock.** For standard queues a message keeps its *original* enqueue timestamp when it is moved to the DLQ, so it expires on the source queue's retention period, measured from when it was first sent — not from when it was dead-lettered. Set the DLQ's retention longer than the source queue's, or the poison messages you were preserving for inspection are deleted out from under you with no event anywhere. Source: [SQS DLQ documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html), checked 2026-08-03.
+⚠️ **A DLQ does not reset the retention clock.** For standard queues a message keeps its *original* enqueue timestamp when it is moved to the DLQ, but expiration uses the **DLQ retention period**, measured from the original enqueue time. A message that spent 1 day in the source with a 4-day DLQ retention has 3 days left, not 4. Set the DLQ's retention longer than the source queue's, or the poison messages you were preserving for inspection are deleted out from under you with no event anywhere. Source: [SQS DLQ documentation](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html), checked 2026-08-03.
 
 One quota bounds the autoscaling advice above: a standard queue allows roughly **120,000 in-flight messages** (received but not yet deleted). Past it, short polling returns an `OverLimit` error and long polling simply stops returning messages — so a fleet that scales out on depth can stall with a deep queue and idle workers, which looks identical to a claim-filter bug.
 
@@ -242,5 +242,28 @@ Web-server background hooks, local thread pools, and local process pools are acc
 For concrete client-notification and callback patterns after work is submitted, continue to [Long-running task patterns](../../architecture/long_running_tasks/README.md).
 
 ---
+
+## Recap and check yourself
+
+- A broker adds a separate commit boundary between accepted database work and pending delivery.
+- An outbox keeps publication intent recoverable; confirmation-after-send deliberately permits duplicate delivery.
+- A visibility or acknowledgement protocol must be combined with application idempotency.
+
+**API commits rise, broker depth is zero, and oldest unpublished age grows. Add workers?**
+
+<details><summary>Answer</summary>
+
+Inspect the publisher and its broker confirmations/connectivity first. Jobs have not crossed the handoff, so idle consumers are expected.
+
+</details>
+
+**A standard SQS message spent one day in its source queue before entering a DLQ with four-day retention. How much remains?**
+
+<details><summary>Answer</summary>
+
+Three days. The original enqueue timestamp remains, but expiration applies the DLQ retention period. Extending only source retention does not grant a new DLQ window.
+
+</details>
+
 
 **Next**: [Task Execution Models](02_task_execution_models.md)

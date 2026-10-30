@@ -227,4 +227,28 @@ review.
 
 ---
 
+
+## Recap
+
+- Choose the scheduler from the bottleneck and the required failure boundary.
+- Bound actual running work separately from caller waiting.
+
+## Check yourself
+
+**Q: A to_thread caller times out after 2 seconds on a 10-second SDK call. Can its capacity permit be reused?**
+
+<details><summary>Answer</summary>
+
+Not if the permit represents actual running work. The thread continues; retain accounting until completion or enforce the SDK's own deadline. A process-local permit also multiplies across workers.
+
+</details>
+
+**Q: Can a CPU loop run alongside an async task merely because both were created as tasks?**
+
+<details><summary>Answer</summary>
+
+No. Cooperative scheduling needs a suspension point. Use a suitable CPU owner and bound admission.
+
+</details>
+
 **Next**: [State, Mutability, and Safety](01_state_and_safety.md)

@@ -1,646 +1,257 @@
-# Part 7: Streaming Response Patterns
+# Part 7: Own a finite SSE request until cleanup completes
 
-<!-- length-justification: This is the canonical bounded-stream implementation note; finite streams, SSE, deadlines, admission ownership, heartbeats, buffering, cancellation, and testing remain together because all retain resources across the response lifetime. -->
+> **Role:** implementation tutorial. Prerequisites: [the bounded JSON caller](03_call_patterns.md), async iteration and the ownership rules in [Part 6](06_advanced_patterns.md).
+>
+> **Outcome:** run a local authenticated SSE proxy that admits before headers, bounds idle and total time, handles disconnects, and releases every resource. The fake provider needs no external API key or billable account.
 
-> **Who this is for**: Engineers who already understand bounded outbound calls and need to apply admission, timeout, and cleanup rules to long-lived streamed responses.
+A JSON caller owns a permit until it has read and closed the response. Streaming extends
+that lifetime: receiving response headers only means the body can begin. A text generation
+may emit a word every second for a minute. Releasing capacity after `client.send()` would
+let hundreds of open bodies hide behind a concurrency limit of four.
 
-> **Principle**: Streaming changes timeout semantics, concurrency accounting, and cancellation behavior.
+Our running request returns three text deltas followed by a semantic completion event.
+The browser receives SSE: UTF-8 text frames separated by a blank line. An event name
+identifies its meaning; a `data:` field contains its payload. This tutorial uses one
+explicit provider dialect, then translates it to client-facing events.
 
-> **Key insight**: A streaming permit belongs to the entire body lifetime, not merely to the instant response headers are created.
+## 1. Trace the owner before writing the endpoint
 
----
+The response object owns the whole ASGI lifetime, including the period before any body
+iterator has started. This matters because calling `aclose()` on a never-started async
+generator does not execute a `finally` block inside that generator.
 
-## 1. How Streaming Changes Everything
-
-### Non-Streaming (Buffered) Response
-
-```
-Client request
-  ↓
-Server processes (10-60s)
-  ↓
-Server sends complete response
-  ↓
-Connection closes
-```
-
-**Characteristics**:
-- Single response body
-- Clear "done" signal
-- Predictable timeout behavior
-- Semaphore released at response end
-
-### Streaming Response
-
-```
-Client request
-  ↓
-Server sends first chunk (fast)
-  ↓
-Server sends chunk... (ongoing)
-  ↓
-Server sends chunk... (ongoing)
-  ↓
-Server sends final chunk
-  ↓
-Connection closes
+```mermaid
+sequenceDiagram
+  participant B as Browser
+  participant O as FiniteSSE owner
+  participant G as Capacity gate
+  participant P as Provider response
+  B->>O: GET /events with verified identity
+  O->>G: acquire 1 unit; at most 1 second
+  G-->>O: lease owned
+  O->>P: open + validate status + first useful frame
+  P-->>O: text 0
+  O-->>B: 200 headers, then SSE delta
+  P-->>O: text 1
+  O-->>B: SSE delta
+  B->>O: disconnect
+  O->>O: cancel and join owned work
+  O->>P: await response close
+  O->>G: release 1 unit
 ```
 
-**Characteristics**:
-- Multiple chunks over time
-- "Done" only when stream ends
-- Timeout must be per-chunk, not total
-- Semaphore held for entire stream duration
-- Client can disconnect mid-stream
+The ordering is the guarantee: provider close precedes permit release. No admission
+rejection can become a 503 after 200 headers have been sent. The fixture therefore
+acquires capacity, opens the actual provider request, validates status/content type and
+obtains a useful first frame **before** sending headers. It does not run a preliminary
+`/models` request: that tests another operation and cannot reserve success for the real one.
 
----
+[FiniteSSE and StreamOwner](examples/advanced_streaming.py) are complete implementations.
+`StreamOwner` retains exactly one byte iterator, its partial-frame buffer, the HTTPX
+response and semantic outcome. HTTPX manual streaming requires explicit `aclose()`;
+its [async streaming guide](https://www.python-httpx.org/async/) documents that ownership
+obligation. An async context manager is preferable when the whole lifetime fits one scope.
 
-## 2. Key Differences
+## 2. Give each wait the right clock
 
-| Aspect | Buffered | Streaming |
-|--------|----------|-----------|
-| Response timing | One shot | Continuous |
-| Timeout meaning | Total time | Per-chunk gap |
-| Semaphore duration | Request time | Stream duration |
-| Memory usage | Entire response | Chunk size |
-| Cancellation | Clean | Must handle mid-stream |
-| Client disconnect | Clear error | May be silent |
+| Bound | Fixture default | What it protects |
+|---|---:|---|
+| Admission | 1 second | Time spent waiting to own local capacity |
+| First response/frame | 5 seconds | Open, status validation and first useful data |
+| Idle frame | 30 seconds | Time to obtain the next complete provider frame |
+| Total operation | 90 seconds | Admission, startup, reads and downstream sends together |
+| Downstream send | 5 seconds | One client write which stops making progress |
+| HTTPX transport | 5 seconds in local app | Connection/pool/read/write operations underneath |
 
----
+The total clock starts when the response owner runs. A provider emitting every 20 seconds
+keeps satisfying a 30-second idle bound but still stops at 90 seconds. A finite product
+response needs both. A truly indefinite subscription is a different contract: use a
+renewable session policy, explicit shutdown/reconnect semantics and a separate capacity
+pool; do not silently remove the total bound from a finite generation endpoint.
 
-## 3. Timeout Behavior for Streaming
+Cancellation deadlines trigger cleanup; they cannot guarantee that a remote provider
+stops processing at that instant. Cleanup can also take bounded transport time. At 90
+seconds the application stops ordinary work, closes the response, joins owned tasks and
+releases admission. Measure cleanup latency separately from the user-visible deadline.
 
-### The Problem
+The admission timeout encloses acquisition itself. This is incorrect in principle:
+first await the semaphore forever, then start a timer for the stream. It leaves the
+waiting population unbounded in time even though the provider portion is timed.
 
-With buffered response:
-```python
-async with asyncio.timeout(30):  # 30s for entire response
-    response = await client.post(...)
-```
+## 3. Frame meaning is different from socket progress
 
-With streaming, this **breaks**:
-```python
-async with asyncio.timeout(30):  # WRONG: stream may take 60s total
-    async with client.stream(...) as response:
-        async for chunk in response.aiter_bytes():
-            yield chunk  # Each chunk is fast, but total > 30s
-```
+The fake provider emits this wire representation:
 
-### The Solution: Per-Chunk Timeout
+```text
+data: {"text":"0"}
 
-HTTPX's `read` timeout already works per-chunk:
-```python
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(30.0, read=30.0)  # 30s between chunks, not total
-)
-```
+data: {"text":"1"}
 
-This is **safe for streaming** because the timer resets on each chunk.
+data: {"text":"2"}
 
----
-
-## 4. Streaming Call Pattern
-
-```python
-import asyncio
-import httpx
-from typing import AsyncIterator
-from aiolimiter import AsyncLimiter
-
-
-# === GLOBAL PRIMITIVES ===
-llm_sem = asyncio.Semaphore(50)
-llm_rate = AsyncLimiter(60, 60)
-client: httpx.AsyncClient = None
-
-
-async def stream_llm(payload: dict) -> AsyncIterator[str]:
-    """
-    Streaming LLM call with proper concurrency handling.
-    
-    Key differences from buffered:
-    - Semaphore held for entire stream duration
-    - Queue timeout only covers stream initiation
-    - No total timeout (per-chunk timeout via httpx)
-    """
-    
-    # Acquire resources + open the stream under a short queue timeout.
-    # The timeout MUST NOT wrap the streaming loop itself, or the whole
-    # stream would be cancelled after 5s regardless of per-chunk progress.
-    async with llm_rate:
-        async with llm_sem:
-            # NOTE: Semaphore is held for ENTIRE stream duration.
-
-            async with asyncio.timeout(5):
-                stream_cm = client.stream(
-                    "POST",
-                    "https://api.openai.com/v1/chat/completions",
-                    json={**payload, "stream": True},
-                )
-                response = await stream_cm.__aenter__()
-                response.raise_for_status()
-
-            try:
-                # Stream body: NO wall-clock timeout here.
-                # httpx read timeout applies per-chunk (resets each chunk).
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data != "[DONE]":
-                            yield data
-            finally:
-                await stream_cm.__aexit__(None, None, None)
-```
-
----
-
-## 5. The Semaphore Duration Problem
-
-### Issue
-
-For buffered responses:
-```
-Semaphore acquired → request sent → response received → semaphore released
-Duration: ~1-30s
-```
-
-For streaming responses:
-```
-Semaphore acquired → stream starts → chunks... chunks... → stream ends → semaphore released
-Duration: ~10-120s (depending on output length)
-```
-
-**Streaming holds semaphore slots much longer**, reducing effective concurrency.
-
-### Calculation
+data: [DONE]
 
 ```
-Buffered:
-- Semaphore size: 50
-- Average response time: 5s
-- Effective throughput: 50 / 5s = 10 req/s
 
-Streaming:
-- Semaphore size: 50
-- Average stream duration: 30s
-- Effective throughput: 50 / 30s = 1.67 req/s
+`StreamOwner.next()` checks `[DONE]` before decoding JSON. A delta must be a JSON object
+with a string `text`. The client receives `event: delta`, `event: done`, or a sanitized
+`event: error` with a stable code. EOF without the terminal marker means the completion
+is unknown, even if ten thousand chunks arrived. Chunk count is a progress metric, not
+proof that the model completed or that final usage was delivered.
+
+This parser intentionally accepts only one LF-delimited `data:` line per provider frame.
+It rejects multiline SSE fields, CRLF variants and other event types; it is a complete
+fixture for this stated dialect, not a general SSE implementation. A production adapter
+must implement the selected provider's documented field/event contract. The browser-side
+SSE protocol also supports IDs, comments and multiline data; see the
+[HTML event-stream specification](https://html.spec.whatwg.org/multipage/server-sent-events.html#parsing-an-event-stream).
+Do not forward raw provider bytes while claiming to parse arbitrary SSE correctly.
+
+The retained parser buffer is limited to 4096 bytes, total provider bytes to 262144, and compressed bodies are rejected. A total byte limit also bounds a provider which emits small frames extremely quickly.
+The transport may hand the application one larger chunk before it is rejected; this is
+an application bound on retained parsing data, not a claim about kernel/proxy buffer
+sizes. HTTPX, your proxy and the provider need compatible transport limits. Payloads
+larger than the fixture contract must fail, not accumulate until memory exhaustion.
+
+## 4. Backpressure starts with reading less
+
+The baseline has no producer queue. It reads a frame, awaits the browser send, then
+reads the next frame. If the browser slows down, the owner stops reading upstream;
+transport flow control propagates the pressure. A five-second send bound prevents a
+client which never reads from retaining a permit indefinitely.
+
+Sometimes transformation or merging needs a queue. Bound both the queue cardinality
+and individual frame size. Four 4 KiB frames give at most about 16 KiB of queued payload
+per request, in addition to decoder and transport buffers. An unbounded `Queue()` or
+`put_nowait()` loop defeats backpressure. [Part 8's bounded merge](08_streaming_advanced.md)
+uses one owned producer per source, source-labelled terminal/error events, and cancel/join
+on consumer exit. Producer failure must reach the consumer; a dead producer and an
+empty queue must not leave a consumer waiting forever.
+
+Proxy buffering can hide early chunks even when application code is correct. The fixture
+sets `Cache-Control: no-cache` and `X-Accel-Buffering: no`; the latter is only a hint to
+compatible proxy configuration. Test through your actual ingress with a slow reader.
+Heartbeats, if the chosen protocol allows them, keep middleboxes aware of an idle stream;
+they must not reset a product's hard total deadline or stand in for semantic progress.
+
+## 5. Atomic weighted capacity
+
+A small stream may reserve one unit while an expensive transformation reserves three.
+Acquiring three semaphore tokens one at a time is unsafe: timeout after the second
+acquisition leaks two tokens unless partial ownership is correctly unwound, and two
+large requests can each hold partial capacity forever.
+
+[WeightedGate](examples/advanced_streaming.py) instead waits under an `asyncio.Condition`
+until `used + weight <= capacity`, then increments `used` once. Cancellation before that
+increment owns zero units; after it, cleanup subtracts the whole weight. Invalid weights
+(zero, negative or larger than capacity) fail immediately. Waiting callers are counted
+and capped separately from active units.
+
+For capacity three with two units occupied, a request for two units waits; it does not
+hold the remaining unit. If its timeout expires, usage remains two. The regression test
+asserts exactly this state and zero waiters. This simple gate is not FIFO: small requests
+can overtake large ones. Choose reserved classes or a fair dispatcher if starvation is
+unacceptable. A weight estimates local resources; it is not a financial token reservation.
+
+## 6. Run the whole proxy and client
+
+From `examples/`, use the environment from Part 6 or create it:
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/pip install -r advanced_requirements.txt
+.venv/bin/python -m pytest -q advanced_test_streaming.py
+.venv/bin/uvicorn advanced_stream_app:app --host 127.0.0.1 --port 8087
 ```
 
-### Solutions
+In another terminal:
 
-#### Option 1: Larger Semaphore for Streaming
-
-```python
-# Separate semaphores
-buffered_sem = asyncio.Semaphore(50)
-streaming_sem = asyncio.Semaphore(100)  # Larger for longer duration
+```bash
+curl -N -H 'Authorization: Bearer local-demo' http://127.0.0.1:8087/events
+curl -H 'Authorization: Bearer local-demo' http://127.0.0.1:8087/metrics
+curl -i http://127.0.0.1:8087/events
 ```
 
-#### Option 2: Weighted Semaphore
-
-```python
-from asyncio import Semaphore
-
-class WeightedSemaphore:
-    """Semaphore that accounts for expected duration."""
-    
-    def __init__(self, total_weight: int):
-        self._sem = Semaphore(total_weight)
-        self._total = total_weight
-    
-    async def acquire(self, weight: int = 1):
-        for _ in range(weight):
-            await self._sem.acquire()
-    
-    def release(self, weight: int = 1):
-        for _ in range(weight):
-            self._sem.release()
-
-
-# Usage
-sem = WeightedSemaphore(100)
-
-# Buffered call: weight 1
-await sem.acquire(1)
-result = await buffered_call()
-sem.release(1)
-
-# Streaming call: weight 3 (expected 3x duration)
-await sem.acquire(3)
-async for chunk in stream_call():
-    yield chunk
-sem.release(3)
-```
-
-#### Option 3: Accept Lower Throughput
-
-For many use cases, streaming's value (faster time-to-first-token) outweighs the throughput reduction. Simply size your infrastructure accordingly.
-
----
-
-## 6. Client Disconnection Handling
-
-### The Problem
-
-Client can disconnect mid-stream:
-- Browser closed
-- Network failure
-- Client timeout
-
-Your server may not know immediately.
-
-### Detection in FastAPI
-
-```python
-from fastapi import Request
-from fastapi.responses import StreamingResponse
-
-
-async def stream_with_disconnect_check(
-    request: Request,
-    payload: dict,
-) -> AsyncIterator[str]:
-    """Stream with client disconnect detection."""
-    
-    async with llm_sem:
-        async with client.stream(...) as response:
-            async for chunk in response.aiter_lines():
-                # Check if client disconnected
-                if await request.is_disconnected():
-                    # Client gone - cleanup and exit
-                    break
-                
-                yield chunk
-
-
-@app.post("/stream")
-async def stream_endpoint(request: Request, payload: dict):
-    return StreamingResponse(
-        stream_with_disconnect_check(request, payload),
-        media_type="text/event-stream",
-    )
-```
-
-### Cleanup on Disconnect
-
-```python
-async def stream_with_cleanup(
-    request: Request,
-    payload: dict,
-) -> AsyncIterator[str]:
-    """Stream with proper cleanup on any exit."""
-    
-    try:
-        async with llm_sem:
-            async with client.stream(...) as response:
-                async for chunk in response.aiter_lines():
-                    if await request.is_disconnected():
-                        break
-                    yield chunk
-    
-    finally:
-        # Always runs: normal completion, disconnect, or error
-        await record_stream_end()
-```
-
----
-
-## 7. Retry Logic for Streaming
-
-### The Challenge
-
-Streaming retries are complex:
-- Can't retry mid-stream (client already received data)
-- Retry only makes sense **before first chunk**
-- After first chunk, failure = failure
-
-### Strategy: Retry Only Stream Initiation
-
-```python
-async def stream_llm_with_retry(payload: dict) -> AsyncIterator[str]:
-    """
-    Retry only applies to stream initiation, not mid-stream failures.
-    """
-    
-    for attempt in range(3):
-        try:
-            async with llm_rate:
-                async with llm_sem:
-                    # Queue timeout wraps acquisition + stream open only.
-                    async with asyncio.timeout(5):
-                        stream_cm = client.stream(...)
-                        response = await stream_cm.__aenter__()
-                        response.raise_for_status()  # Check before streaming
-
-                    try:
-                        # Once we start yielding, no retry possible.
-                        first_chunk = True
-                        async for line in response.aiter_lines():
-                            if first_chunk:
-                                first_chunk = False
-                                # Past this point, retry is not possible.
-
-                            yield line
-                    finally:
-                        await stream_cm.__aexit__(None, None, None)
-
-                    return  # Stream completed successfully
-        
-        except httpx.HTTPStatusError as e:
-            if 500 <= e.response.status_code < 600 and attempt < 2:
-                await asyncio.sleep(backoff(attempt))
-                continue
-            raise
-        
-        except httpx.ConnectError:
-            if attempt < 2:
-                await asyncio.sleep(backoff(attempt))
-                continue
-            raise
-```
-
-### Alternative: Wrapper with Pre-Check
-
-```python
-async def stream_llm_safe(payload: dict) -> AsyncIterator[str]:
-    """
-    Validate connection before streaming.
-    Retry happens at validation, not stream.
-    """
-    
-    # Phase 1: Validate (retryable)
-    for attempt in range(3):
-        try:
-            # Quick validation request
-            health = await client.get("https://api.openai.com/v1/models")
-            health.raise_for_status()
-            break
-        except Exception:
-            if attempt < 2:
-                await asyncio.sleep(backoff(attempt))
-                continue
-            raise
-    
-    # Phase 2: Stream (not retryable)
-    async for chunk in stream_llm(payload):
-        yield chunk
-```
-
----
-
-## 8. Server-Sent Events (SSE) Pattern
-
-### Complete SSE Implementation
-
-```python
-import asyncio
-import json
-import httpx
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
-from aiolimiter import AsyncLimiter
-from typing import AsyncIterator
-
-
-# === GLOBAL PRIMITIVES ===
-llm_sem = asyncio.Semaphore(50)
-llm_rate = AsyncLimiter(60, 60)
-client: httpx.AsyncClient = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(
-            connect=5.0,
-            read=60.0,   # Per-chunk timeout for streaming
-            write=10.0,
-            pool=5.0,
-        ),
-        limits=httpx.Limits(
-            max_connections=100,  # Higher for streaming
-            max_keepalive_connections=30,
-        ),
-    )
-    yield
-    await client.aclose()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-async def generate_sse_stream(
-    request: Request,
-    payload: dict,
-) -> AsyncIterator[str]:
-    """
-    Generate SSE-formatted stream.
-    """
-    
-    try:
-        async with llm_rate:
-            async with llm_sem:
-                # Queue timeout wraps ONLY acquisition + stream open.
-                # It must NOT wrap the streaming loop.
-                async with asyncio.timeout(5):
-                    stream_cm = client.stream(
-                        "POST",
-                        "https://api.openai.com/v1/chat/completions",
-                        json={**payload, "stream": True},
-                        headers={"Authorization": f"Bearer {API_KEY}"},
-                    )
-                    response = await stream_cm.__aenter__()
-                    response.raise_for_status()
-
-                try:
-                    async for line in response.aiter_lines():
-                        # Check disconnect
-                        if await request.is_disconnected():
-                            break
-
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                yield "data: [DONE]\n\n"
-                                break
-                            else:
-                                # Forward chunk
-                                yield f"data: {data}\n\n"
-                finally:
-                    await stream_cm.__aexit__(None, None, None)
-
-    except asyncio.TimeoutError:
-        yield f"data: {json.dumps({'error': 'timeout'})}\n\n"
-    
-    except httpx.HTTPStatusError as e:
-        yield f"data: {json.dumps({'error': f'upstream error: {e.response.status_code}'})}\n\n"
-    
-    except Exception as e:
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-
-@app.post("/v1/chat/completions/stream")
-async def stream_chat(request: Request, payload: dict):
-    """
-    SSE streaming endpoint.
-    """
-    return StreamingResponse(
-        generate_sse_stream(request, payload),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # Disable nginx buffering
-        },
-    )
-```
-
----
-
-## 9. Metrics and Observability for Streaming
-
-### Key Metrics
-
-| Metric | What it measures |
-|--------|------------------|
-| `stream_duration_seconds` | Total stream time |
-| `time_to_first_chunk_seconds` | Latency to first data |
-| `chunks_per_stream` | Output size proxy |
-| `stream_errors_total` | By error type |
-| `client_disconnects_total` | Premature closures |
-| `active_streams` | Current streaming connections |
-
-### Implementation
-
-```python
-import time
-from dataclasses import dataclass
-from typing import Optional
-
-
-@dataclass
-class StreamMetrics:
-    start_time: float
-    first_chunk_time: Optional[float] = None
-    chunk_count: int = 0
-    error: Optional[str] = None
-    client_disconnected: bool = False
-
-
-async def stream_with_metrics(
-    request: Request,
-    payload: dict,
-) -> AsyncIterator[str]:
-    """Stream with comprehensive metrics."""
-    
-    metrics = StreamMetrics(start_time=time.time())
-    
-    try:
-        async with llm_sem:
-            async with client.stream(...) as response:
-                async for chunk in response.aiter_lines():
-                    if await request.is_disconnected():
-                        metrics.client_disconnected = True
-                        break
-                    
-                    # Record first chunk time
-                    if metrics.first_chunk_time is None:
-                        metrics.first_chunk_time = time.time()
-                    
-                    metrics.chunk_count += 1
-                    yield chunk
-    
-    except Exception as e:
-        metrics.error = type(e).__name__
-        raise
-    
-    finally:
-        duration = time.time() - metrics.start_time
-        ttfc = (metrics.first_chunk_time - metrics.start_time
-                if metrics.first_chunk_time else None)
-        
-        # Record metrics
-        await record_stream_metrics(
-            duration=duration,
-            time_to_first_chunk=ttfc,
-            chunks=metrics.chunk_count,
-            error=metrics.error,
-            disconnected=metrics.client_disconnected,
-        )
-```
-
----
-
-## 10. Backpressure and Flow Control
-
-### The Problem
-
-If client is slow to consume chunks:
-- Server buffers chunks in memory
-- Memory usage grows
-- Eventually OOM or degraded performance
-
-### Solution: Bounded Buffer
-
-FastAPI's `StreamingResponse` handles this via asyncio's flow control, but you can add explicit backpressure:
-
-```python
-async def stream_with_backpressure(
-    payload: dict,
-    max_buffer: int = 10,
-) -> AsyncIterator[str]:
-    """
-    Stream with explicit backpressure handling.
-    """
-    
-    buffer = asyncio.Queue(maxsize=max_buffer)
-    
-    async def producer():
-        async with client.stream(...) as response:
-            async for chunk in response.aiter_lines():
-                await buffer.put(chunk)  # Blocks if buffer full
-            await buffer.put(None)  # Sentinel
-    
-    # Start producer
-    producer_task = asyncio.create_task(producer())
-    
-    try:
-        while True:
-            chunk = await buffer.get()
-            if chunk is None:
-                break
-            yield chunk
-    finally:
-        producer_task.cancel()
-```
-
----
-
-## 11. Summary: Streaming vs Buffered
-
-| Aspect | Buffered Pattern | Streaming Pattern |
-|--------|------------------|-------------------|
-| Timeout | Total request time | Per-chunk gap |
-| Semaphore | Short duration | Long duration (size accordingly) |
-| Retry | Any failure | Only before first chunk |
-| Disconnect | Clear error | Must detect explicitly |
-| Memory | Full response | Chunk size |
-| Metrics | Simple | Need TTFC, duration, chunks |
-| Backpressure | Automatic | Consider explicitly |
-
----
-
-## Key Principles
-
-1. **Streaming holds resources longer** — size semaphores accordingly
-2. **Timeouts must be per-chunk** — use httpx `read` timeout
-3. **Retries only work before first chunk** — design accordingly
-4. **Client disconnect must be detected** — check `request.is_disconnected()`
-5. **Track streaming-specific metrics** — TTFC is crucial
-6. **Consider backpressure** — slow clients can cause problems
-
----
-
-**Next**: [Part 8: Streaming Advanced Patterns](08_streaming_advanced.md) — multi-model routing, partial failure recovery, and streaming aggregation.
+Expect three `delta` events, one `done`, then EOF. The metrics response reports zero active
+units and a `done` outcome. The unauthenticated request returns 401 before any upstream
+work. `local-demo` is a fixed laboratory credential. Replace it with the application's
+verified identity dependency, resolve tenant/tier on the server, and keep a provider key
+only in the provider adapter. Never accept arbitrary upstream URLs from the caller.
+
+The app uses lifespan to own one HTTPX client. The custom response owns every individual
+stream and watches ASGI disconnect messages concurrently with its work. On disconnect
+it cancels and joins the work task; on server cancellation it also joins the disconnect
+watcher. Failure before headers returns 503. Failure afterward emits a sanitized error
+frame if the client is still writable, because HTTP status cannot change mid-response.
+
+The tests use real async byte streams through HTTPX MockTransport, not buffered
+`Response(content=...)` objects. They assert response closure and zero owned units for
+success, bad status, empty first frame, idle timeout, total timeout despite continuous
+progress, client disconnect and stalled downstream send. The 20/30/90-second acceptance
+case is scaled to 20/30/90 milliseconds for deterministic local execution.
+
+## 7. Operate and upgrade the lifetime contract
+
+Watch admission wait/rejections, active units, time to first useful event, idle gaps,
+stream duration, downstream send duration, bytes per stream, semantic outcome and cleanup
+latency. Keep outcome labels bounded; use request IDs in sampled traces rather than
+high-cardinality metric labels. Log a stable error classification, not raw provider
+exceptions which can contain URLs, prompts or credentials.
+
+Before production:
+
+- Test admission saturation before headers and a provider error immediately after headers.
+- Exercise browser disconnect, server shutdown and cancellation while opening the provider.
+  Every path must close the response and return active/waiting gauges to baseline.
+- Configure reverse-proxy buffering, read/write idle limits and maximum response duration
+  against the same product contract; verify through the ingress, not only localhost.
+- Keep streams separate from short JSON calls when their lifetimes would exhaust the
+  shared pool. Test pool limits with the chosen HTTP/1.1 or HTTP/2 transport.
+- Pin framework/transport versions. Run lifecycle tests when upgrading Starlette/HTTPX;
+  middleware and disconnect behavior can change without changing your endpoint signature.
+
+If clients receive all deltas at once, inspect buffering before changing provider concurrency.
+If a successful provider generation is followed by a broken client connection, keep those
+outcomes separate: provider completion does not prove client receipt. If final usage is
+missing, retain the financial obligation as [Part 10](10_llm_token_economics.md) explains.
+
+## Recap
+
+The owner spans admission through awaited cleanup. Admit and validate before headers;
+keep independent idle, total and send bounds; retain one parser iterator; distinguish
+semantic completion from EOF; propagate backpressure and join every task on disconnect.
+
+## Check yourself
+
+<details><summary>The provider emits every 20 seconds. Idle is 30 seconds; total is 90. When does work stop?</summary>
+At the 90-second total deadline. Progress prevents an idle timeout but does not extend
+the product budget. Cleanup closes the provider, joins producers if present and releases
+the owned permit; cleanup latency is measured separately.
+</details>
+
+<details><summary>Why is a generator's finally block insufficient for a response opened before the generator starts?</summary>
+An unstarted generator has not entered its try/finally scope. Its close need not run that
+cleanup. The surrounding response owner must explicitly close resources regardless of
+whether iteration started.
+</details>
+
+## Try it
+
+Change the fake provider to emit a delta and then EOF. Predict the client event and metric
+outcome, then verify the response closes and active units return to zero. Next stall the
+client after the first delta while the provider keeps producing. Keep the send bound
+smaller than total and assert cleanup completes without an accumulating queue.
+
+Scaffold: modify `DemoBytes.__aiter__` to yield one delta, then `return` before the
+terminal marker; finish `assert stats == {_____: 1}` and `assert gate.used == _____`.
+
+Hint: transport EOF cannot prove semantic done, and ownership is independent of outcome.
+
+<details><summary>Reasoned solution</summary>
+Expect `{'failed': 1}` in the response owner's metrics, an in-band
+`stream_interrupted` event after the already-sent 200, and `gate.used == 0`. The underlying
+provider owner never observed done. Stalling downstream triggers the send bound, closes
+the upstream and returns capacity without continuing to buffer new frames.
+</details>
+
+**Next:** [Coordinate multiple streams](08_streaming_advanced.md). **Back:** [learning map](README.md).

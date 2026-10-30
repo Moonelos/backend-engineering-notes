@@ -210,3 +210,25 @@ runnable contract configuration, deliberate failing edge, and behavioral evidenc
 
 **Next**: [Part 4 — Map Code to Owning Boundaries](04_map_code_to_owning_boundaries.md)
 
+
+## Recap and retrieval
+
+- Source imports define dependency direction; runtime calls can dispatch to injected adapters.
+- Caller-owned contracts express what policy needs without importing SDK mechanics.
+- A graph check catches forbidden source edges; behavior tests prove semantics.
+
+**The action calls LLMTicketClassifier at runtime but imports only TicketClassifier. Is inversion violated?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Runtime dispatch reaches the injected implementation while source code depends on the caller-owned contract. Importing the concrete classifier into policy would introduce the prohibited edge.
+
+</details>
+
+**No forbidden imports exist. Is tenant isolation therefore verified?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Import direction constrains coupling, not authorization behavior; assert cross-tenant refusal separately.
+
+</details>

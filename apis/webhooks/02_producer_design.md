@@ -66,21 +66,25 @@ Write business state and an outbox event in one database transaction:
 ```sql
 BEGIN;
 
-UPDATE invoices
-SET status = 'paid', paid_at = now()
-WHERE tenant_id = :tenant_id
-  AND id = :invoice_id
-  AND status = 'open';
-
+WITH changed AS (
+    UPDATE invoices
+    SET status = 'paid', paid_at = now()
+    WHERE tenant_id = :tenant_id
+      AND id = :invoice_id
+      AND status = 'open'
+    RETURNING id
+)
 INSERT INTO webhook_events (
     id, tenant_id, event_type, schema_version, subject, occurred_at, payload
-) VALUES (
-    :event_id, :tenant_id, 'invoice.paid', 1,
-    :subject, now(), CAST(:payload AS jsonb)
-);
+)
+SELECT :event_id, :tenant_id, 'invoice.paid', 1,
+       :subject, now(), CAST(:payload AS jsonb)
+FROM changed;
 
 COMMIT;
 ```
+
+If the invoice was already paid or belongs to another tenant, `changed` has no row and no event is inserted. A real state transition is the source of the event, not merely receiving a command.
 
 An outbox relay reads committed events and creates per-subscription deliveries. Make that step idempotent with a unique constraint:
 
@@ -147,6 +151,40 @@ Partition or fairly schedule by destination/tenant so one failed endpoint cannot
 Never hold a database transaction open during the customer HTTP request.
 
 ---
+
+### A lease survives the claim transaction
+
+For delivery `del_A`, W1 commits `owner=W1, generation=4, lease_until=10:00:30` before
+sending HTTP. The row lock is gone after commit; the persisted lease prevents W2 from
+starting another ordinary attempt during that interval. If W1 dies, W2 may claim at
+10:00:31, atomically incrementing the generation to 5.
+
+```mermaid
+sequenceDiagram
+ participant W1 as W1 generation 4
+ participant DB as Delivery row del_A
+ participant W2 as W2 generation 5
+ participant C as Consumer inbox
+ W1->>DB: Claim until t30; commit
+ W1->>C: Signed evt_1 HTTP attempt
+ Note over W1: Stops before recording result
+ W2->>DB: t31 reclaim expired lease; generation 5
+ W2->>C: Retry same evt_1
+ C-->>W2: 204; one durable receipt
+ W1->>DB: Late completion WHERE generation=4
+ DB-->>W1: Zero rows; stale completion refused
+```
+
+The conditional completion must include delivery ID, owner, generation and active lease
+under one transaction. The same check protects renewal. W1 may still have reached the
+consumer before losing ownership: a lease fences local state writes, not an HTTP side
+effect. Stable signed event identity and the consumer's durable inbox handle that ambiguity.
+
+With 20 global slots and a limit of two per destination, one failing destination occupies
+at most two slots while others proceed. Pick a due destination fairly, acquire its bounded
+slot, and only then claim a short batch for it; claiming thousands of rows before capacity
+is available strands leases in a local queue. On a destination's 429, store its next eligible
+time and release the slot. A delayed retry does not hold worker capacity while sleeping.
 
 ## 6. HTTP Attempt Contract
 
@@ -227,5 +265,30 @@ If sensitive fields become newly available, require an explicit subscription/ver
 - Owners can inspect, test, rotate, pause, and diagnose safely.
 
 ---
+
+
+## Recap
+
+- Only a committed business transition should create its outbox event.
+- Delivery uniqueness prevents relay restart from inventing another logical delivery.
+- Persisted lease generations protect local completion while consumer deduplication protects repeated HTTP attempts.
+
+## Check yourself
+
+**the relay restarts after creating del_A for evt_1 but before advancing its cursor; how many logical deliveries should exist?**
+
+<details><summary>Reasoned answer</summary>
+
+One for that event/subscription, because the unique pair rejects a second delivery; its HTTP attempts may still repeat.
+
+</details>
+
+**W1 returns 204 after W2 reclaimed generation 5. May W1 mark the row delivered?**
+
+<details><summary>Reasoned answer</summary>
+
+Only a current owner with matching generation and valid lease may finish. W1’s stale conditional update must affect zero rows.
+
+</details>
 
 **Next**: [Webhook Consumer Design](03_consumer_design.md)

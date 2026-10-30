@@ -59,6 +59,7 @@ The following `webhook_security.py` matches the import in [Consumer Design](03_c
 
 ```python
 import base64
+import binascii
 import hashlib
 import hmac
 import time
@@ -143,14 +144,24 @@ def verify_webhook(
     if not supplied or len(supplied) > 10:
         raise VerificationError("No supported signature")
 
+    # Compare decoded MAC bytes; malformed Unicode/base64 is an authentication failure.
+    candidates = []
+    for value in supplied:
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (ValueError, binascii.Error):
+            continue  # A malformed rotation candidate cannot authenticate the request.
+        if len(decoded) == hashlib.sha256().digest_size:
+            candidates.append(decoded)
+    if not candidates:
+        raise VerificationError("Malformed webhook signature")
+
     matched = False
     for secret in secrets:
         if len(secret) < 24:
             raise ValueError("Webhook secrets must contain at least 192 bits")
-        expected = base64.b64encode(
-            hmac.new(secret, content, hashlib.sha256).digest()
-        ).decode("ascii")
-        for candidate in supplied:
+        expected = hmac.new(secret, content, hashlib.sha256).digest()
+        for candidate in candidates:
             matched |= hmac.compare_digest(candidate, expected)
 
     if not matched:
@@ -251,6 +262,27 @@ Application URL validation alone is bypass-prone. The network must make forbidde
 
 ---
 
+Which address does the worker actually connect to? A second DNS lookup can differ from the validated first answer.
+
+```mermaid
+sequenceDiagram
+ participant A as Attacker DNS
+ participant W as Producer worker
+ participant E as Egress proxy
+ participant M as Metadata service
+ W->>A: Resolve callback hostname
+ A-->>W: Public address (passes policy)
+ W->>A: Client resolves again at connection
+ A-->>W: 169.254.169.254
+ W->>E: Connect to selected address
+ E-->>W: Deny forbidden destination
+ Note over E,M: No request reaches metadata
+```
+
+Checking the first DNS result does not constrain a later connection. Bind the transport to the approved address while preserving TLS hostname verification, and enforce forbidden-destination policy at egress as an independent boundary. Redirects require the same checks.
+
+---
+
 ## 8. Endpoint Ownership and Abuse
 
 Sending test events to an unverified URL can itself become reflected traffic. Ownership verification should use a bounded challenge and rate limits, and must still pass SSRF controls.
@@ -288,5 +320,38 @@ Prevent abuse:
 - [GitHub: validating webhook deliveries](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)
 
 ---
+
+
+## Recap
+
+- Identity, timestamp and raw bytes are bound by the MAC.
+- Malformed signatures fail authentication; valid signatures still need durable replay protection.
+- DNS validation must constrain the connection actually made and every redirect.
+
+## Check yourself
+
+**a valid evt_1 request is captured and replayed 20 seconds later under a 300-second tolerance; is HMAC enough?**
+
+<details><summary>Reasoned answer</summary>
+
+Its signature and timestamp remain valid, so only the durable event-ID guard prevents a second effect. Leave the duplicate-effect assertion for the learner.
+
+</details>
+
+**The first DNS answer is public and the connection resolves to a private address. Did the first check protect it?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The lookup and connection used different decisions. Pin the approved destination with correct TLS identity and enforce egress restrictions.
+
+</details>
+
+**Try it:** Call verify_webhook with a valid signed body and a header containing both a malformed v1 candidate and a valid candidate. Then alter one byte of the body. Leave the expected outcomes blank.
+
+Hint: Candidate parsing is independent; every accepted candidate still signs the same exact bytes and delivery metadata.
+
+<details><summary>Solution</summary>
+The valid candidate succeeds despite a malformed sibling; altering the body fails VerificationError. Non-ASCII or invalid Base64 alone must also become VerificationError, never an uncaught comparison/type error.
+</details>
 
 **Next**: [Retries, Idempotency, Ordering, and Replay](05_retries_idempotency_ordering_and_replay.md)

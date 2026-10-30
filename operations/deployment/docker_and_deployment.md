@@ -1,6 +1,6 @@
 # Docker and Deployment for FastAPI
 
-<!-- length-justification: This is the canonical deployment path from image construction through process lifecycle and Kubernetes operation; the later orchestration material remains here because health, shutdown, identity, and resource settings must be verified against the same container contract. -->
+<!-- length-justification: The opening lab owns the complete image/lifecycle result. Later sections retain implementation alternatives as reference; release and Kubernetes behavior have separate canonical owners. -->
 
 > **Who this is for**: FastAPI engineers building a reproducible container and carrying its health,
 > shutdown, identity, and capacity contract into deployment.
@@ -11,6 +11,71 @@ A production-focused guide to containerizing and deploying FastAPI applications 
 > runtime contract around identity, signals, health, resources, and rollout.
 
 ---
+
+## Run one image through its full lifetime
+
+Prerequisites: Python 3.11+ for the verification driver and a local Docker daemon. The supplied app
+uses Python 3.12, pinned FastAPI/Uvicorn inputs and a fully resolved hash-checked requirements file.
+It has no database, credentials or external service. From the repository root:
+
+```bash
+docker build -t notes-lifecycle:lab operations/deployment/examples/container_lifecycle
+python3 operations/deployment/examples/container_lifecycle/verify.py notes-lifecycle:lab
+```
+
+The [app](examples/container_lifecycle/app.py), [Dockerfile](examples/container_lifecycle/Dockerfile),
+[dependency lock](examples/container_lifecycle/requirements.txt) and [driver](examples/container_lifecycle/verify.py)
+are the complete example. The driver binds an ephemeral port on loopback, checks the same image
+through each phase and removes its uniquely named container even on failure. Expected assertions:
+
+```text
+PASS non-root uid=10001; ready=503 while health=200
+PASS unhealthy stays running; restart count=0
+PASS in-flight response=200; cleanup complete; exit=0; stop under 12s
+```
+
+The printed image ID identifies the artifact tested. The Python base tag is mutable: record its
+resolved digest and pin that digest in a release build; hashes in `requirements.txt` protect Python
+artifacts, not the operating-system base. Rebuild and rerun after any base or dependency upgrade.
+The test injects failures through files inside its own container, not through public debug routes.
+
+This lifecycle has several owners; inspect where observation becomes action:
+
+```mermaid
+sequenceDiagram
+    participant D as Docker
+    participant U as Uvicorn
+    participant A as FastAPI lifespan
+    participant C as Local client
+    D->>U: Start tested image as uid 10001
+    U->>A: Startup
+    C->>A: GET ready and health
+    A-->>C: ready 503, health 200 after dependency simulation
+    Note over D,A: Docker health failure marks unhealthy, process remains running
+    C->>U: GET slow, bounded to 3 seconds
+    D->>U: SIGTERM, outer grace 12 seconds
+    U-->>C: Finish response before 6-second server drain budget
+    U->>A: Shutdown and resource cleanup
+    U-->>D: Exit 0
+```
+
+Docker's `HEALTHCHECK` changes health status. Its ordinary restart policy responds to process exit,
+not to `unhealthy`. Kubernetes can separately restart after a failed liveness probe or withdraw
+traffic after failed readiness; those are controller decisions. A database outage should usually
+withdraw dependent traffic, not create a fleet-wide restart storm.
+[Docker health](https://docs.docker.com/reference/dockerfile/#healthcheck) and
+[restart policies](https://docs.docker.com/engine/containers/start-containers-automatically/), checked 2026-10-30.
+
+During the slow request, the driver waits for the server's “started” log before sending SIGTERM.
+That establishes the interleaving; sleeping a guessed duration would not prove draining. The server
+owns intake/drain; lifespan owns cleanup; Docker owns the final kill deadline. A real resource
+cleanup budget must fit between server drain and container grace, and must handle partial startup.
+The lab's cleanup is local logging; the resource-owning pattern appears in section 8.
+
+**Stop here** when you can reproduce and explain these observations. The following sections are
+reference variants for real resources, process counts, package managers and Compose. Promote the
+same tested digest through [releases](02_ci_cd_and_releases.md), then apply the
+[Kubernetes runtime](03_kubernetes_runtime.md) only when needed.
 
 ## 1. The Mental Model
 
@@ -80,10 +145,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 | Concern | Single stage | Multi-stage |
 |---------|-------------|-------------|
-| Image size | 800MB+ (gcc, dev headers) | ~150MB (runtime only) |
+| Image size | Includes whatever build tools remain in final layers | Can omit build tools; measure the actual compressed/pulled image |
 | Attack surface | Build tools in production | Minimal runtime |
-| Build cache | Poor (one layer) | Good (builder cached separately) |
-| Secrets exposure | Build-time secrets in final image | Build-time artifacts discarded |
+| Build cache | Supports cacheable layers when inputs are ordered well | Separates builder and runtime cache boundaries |
+| Secrets exposure | Never COPY secrets; use BuildKit secret mounts | Same rule: stage separation alone does not secure caches/history |
 
 ### Why `python:3.12-slim` Over `python:3.12`
 
@@ -164,7 +229,7 @@ Each worker is a fully independent copy of your application. They share nothing 
 
 ### Understanding `--limit-concurrency`
 
-This is your **pod-level admission control**.
+This is your **per-worker admission control**.
 
 ```
 --limit-concurrency 100
@@ -430,7 +495,7 @@ build/
 
 | Endpoint | Question | Used By | Action on Failure |
 |----------|----------|---------|-------------------|
-| `/health` (liveness) | Is the process alive? | Docker, Kubernetes | Restart container |
+| `/health` (liveness) | Is the process responsive? | Docker health observer / Kubernetes liveness controller | Docker marks health; Kubernetes may restart |
 | `/ready` (readiness) | Can it handle traffic? | Load balancer, Kubernetes | Stop sending traffic |
 
 ### Implementation
@@ -449,7 +514,7 @@ async def health():
     """Liveness: is the process running and responsive?
 
     Keep this simple. No external dependency checks.
-    If this fails, the container gets restarted.
+    A failed probe lets its configured observer/controller decide what to do.
     """
     return {"status": "alive"}
 
@@ -514,7 +579,7 @@ async def ready():
     ...
 ```
 
-If liveness depends on the database and the database goes down, **every container restarts in a loop**. The database comes back to a thundering herd of reconnections. This turns a database blip into a full outage.
+If liveness depends on the database and the database goes down, a Kubernetes liveness policy can cause **every affected container to restart in a loop**. The database comes back to a thundering herd of reconnections. This turns a database blip into a full outage.
 
 ### Docker HEALTHCHECK
 
@@ -530,7 +595,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 | `--start-period` | Grace period during startup (failures don't count) |
 | `--retries` | Consecutive failures before marking unhealthy |
 
-> **`--start-period` is critical.** Without it, a slow-starting app (running migrations, loading ML models) gets killed before it finishes starting.
+> **`--start-period` is critical.** Without it, a slow-starting app (running migrations, loading ML models) can be marked unhealthy before it finishes starting. Ordinary Docker does not kill it solely for that health state.
 
 ---
 
@@ -560,37 +625,41 @@ Uvicorn already handles `SIGTERM` and `SIGINT`:
 ### FastAPI Lifespan for Resource Cleanup
 
 ```python
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from fastapi import FastAPI
-import httpx
+import asyncio
+import os
 import asyncpg
+import httpx
+import redis.asyncio as redis
 
+async def close_pool(pool):
+    try:
+        async with asyncio.timeout(3):
+            await pool.close()
+    except TimeoutError:
+        pool.terminate()  # don't let checked-out connections exceed shutdown grace
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ---- Startup ----
-    app.state.db_pool = await asyncpg.create_pool(
-        dsn="postgresql://user:pass@db:5432/appdb",
-        min_size=5,
-        max_size=20,
-    )
-    app.state.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-    )
-    app.state.redis = redis.from_url("redis://redis:6379/0")
-
-    yield  # Application runs here
-
-    # ---- Shutdown ----
-    # Close in reverse order of creation
-    await app.state.redis.aclose()
-    await app.state.http_client.aclose()
-    await app.state.db_pool.close()
-
+    async with AsyncExitStack() as stack:
+        pool = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=10)
+        stack.push_async_callback(close_pool, pool)  # registered before next acquisition
+        client = await stack.enter_async_context(httpx.AsyncClient(timeout=5.0))
+        cache = redis.from_url(os.environ["REDIS_URL"], socket_timeout=2)
+        stack.push_async_callback(cache.aclose)
+        await cache.ping()  # failure still closes cache, HTTP client, then pool
+        app.state.db_pool, app.state.http_client, app.state.redis = pool, client, cache
+        yield
 
 app = FastAPI(lifespan=lifespan)
 ```
+
+This application-dependent excerpt requires reachable database and Redis services; the opening
+lab does not claim to verify them. Give every cleanup operation a bounded policy appropriate to
+its client and leave total cleanup time inside the outer stop grace. The stack handles both a
+failed acquisition and cancellation after successful startup.
+
 
 ### Docker Stop Timeout
 
@@ -608,7 +677,7 @@ docker stop --time 30 my_container
 
 ### The PID 1 Problem
 
-In Docker, your application **must** run as PID 1 to receive signals.
+Docker signals the container’s main process. Exec form makes the server that process; a proper init or process manager may instead forward signals to its children. The requirement is a verified signal path, not that application code always has PID 1.
 
 ```dockerfile
 # ❌ WRONG — shell wraps the process, eats signals
@@ -627,33 +696,29 @@ The **exec form** (JSON array) runs the process directly without a shell wrapper
 
 ### Connection Draining in Practice
 
+An HTTP middleware counter around `call_next()` can reach zero when headers return while a
+streaming body is still running. Wrap the ASGI call to track the whole response lifetime instead:
+
 ```python
-import signal
-import asyncio
-from fastapi import FastAPI
+class ActiveRequests:
+    def __init__(self, app):
+        self.app = app
+        self.active = 0  # per process and event loop, not a fleet-wide count
 
-app = FastAPI()
-
-# Track active connections for observability
-active_requests = 0
-
-
-@app.middleware("http")
-async def track_requests(request, call_next):
-    global active_requests
-    active_requests += 1
-    try:
-        response = await call_next(request)
-        return response
-    finally:
-        active_requests -= 1
-
-
-@app.get("/debug/connections")
-async def connection_count():
-    """Useful during shutdown debugging."""
-    return {"active_requests": active_requests}
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        self.active += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.active -= 1
 ```
+
+Uvicorn still owns actual draining. This counter is telemetry, and separate worker processes have
+separate counters; aggregate them explicitly. Use a bounded streaming test before trusting a
+shutdown dashboard.
+
 
 ---
 
@@ -740,7 +805,7 @@ settings = Settings()
 
 ### Anti-Pattern: Hardcoded Secrets
 
-```python
+```dockerfile
 # ❌ WRONG — secrets baked into image
 ENV DATABASE_URL=postgresql://user:realpassword@prod-db:5432/app
 ```
@@ -774,7 +839,7 @@ Requires Poetry installed in the build stage.
 # ---- Build stage ----
 FROM python:3.12-slim AS builder
 
-RUN pip install --no-cache-dir poetry
+RUN pip install --no-cache-dir "poetry==2.5.1" "poetry-plugin-export==1.9.0"
 
 WORKDIR /build
 COPY pyproject.toml poetry.lock ./
@@ -792,13 +857,14 @@ COPY ./app /app/app
 
 > **Do not install Poetry in the runtime image.** Export to `requirements.txt` in the build stage and use plain `pip` in the runtime stage. Poetry is a build tool, not a runtime dependency.
 
-#### uv — Fast, Modern, Recommended
+#### uv — Project lock and dependency synchronization
 
-[uv](https://github.com/astral-sh/uv) is a Python package manager written in Rust by Astral (the makers of Ruff). It is **10-100x faster** than pip and Poetry, has a built-in lockfile (`uv.lock`), and is designed for Docker from the ground up.
+[uv](https://github.com/astral-sh/uv) is a Python package manager written in Rust by Astral (the makers of Ruff). It has a project lockfile (`uv.lock`) and cache-aware installation. Compare clean and warm-cache timings on your actual dependency set instead of assuming a fixed speedup.
 
 ```dockerfile
 # ---- Build stage ----
 FROM python:3.13-slim AS builder
+WORKDIR /app
 
 # Copy uv binary directly from the official image — no pip install needed
 COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /uvx /bin/
@@ -815,7 +881,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Copy source and install the project
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --locked --no-dev
 
 # ---- Runtime stage ----
 FROM python:3.13-slim
@@ -834,10 +900,11 @@ ENV PATH="/app/.venv/bin:$PATH"
 | `COPY --from=ghcr.io/astral-sh/uv:0.11.32 /uv /uvx /bin/` | Copies a version-pinned uv toolchain from the official image; pin a digest as well when the supply-chain policy requires immutable image identity |
 | `UV_COMPILE_BYTECODE=1` | Pre-compile `.pyc` files during install. Faster cold start (no compilation at runtime) |
 | `UV_LINK_MODE=copy` | Copy files into `.venv` instead of symlinking. Required for multi-stage builds where the source layer won't exist |
-| `--frozen` | Use `uv.lock` exactly as-is. Fails if lockfile is outdated (guarantees reproducibility) |
+| `--frozen` | Use the existing lock without checking freshness against project metadata |
+| `--locked` | Fail if the project metadata would require changing the lock |
 | `--no-install-project` | Install only dependencies, not the project itself. Used in the first `RUN` to cache deps separately from source |
 | `--no-dev` | Skip dev dependencies (pytest, mypy, etc.) |
-| `--mount=type=cache,target=/root/.cache/uv` | Docker BuildKit cache mount. uv's cache persists across builds — repeat builds install in <1s |
+| `--mount=type=cache,target=/root/.cache/uv` | Docker BuildKit cache mount. uv's cache can persist across builds; benchmark warm/cold behavior |
 
 **The two-step install pattern** is the key Docker optimization:
 
@@ -855,15 +922,15 @@ This is the same principle as the pip layer ordering trick (copy requirements be
 
 | Concern | pip | Poetry | uv |
 |---|---|---|---|
-| Speed (clean install) | Baseline | ~1.5x slower | **10-100x faster** |
-| Lockfile | ❌ (manual `pip freeze`) | ✅ `poetry.lock` | ✅ `uv.lock` |
-| Reproducibility | Low (no lock) | High | High |
-| Docker cache support | Manual layer ordering | Export to requirements.txt | Native (`--mount=type=cache`) |
-| Binary size in build | Already present | ~30MB install | ~15MB single binary (COPY from image) |
-| Installs in runtime image | No (use `--prefix`) | No (export + pip) | No (COPY `.venv`) |
-| Compile bytecode | ❌ | ❌ | ✅ `UV_COMPILE_BYTECODE=1` |
+| Dependency input | Pinned requirements; `--require-hashes` verifies listed artifacts | `poetry.lock`, optionally exported with its explicit plugin | `uv.lock`, checked with `--locked` or `uv lock --check` |
+| Layer caching | Order dependency input before source | Export and install before source when project structure permits | Sync dependencies before source, then install project |
+| Bytecode | Normally compiled during install | Depends on install/export path | Explicit `UV_COMPILE_BYTECODE=1` |
+| Runtime tools | Python base commonly includes pip | Keep Poetry in builder | Keep uv in builder; Python base can still contain pip |
 
-> **If you're starting a new project, use uv.** It's faster, simpler in Docker, and produces reproducible builds out of the box. For existing projects on pip or Poetry, migrating is straightforward — `uv` can read `requirements.txt` and `pyproject.toml` directly.
+`--frozen` is appropriate only when a separate gate established lock freshness or a partial build
+context intentionally lacks project metadata. It is not that freshness gate. See
+[uv locking](https://docs.astral.sh/uv/concepts/projects/sync/) and
+[Poetry export plugin](https://python-poetry.org/docs/cli/#export), checked 2026-10-30.
 
 ### `pip install --no-cache-dir`
 
@@ -983,7 +1050,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 FROM python:3.12-slim
 CMD ["uvicorn", "app.main:app"]
 
-# ✅ Docker can detect and restart unhealthy containers
+# ✅ Docker records unhealthy state; a separate controller owns remediation
 FROM python:3.12-slim
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
@@ -1094,7 +1161,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Step 2: Copy source and install the project
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --locked --no-dev
 
 # ============================================================
 # Stage 2: Production runtime (no uv, no build tools)
@@ -1131,16 +1198,10 @@ CMD ["uvicorn", "app.main:app", \
      "--timeout-keep-alive", "5"]
 ```
 
-**Why uv produces smaller, faster builds:**
-
-| Metric | pip Dockerfile | uv Dockerfile |
-|---|---|---|
-| Build time (clean) | 60-90s | 5-10s |
-| Build time (deps cached) | 0s (layer cache) | 0s (layer cache + uv cache) |
-| Build time (source change only) | 0s | <1s (only re-links project) |
-| Needs gcc/build tools | Yes (for C extensions) | Only if package has C extensions |
-| Bytecode pre-compiled | No (compiled on first import) | Yes (`UV_COMPILE_BYTECODE=1`) |
-| Runtime image has package manager | Yes (pip in stdlib) | No (uv only in builder) |
+Compare builds using the same base digest, dependency versions, target architecture and cache
+state. Record build duration, compressed image size and startup latency. Both installers need build
+tools only for dependencies built from source; pip normally compiles bytecode and the shown Python
+runtime base includes pip even when uv is confined to the builder.
 
 > **Note on Gunicorn:** If you're running behind Gunicorn (recommended for non-Kubernetes deployments), replace the `CMD` with:
 > ```dockerfile
@@ -1195,150 +1256,50 @@ Treat it that way: small images, single process, no state, fast startup, clean s
 
 ---
 
-## Kubernetes Essentials for Python Services
+## Continue to deployment controllers
 
-Deployment mechanics this corpus didn't cover elsewhere. Short and pragmatic; not a Kubernetes tutorial.
+The [release lesson](02_ci_cd_and_releases.md) owns rolling/canary/blue-green choices, shared-schema
+compatibility and rollback rehearsal. A routing flip does not undo database changes, drain old
+requests instantly or stop old background workers. Coexistence safety must be proved for either
+strategy. The [Kubernetes lesson](03_kubernetes_runtime.md) owns probes, resource/connection budgets,
+PDB limits and termination overlap; avoid copying a second deployment recipe here.
 
-### Rolling Deployments vs Blue/Green
+## Recap
 
-**Rolling update (Kubernetes default):** new pods are created while old ones are terminated, one or a few at a time. No downtime, but old and new versions run simultaneously for a few seconds to minutes.
+- An image fixes files and dependency inputs; its tested digest identifies the promoted artifact.
+- Docker health is observation. Restart, traffic withdrawal and process exit have separate owners.
+- Exec form or a forwarding supervisor delivers SIGTERM; the server drains before lifespan cleanup.
+- Resource acquisition registers cleanup immediately, so partial startup cannot leak earlier resources.
+- Worker counts multiply admission and pools; budget the whole fleet, including rollout overlap.
 
-```yaml
-spec:
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 25%          # at most 125% of desired replicas during rollout
-      maxUnavailable: 0      # never drop below 100% availability
-```
+**An ordinary container remains running but health is unhealthy. Will its restart policy repair it?**
 
-**Blue/Green:** deploy the new version to a parallel environment ("green"), run smoke tests, then flip the load balancer. Instant cutover, instant rollback.
+<details><summary>Answer</summary>
 
-- Rolling: cheaper (no doubled capacity), simpler to operate, gives you canary-like gradual exposure.
-- Blue/green: cleaner rollback (just flip traffic back), but doubles the running cost during cutover, and database migrations become harder (both versions must work against the migrated schema).
+No. The restart policy reacts to process exit; health status alone does not exit it. Diagnose the
+failed check and configure an appropriate controller if automatic remediation is needed. Restarting
+a healthy process cannot repair a shared database outage.
 
-**When to use which:**
-- Stateless services with compatible schema migrations: rolling.
-- Services with risky migrations or where "old and new running at the same time" is unsafe: blue/green.
-- Most teams: rolling with good observability + manual canary if the change is sensitive.
+</details>
 
-### Readiness vs Liveness Probes — Tuning That Matters
+**A response stream is still sending after `call_next` returns. Has the request finished draining?**
 
-Two probes, two different questions:
+<details><summary>Answer</summary>
 
-- **Liveness**: "is this process alive, or is it stuck/deadlocked and needs a kill?" Failing liveness → pod is killed and restarted.
-- **Readiness**: "should this pod receive traffic right now?" Failing readiness → pod is removed from the Service's endpoints, but **not** killed.
+No. Headers and body completion are different events. Track the entire ASGI call and let the server
+await bounded requests before cleanup. A counter ending at header return undercounts active streams.
 
-For a Python web service, liveness is almost always more dangerous than useful — a slow response is not a dead process, but a wrong liveness probe will kill a busy pod mid-request. Rule of thumb:
+</details>
 
-- **Liveness**: very conservative. Only fail on a condition that genuinely means "this pod will never recover without a restart" — deadlocked event loop, stuck forever on a corrupt internal state.
-- **Readiness**: tighter. This pod is temporarily unable to serve — dependency down, startup not complete, queue drain in progress.
+**Try it:** In the lab, change `/slow` to take 5 seconds and reduce Uvicorn's drain timeout to 2.
+Keep outer grace at 12. Predict the client result and which assertion fails before running it.
+Hint: the process has time for cleanup even when the in-flight response exceeds its own budget.
 
-```yaml
-containers:
-- name: api
-  readinessProbe:
-    httpGet: { path: /ready, port: 8000 }
-    initialDelaySeconds: 5       # don't probe before the app can possibly be up
-    periodSeconds: 5
-    timeoutSeconds: 2
-    failureThreshold: 3          # remove from service after 15s of failure
-  livenessProbe:
-    httpGet: { path: /health, port: 8000 }
-    initialDelaySeconds: 30      # generous — app must be fully warm first
-    periodSeconds: 15
-    timeoutSeconds: 5
-    failureThreshold: 6          # kill only after 90s of failure
-  # startupProbe (optional) — use when startup is slow (>30s)
-  startupProbe:
-    httpGet: { path: /health, port: 8000 }
-    periodSeconds: 5
-    failureThreshold: 60         # gives 5 minutes to finish starting
-```
+<details><summary>Worked solution</summary>
 
-Interaction with graceful shutdown:
-- On termination, Kubernetes sends SIGTERM, then waits `terminationGracePeriodSeconds` (default 30s) before SIGKILL.
-- Kubernetes marks terminating endpoints `ready=false` in EndpointSlices as Pod termination begins,
-  while the container receives its `preStop` hook and then `SIGTERM`. The application should stop
-  accepting new work on `SIGTERM` and finish in-flight work within the grace period.
-- Add an explicit drain endpoint or a bounded `preStop` propagation wait only when an external load
-  balancer or mesh demonstrably continues routing after the EndpointSlice update. Measure that
-  propagation delay; a ceremonial `sleep 5` is not a universal readiness requirement.
+The server cancels the request after its shorter drain budget, so the assertion expecting a complete
+200 response fails. Lifespan may still finish and the process may exit within 12 seconds. Restore a
+server budget longer than the bounded request plus cleanup allowance, rebuild, and rerun the
+unchanged driver. Do not interpret “exited quickly” as proof that every response was preserved.
 
-### Resource Requests and Limits
-
-Every pod spec should set these — leaving them unset is one of the most common causes of noisy-neighbor problems in clusters.
-
-```yaml
-resources:
-  requests:
-    cpu: 250m          # 0.25 CPU — guarantees scheduling on a node with this available
-    memory: 512Mi      # guarantees this much RAM
-  limits:
-    cpu: 1000m         # 1 CPU — hard cap; beyond this, the pod is throttled
-    memory: 1Gi        # hard cap; beyond this, the pod is OOM-killed
-```
-
-- **Requests** = what the scheduler reserves. Too low → pod co-locates with neighbors and fights for CPU/memory. Too high → wastes cluster capacity.
-- **Limits** = hard ceiling. CPU: you get throttled (latency spike, not a kill). Memory: you get OOM-killed.
-- **Memory limit == memory request** is safe and predictable. **CPU limit > CPU request** lets you burst when a neighbor isn't using theirs.
-- Measure under load. Pick requests at p50 steady-state, limits at p99 peak + headroom. Adjust based on actual metrics, not guesses.
-
-**Python-specific note:** Python doesn't release memory back to the OS easily. If the process's high-water mark is 700MB but it's currently using 400MB, the OS reports 700MB. Set memory limits accounting for this.
-
-### Autoscaling — HPA and KEDA
-
-**Horizontal Pod Autoscaler (HPA):** scales pod count based on CPU or custom metrics.
-
-```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata: { name: api }
-spec:
-  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
-  minReplicas: 2
-  maxReplicas: 20
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target: { type: Utilization, averageUtilization: 70 }
-```
-
-HPA reacts on a 15–30s cycle and has configurable scale-up / scale-down stabilization windows. Default scale-down is conservative (5 minutes) to avoid flapping. Don't touch it without a reason.
-
-**KEDA:** HPA extended with event-driven sources — Redis queue depth, Kafka lag, SQS message count, HTTP requests per second via Prometheus. Essential when your service is queue-driven (background workers), not request-driven.
-
-```yaml
-# KEDA ScaledObject scaling on Redis list length
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata: { name: worker }
-spec:
-  scaleTargetRef: { kind: Deployment, name: worker }
-  minReplicaCount: 1
-  maxReplicaCount: 50
-  triggers:
-  - type: redis
-    metadata:
-      address: redis.default:6379
-      listName: dramatiq:default
-      listLength: "10"     # target: one pod per ~10 messages queued
-```
-
-KEDA provides mature event-driven scale-to-zero behavior, which is useful for low-traffic workers.
-The Horizontal Pod Autoscaler normally uses `minReplicas >= 1`; Kubernetes can permit zero only
-behind the alpha `HPAScaleToZero` feature gate and with Object or External metrics. Pair any
-scale-to-zero design with a cold-start-tolerant workload.
-
-**Autoscaling gotchas:**
-- Scaling on CPU alone is blunt. A queue-driven worker that's I/O-waiting isn't using CPU even when backed up. Scale on queue depth or response latency instead.
-- Scale-up is limited by pod startup time. A 60-second startup means you can't react to 30-second traffic spikes; pre-scale via scheduled scaling or keep a baseline of minReplicas.
-- Scale-down can kill in-flight requests. Combine with proper readiness probes + graceful shutdown.
-
----
-
-## See also
-
-- [../testing/08_database_testing.md](../testing/08_database_testing.md) — integration tests with real Postgres via testcontainers.
-- [../../fundamentals/fastapi/safe_and_scalable_api_calls/04_kubernetes.md](../../fundamentals/fastapi/safe_and_scalable_api_calls/04_kubernetes.md) — per-pod vs cluster-wide admission control.
+</details>

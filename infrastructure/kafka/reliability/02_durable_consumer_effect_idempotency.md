@@ -70,5 +70,42 @@ Both may read “missing” and apply the effect. Make the claim an atomic stora
 Do not build an effect store for naturally convergent writes such as replacing a projection row by
 stable key. Do use one for money, inventory, email, permissions, and other non-repeatable effects.
 
+## Recap
+
+- The unique consumer/event key and business effect commit in one database transaction.
+- A failed transaction leaves neither the marker nor the effect.
+- The Kafka commit follows durable completion; external effects need a separate protocol.
+
+## Check yourself
+
+**Q: The effect commits and the process dies before the Kafka commit. What does replay do?**
+
+<details><summary>Answer</summary>
+
+It conflicts with the durable consumer/event key, skips the already-committed effect and advances the Kafka checkpoint. Neither in-memory flags nor delivery count could prove that completion.
+
+</details>
+
+**Q: The inbox insert commits but the effect fails in another transaction. Can the event safely be skipped?**
+
+<details><summary>Answer</summary>
+
+No. The marker now falsely claims completion. That is why the insert and effect must share one transaction, and why a separate remote effect needs an outbox/idempotency protocol.
+
+</details>
+
+## Try it
+
+Run the local example with one event delivered twice, then inject a failure before the effect transaction commits.
+
+Hint: Assert both the effect count and inbox contents.
+
+<details><summary>Worked solution</summary>
+
+The duplicate produces one effect. The injected rollback leaves no inbox row for that event; retry then applies exactly one effect.
+
+</details>
+
+
 **Next**: [Kafka Idempotence and Transactions](02_idempotence_transactions_and_exactly_once.md) or
 [Retries, Dead Letters, and Replay](03_retries_dead_letters_and_replay.md).

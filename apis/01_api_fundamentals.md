@@ -205,4 +205,29 @@ An endpoint that returns the right JSON once is a prototype. An API is a maintai
 
 ---
 
+
+## Recap
+
+- Independent clients need a shared contract because deployments do not happen together.
+- A timeout ends the caller’s wait while the provider may already have committed.
+- Stable operation identity and reconciliation resolve unknown outcomes.
+
+## Check yourself
+
+**The server commits `create_payment`, but the response is lost; may the client conclude that no payment exists?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The timeout records only the caller stopping; the server commit may have completed. Reusing the same idempotency key or reconciling the operation prevents blindly creating a second payment.
+
+</details>
+
+**The request succeeds but the reply schema changes. Is a 200 enough to preserve compatibility?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Transport success does not ensure the old client can decode or interpret the new representation.
+
+</details>
+
 **Next**: [API Styles and Selection](02_api_styles_and_selection.md)

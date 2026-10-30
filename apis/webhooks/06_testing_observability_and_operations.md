@@ -6,6 +6,37 @@
 
 ---
 
+## Reproduce acceptance without processing
+
+Run the [signed PostgreSQL inbox lab](03_consumer_design.md#run-signed-intake-and-recover-a-failed-worker)
+first. Its assertions separate authentic receipt, duplicate admission, worker rollback and
+one committed effect. Keep the exact raw bytes in its test; reserializing an object would
+change what the signature test proves.
+
+In a staging drill, stop the processor while keeping intake available. At 10:00, `evt_1`
+receives 204 and remains `received`. At 10:05, HTTP receipt success can still be 100% while
+its age is 300 seconds. Inspect the work owner before replaying producer traffic:
+
+```sql
+SELECT state, count(*), min(received_at) AS oldest
+FROM webhook_inbox
+GROUP BY state;
+SELECT producer, event_id, state, attempts, last_error_code
+FROM webhook_inbox
+WHERE state <> 'processed'
+ORDER BY received_at LIMIT 20;
+```
+
+If rows are received and no workers claim them, restore worker availability. If they are
+leased with repeated dependency failures, repair that dependency and use bounded retry.
+If one unsupported schema repeatedly fails, quarantine it and keep unrelated events moving.
+The lab's injected pre-commit failure leaves the invoice unchanged; after restart one
+transaction advances it and the receipt to processed. Verify both the pending-age trend
+and effect identity/count. Do not clear the inbox to make backlog metrics look healthy.
+
+Contrast signature failures with no new inbox rows: that points to raw-body handling,
+clock skew or key rotation before admission. Increasing workers cannot repair invalid signatures.
+
 ## 1. Test the Exact Contract
 
 Webhook fixtures should include **raw bytes plus headers**, not only parsed JSON:
@@ -139,6 +170,22 @@ An HTTP `2xx` dashboard alone can be green while the inbox worker is broken.
 
 ---
 
+Receipt and processing have distinct progress signals.
+
+```mermaid
+flowchart LR
+ P[Producer evt_1] -->|signed bytes| I[Consumer ingress]
+ I -->|commit receipt| DB[(Inbox)]
+ DB -->|claim due event| W[Worker]
+ W -->|idempotent transaction| E[Invoice state]
+ DB -.->|oldest unprocessed age| O[Operator]
+ I -.->|HTTP 2xx receipt rate| O
+```
+
+Normal HTTP 2xx with growing oldest-unprocessed age points beyond intake. Inspect worker ownership and dependency outcomes; resending accepted events cannot restart a stopped processor.
+
+---
+
 ## 7. Service-level objectives (SLOs) and Retention
 
 Producer SLO examples:
@@ -232,5 +279,38 @@ Rotate, accept overlap only as necessary, revoke old key, inspect failed/suspici
 - [Stripe webhook documentation](https://docs.stripe.com/webhooks)
 
 ---
+
+
+## Recap
+
+- Signature tests preserve the exact fixture bytes.
+- Receipt success and processing progress have separate metrics.
+- Repair the failing boundary and verify durable effects before considering replay.
+
+## Check yourself
+
+**HTTP2xx rate is normal but oldest inbox age keeps rising. Where should the first investigation go?**
+
+<details><summary>Reasoned answer</summary>
+
+After durable intake: worker leases, poison events, database contention and downstream dependencies. HTTP acknowledgement proves receipt, not processing.
+
+</details>
+
+**Signatures suddenly fail and the inbox stays empty. Should workers be scaled up?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The fault precedes admission; inspect keys, time tolerance and raw-body handling. More processors cannot repair missing authenticated receipts.
+
+</details>
+
+**Try it:** Pause the worker in the local inbox lab, submit two valid delivery IDs, and keep the API running. Leave the expected HTTP result and backlog observation blank.
+
+Hint: Admission and completion have separate owners and measurements.
+
+<details><summary>Solution</summary>
+HTTP admission remains 204 after durable receipt, while received/unprocessed rows and oldest age rise. Resume the worker, verify effects and backlog drain, and distinguish this from signature failures that never enter the inbox.
+</details>
 
 **Next**: Return to the [API Communication Guides](../README.md) or apply the patterns in the [FastAPI Guides](../../fundamentals/fastapi/README.md).

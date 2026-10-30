@@ -153,4 +153,35 @@ Do not optimize the modeling axis before deciding the source of truth. Do not ad
 
 ---
 
+## Recap and check yourself
+
+- The transition model defines permitted changes, while persistence retains authoritative preconditions.
+- The queue delivers hints and must not become the owner of business state.
+- Choose relational state or engine history according to the recovery/coordination requirement.
+
+**A state-machine library and durable queue are installed, but state remains in a Python object. Is the workflow durable?**
+
+<details><summary>Answer</summary>
+
+No. Restart erases its authoritative preconditions. Persist state and work intent together, or let a workflow engine own durable history.
+
+</details>
+
+**An endpoint accepts arbitrary to_state values. What boundary is missing?**
+
+<details><summary>Answer</summary>
+
+The application no longer controls event-to-transition mapping. Accept a domain event such as approve, validate its current state and evidence, then choose the legal destination.
+
+</details>
+
+**Try it:** Write the approval transition scaffold as expected_state, expected_version, destination and owed_work. Fill the missing expected_state.
+
+<details><summary>Hint and worked solution</summary>
+
+The decision is legal only while waiting for review. Use WAITING_FOR_HUMAN_REVIEW; compare the current revision, move to GENERATION_QUEUED and create one dependent job/outbox in the same transaction.
+
+</details>
+
+
 **Next**: [State-Machine Implementations](state_machines/README.md)

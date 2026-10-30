@@ -388,3 +388,19 @@ async def get_ticket(ticket_id: str):
 
 - [07 - Error Responses](07_error_handling.md) - implement the error shape.
 - [Safe API Calls / 11 - Idempotency Keys](safe_and_scalable_api_calls/11_idempotency.md) - make retryable `POST`s safe.
+
+## Check your understanding
+
+A public contract distinguishes absent fields, explicit null and valid values. Compatibility includes these semantics, not just field names.
+
+**Prediction:** PATCH omits assignee_id; a second request explicitly sends null. Should both clear it?
+
+<details><summary>Answer</summary>
+No. exclude_unset preserves omission; explicit null clears only if the schema allows it.
+</details>
+
+**Diagnosis:** Title is non-nullable. Should a patch filter out every None value?
+
+<details><summary>Answer</summary>
+No. That would silently ignore invalid input. Reject an explicit null for title while preserving omission.
+</details>

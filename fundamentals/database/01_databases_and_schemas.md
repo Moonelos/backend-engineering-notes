@@ -934,9 +934,9 @@ ORDER BY mean_exec_time DESC LIMIT 20;
 
 ## Replication and Read Replicas
 
-Postgres replicates via the **Write-Ahead Log (WAL)**. Every change the primary makes is first written to the WAL; replicas stream that log and apply it. Understanding this mechanism is worth the five minutes:
+Ordinary PostgreSQL physical replication uses the **Write-Ahead Log (WAL)**. Every change the primary makes is first written to the WAL; replicas stream that log and apply it. Understanding this mechanism is worth the five minutes:
 
-### Streaming replication (the default for RDS / Aurora / self-hosted HA)
+### Physical streaming replication (ordinary PostgreSQL standbys)
 
 The primary ships WAL records to the replica continuously. In the default asynchronous setup, the
 primary can acknowledge locally before a standby confirms receipt. Synchronous replication requires
@@ -987,3 +987,7 @@ async def get_read_session():
 Logical replication replays changes at the **row level**, not WAL block level. This lets you replicate subsets of tables, replicate across Postgres versions, or feed the changes to a non-Postgres consumer (Kafka, Elasticsearch) via Debezium. Slower and more complex than streaming replication; use when you need the flexibility, not when you just want a hot standby.
 
 ---
+
+## Aurora is a different replica topology
+
+An Aurora PostgreSQL writer and its in-region Aurora Replicas share the cluster storage volume. Adding a reader does not create an ordinary independent PostgreSQL data directory maintained by the WAL receiver/replay model above. Readers still have instance-local state and visibility/freshness concerns; use Aurora-specific lag/failover metrics and test read-after-write requirements rather than assuming shared storage makes every read immediately current. Logical replication and cross-region Aurora global databases are separate mechanisms. [AWS Aurora replication](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Replication.html), checked 2026-10-30.

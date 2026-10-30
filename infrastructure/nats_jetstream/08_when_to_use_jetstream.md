@@ -96,4 +96,29 @@ removes systems or materially simplifies the required topology.
 
 ---
 
+## Recap
+
+- Choose a broker from retained-history, routing and recovery requirements.
+- JetStream provides durable subject delivery while the application owns business state.
+- A smaller database queue/outbox can be enough when all state shares one database.
+
+## Check yourself
+
+**Q: One PostgreSQL transaction must commit an order and its future notification, with no independent replay consumer. Start by publishing directly inside it?**
+
+<details><summary>Answer</summary>
+
+No. Direct publishing creates a dual-write ambiguity. Commit an outbox/queue row with the order; add JetStream when separate routing, replay or scaling justifies it.
+
+</details>
+
+**Q: A new audit consumer needs yesterday's events without disturbing workers. What changes?**
+
+<details><summary>Answer</summary>
+
+Independent retained replay becomes valuable. Choose a retention policy and new consumer identity that preserve that history, and keep business-effect idempotency for the workers.
+
+</details>
+
+
 **Next**: [NATS JetStream learning paths](README.md)

@@ -6,6 +6,53 @@
 
 ---
 
+## Run signed intake and recover a failed worker
+
+The [lab files](../examples/webhook_inbox/) contain `app.py`, `webhook_security.py`,
+`schema.sql`, `worker.py` and `test_lab.py`. Use only this disposable PostgreSQL database;
+the test resets its tables and refuses a differently named database.
+
+```bash
+python -m venv /tmp/notes-webhook-env
+source /tmp/notes-webhook-env/bin/activate
+python -m pip install 'fastapi==0.162.0' 'httpx==0.28.1' asyncpg pytest
+docker run --rm -d --name notes-webhook-lab -e POSTGRES_PASSWORD=local-lab-password -e POSTGRES_DB=webhook_lab -p 127.0.0.1:55439:5432 postgres:17
+export DATABASE_URL='postgresql://postgres:local-lab-password@127.0.0.1:55439/webhook_lab'
+export BILLING_WEBHOOK_SECRETS='local-test-only-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+# Wait until PostgreSQL is ready before running the test.
+docker exec notes-webhook-lab pg_isready -U postgres
+python -m pytest -q apis/examples/webhook_inbox
+# Cleanup after the lab:
+docker stop notes-webhook-lab
+```
+
+The test sends signed `evt_1`: 204 and one inbox row. A changed byte returns 401.
+Two concurrent valid duplicates still leave one row. Before processing, the invoice effect
+count is zero: acceptance has not completed the business work. The test then injects a
+failure after the invoice update but before commit; both the effect and guard roll back.
+Retry commits one effect, and replaying the worker leaves that count at one.
+
+```mermaid
+sequenceDiagram
+ participant P as Billing producer
+ participant API as Intake
+ participant DB as PostgreSQL
+ participant W as Worker
+ P->>API: Signed evt_1 for inv_123
+ API->>DB: Insert inbox and commit
+ API-->>P: 204 accepted
+ W->>DB: Lock receipt; insert effect guard; update invoice
+ Note over W,DB: Crash before commit rolls back all three changes
+ W->>DB: Retry same receipt; commit guard plus effect plus processed
+```
+
+The producer can stop once 204 arrives. Therefore the durable inbox takes responsibility
+before that response, while the worker retains its own recovery path. This lab covers one
+billing account and short local database effects. Remote effects require a transactional
+outbox or a provider idempotency contract, as developed below.
+
+The worker quarantines unsupported event schemas, unauthorized invoice identities and missing invoice rows with explicit reason codes. These terminal receipts no longer block the oldest-row selection; the regression queues a valid event behind a signed poison event and proves it still completes. A database outage remains retryable and rolls back the transaction. Quarantine requires an operator diagnosis and authorized replay after repair, not endless retries of unchanged bad input.
+
 ## 1. The Safe Ingress Pipeline
 
 ```text
@@ -96,7 +143,7 @@ import asyncpg
 from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from webhook_security import VerificationError, verify_webhook
+from .webhook_security import VerificationError, verify_webhook
 
 
 MAX_WEBHOOK_BYTES = 256 * 1024
@@ -203,7 +250,14 @@ The database command timeout and pool are deliberately bounded. If durable stora
 
 ## 5. Inbox Worker
 
-Workers claim rows with a transaction and `FOR UPDATE SKIP LOCKED`, move them to a leased `processing` state, then perform work. On crash, an expired lease makes the row eligible again.
+The lab worker holds `FOR UPDATE SKIP LOCKED` only for a short database transaction.
+It inserts the effect guard with `RETURNING event_id`, updates the invoice **only if that
+insert returned a row**, and marks the receipt processed in the same transaction. Another
+worker either skips the locked row or sees the committed processed state. An exception
+rolls back the guard, effect and completion together.
+
+Long or remote work uses a persisted owner/lease/generation and short claim transaction,
+as in the producer lesson. It cannot hold this local transaction across network I/O.
 
 Handler design:
 
@@ -218,10 +272,11 @@ Handler design:
 ```sql
 INSERT INTO processed_provider_events (producer, event_id, processed_at)
 VALUES (:producer, :event_id, now())
-ON CONFLICT DO NOTHING;
+ON CONFLICT DO NOTHING
+RETURNING event_id;
 ```
 
-A unique guard next to the side effect protects against worker lease races and operator replay.
+The caller must branch on the returned row before applying any effect. A uniqueness constraint without that branch still lets a duplicate run the following code. See the complete transactional branch in [worker.py](../examples/webhook_inbox/worker.py).
 
 ---
 
@@ -276,5 +331,38 @@ Keep raw or normalized payload only for the required retention and protect it as
 - Payload retention, encryption, and access follow data classification.
 
 ---
+
+
+## Recap
+
+- Verify the exact bytes before parsing and durable inbox admission.
+- A committed receipt permits 204 even though processing has not happened yet.
+- The effect guard, local effect and completion share one transaction and rollback together.
+
+## Check yourself
+
+**two verified copies of evt_1 arrive together; what prevents two inbox rows?**
+
+<details><summary>Reasoned answer</summary>
+
+PostgreSQL enforces PRIMARY KEY(producer,event_id), and ON CONFLICT makes the losing insert a successful no-op before 204.
+
+</details>
+
+**The guard insert conflicts but the handler still increments a counter. Is the guard sufficient?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Branch on INSERT RETURNING; only its winner may perform the guarded effect. A constraint by itself does not skip later statements.
+
+</details>
+
+**Try it:** In examples/webhook_inbox/test_lab.py, inject a worker failure after the invoice update but before commit. Leave the expected effect_count and processed-event row count blank.
+
+Hint: The effect, deduplication guard and completion marker share one transaction.
+
+<details><summary>Solution</summary>
+Both counts remain zero after rollback. A later worker attempt commits exactly one effect and one guard, and replay does not increment either.
+</details>
 
 **Next**: [Webhook Signatures, Security, and SSRF](04_signatures_security_and_ssrf.md)

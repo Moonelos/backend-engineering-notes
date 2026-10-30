@@ -164,6 +164,23 @@ An `ExceptionGroup` can be nested, so production error reporting may need `Excep
 
 ---
 
+The TaskGroup owns both children until failure cleanup completes:
+
+```mermaid
+sequenceDiagram
+ participant P as build_dashboard
+ participant A as load_profile
+ participant B as load_orders
+ P->>A: create child
+ P->>B: create child
+ A-->>P: failure
+ P->>B: request cancellation
+ B-->>P: cleanup complete
+ P->>P: raise ExceptionGroup
+```
+
+The parent sees grouped failure only after sibling cleanup. Blocking or cancellation-resistant cleanup can delay that exit.
+
 ## 5. When `gather()` and `create_task()` Still Fit
 
 `asyncio.gather()` is useful when all of these semantics are intentional:
@@ -327,5 +344,29 @@ Debug mode is a diagnostic aid, not a production latency monitor. Measure event-
 - [PEP 654 — Exception Groups and `except*`](https://peps.python.org/pep-0654/)
 
 ---
+
+
+## Recap
+
+- A coroutine progresses when a task drives it; cooperative suspension enables overlap.
+- TaskGroup owns children through failure and cleanup.
+
+## Check yourself
+
+**Q: A child fails while its sibling waits. What happens before the parent receives ExceptionGroup?**
+
+<details><summary>Answer</summary>
+
+The sibling is cancelled and its cleanup awaited. It cannot silently outlive the group.
+
+</details>
+
+**Q: Does every await yield to another task?**
+
+<details><summary>Answer</summary>
+
+No. An already-ready await may return immediately; blocking code between suspension points still blocks the loop.
+
+</details>
 
 **Next**: [Async Production Patterns](02_production_patterns.md)

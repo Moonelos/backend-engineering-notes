@@ -7,6 +7,12 @@
 
 ---
 
+A tenant-7 user requests tenant 8's order using a valid tenant-7 access token.
+Authentication succeeds. An unscoped lookup leaks the order; a query constrained by
+`tenant_id=7 AND id=requested_id` returns no visible row. The checks below explain where
+that trusted tenant predicate comes from and why neither UUID secrecy nor a valid token
+can replace it.
+
 ## 1. Security Is a Decision Stack
 
 TLS and a valid token are necessary, not sufficient.
@@ -124,12 +130,23 @@ Whichever source a request uses, re-derive the tenant from the authenticated pri
 
 ### Defense in Depth: Database-Level Enforcement
 
-Row-level security (Postgres `CREATE POLICY`, or equivalent) enforces the tenant filter inside the database itself, keyed off a session variable the application sets after authentication:
+PostgreSQL row-level security enforces a tenant predicate only after it is enabled. This schema
+excerpt assumes `orders.tenant_id` is a UUID. Run requests as a non-owner role with neither
+superuser nor `BYPASSRLS`; table owners normally bypass RLS unless it is forced:
 
 ```sql
+ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE orders FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON orders
-  USING (tenant_id = current_setting('app.tenant_id')::uuid);
+  USING (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid);
 ```
+
+After checking membership, use parameterized `SELECT set_config('app.tenant_id', :tenant_id, true)`
+inside the same explicit transaction as the query. The final `true` makes the setting transaction-local,
+preventing pool reuse from inheriting another request's tenant. An absent setting sees no tenant rows.
+Run the complete positive/negative [RLS and pool-reuse lab](../../fundamentals/database/13_multi_tenancy.md);
+the schema excerpt alone does not create a secure role or authenticate a tenant.
 
 This doesn't replace the `WHERE tenant_id = ...` check in application code — it's a second, independent layer that still holds if one query, one ORM shortcut, or a future change forgets the filter. RLS can't express authorization that isn't a row filter (e.g., "only admins may update `status`"), so keep it as a backstop, not a substitute for scoping every query explicitly.
 
@@ -142,6 +159,24 @@ A path template like `{tenant_id}` isn't enumerated — it matches any string (o
 3. **Authorization** — does the *authenticated principal* have a relationship to that tenant? This is the BOLA check above — it answers "may this caller act as this tenant," not "is this ID well-formed."
 
 Conflating step 1 (the ID parsed) with step 3 (the caller may use it) is exactly the BOLA gap.
+
+---
+
+An authenticated tenant-7 caller controls the requested order ID, but not the trusted tenant predicate.
+
+```mermaid
+sequenceDiagram
+ participant U as Tenant-7 user
+ participant API as Orders API
+ participant DB as Orders database
+ U->>API: valid token plus tenant-8 order_id
+ API->>API: verify principal tenant=7
+ API->>DB: WHERE tenant_id=7 AND id=tenant8_order
+ DB-->>API: no visible row
+ API-->>U: scoped 404
+```
+
+Changing the requested ID does not change the verified principal. Removing tenant_id from the query exposes tenant 8 even though token validation still succeeds.
 
 ---
 
@@ -259,5 +294,30 @@ Use static analysis, dependency scanning, schema fuzzing, and an authorization t
 - [FastAPI API Security](../../fundamentals/fastapi/11_api_security.md)
 
 ---
+
+
+## Recap
+
+- Authentication identifies a caller; authorization decides which objects and actions it may use.
+- The trusted tenant predicate must not come from an unchecked request identifier.
+- RLS is effective only when enabled with a non-bypass runtime role and correct transaction context.
+
+## Check yourself
+
+**A user has a valid token for tenant 7 and submits tenant_id=8. Which value may scope the query?**
+
+<details><summary>Reasoned answer</summary>
+
+The authenticated entitlement supplies allowable scope. The submitted value is only an address and must be rejected unless that relationship is authorized.
+
+</details>
+
+**Does FORCE ROW LEVEL SECURITY make a superuser obey tenant policies?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Superusers and BYPASSRLS roles remain privileged. Test the actual restricted application role.
+
+</details>
 
 **Next**: [Versioning, Compatibility, and OpenAPI](09_versioning_compatibility_and_openapi.md)

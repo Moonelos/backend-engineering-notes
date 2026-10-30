@@ -80,11 +80,12 @@ async def test_list_users_empty(client):
 async def test_create_user_unicode_name(client):
     """Non-ASCII characters must be handled correctly."""
     response = await client.post("/users", json={
-        "username": "utilisateur",
+        "username": "élève_東京",
         "email": "user@example.com",
         "password": "correct_horse_battery_staple",
     })
     assert response.status_code == 201
+    assert response.json()["username"] == "élève_東京"
 
 
 async def test_pagination_beyond_results(client, make_user):
@@ -104,15 +105,15 @@ Eliminate copy-paste test functions. One test body, many inputs.
 ```python
 # ❌ Without parametrize — repetitive, hard to maintain
 async def test_invalid_email_no_at(client):
-    response = await client.post("/users", json={"email": "invalid", ...})
+    response = await client.post("/users", json={"email": "invalid", "username": "alice", "password": "correct_horse_battery_staple"})
     assert response.status_code == 422
 
 async def test_invalid_email_no_domain(client):
-    response = await client.post("/users", json={"email": "user@", ...})
+    response = await client.post("/users", json={"email": "user@", "username": "alice", "password": "correct_horse_battery_staple"})
     assert response.status_code == 422
 
 async def test_invalid_email_empty(client):
-    response = await client.post("/users", json={"email": "", ...})
+    response = await client.post("/users", json={"email": "", "username": "alice", "password": "correct_horse_battery_staple"})
     assert response.status_code == 422
 ```
 
@@ -195,7 +196,7 @@ pip install syrupy
 
 ```python
 async def test_get_user_shape(client, make_user, snapshot):
-    user = await make_user(username="alice", email="alice@example.com")
+    user = make_user(username="alice", email="alice@example.com")
     resp = await client.get(f"/users/{user.id}")
     assert resp.status_code == 200
     assert resp.json() == snapshot
@@ -211,7 +212,9 @@ The initial approved snapshot contains the stable contract fields, for example:
 }
 ```
 
-First run stores the response in `__snapshots__/`; run `pytest --snapshot-update` only after
+A missing snapshot fails the ordinary first run. Create a candidate with
+`pytest --snapshot-update tests/test_users.py`, inspect the generated `__snapshots__/` diff, commit
+the approved baseline, and rerun without the update flag. Update an existing baseline only after
 reviewing that initial value. A subsequent successful run reports `1 passed`. A field addition,
 removal, or rename produces a snapshot diff and a failed test instead of silently updating the
 contract.
@@ -227,7 +230,7 @@ from syrupy.matchers import path_type
 
 
 async def test_user_shape_stable(client, make_user, snapshot):
-    user = await make_user(username="alice", email="alice@example.com")
+    user = make_user(username="alice", email="alice@example.com")
     resp = await client.get(f"/users/{user.id}")
     assert resp.status_code == 200
     assert resp.json() == snapshot(
@@ -381,3 +384,21 @@ Mocks are sometimes necessary (see [09](09_mocking_external.md)), but their defa
 ## Next
 
 - [11 — Coverage & CI](11_coverage_and_ci.md) — measure what's tested and wire the suite into a pipeline.
+
+## Runtime-discovered cases with pytest 9 subtests
+
+When cases are known at collection, parametrization gives individually selectable tests. When a
+fixture discovers cases only during execution, pytest 9 includes `subtests`:
+
+```python
+def test_discovered_ids(subtests):
+    discovered = [1, 2, 3]  # replace with a deterministic fixture, not live discovery
+    for item_id in discovered:
+        with subtests.test(item_id=item_id):
+            assert item_id > 0
+```
+
+A failure in one subtest is reported without preventing checks of the remaining items. Subtests are
+not separately selectable command-line test IDs. Core functionality is available; reporting behavior
+is still described as evolving, so verify CI report consumers when upgrading.
+[pytest subtests](https://docs.pytest.org/en/stable/how-to/subtests.html), checked 2026-10-30.

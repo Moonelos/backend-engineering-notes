@@ -18,7 +18,7 @@ After a successful login, Cognito returns three tokens. Two (IdToken and AccessT
 
 ### IdToken — "Who is this user?"
 
-Contains user identity information. Tells your app (and API) who the user is.
+Contains user identity information for the OIDC client. It is not an API authorization credential.
 
 ```json
 {
@@ -69,7 +69,7 @@ Used to authorize API calls. Less about identity, more about permissions and sco
 
 Key differences from IdToken:
 - Has `scope` instead of user attributes
-- `client_id` is always present; `aud` is absent for plain app-client tokens, but **is** set to the resource-server identifier when the token is issued for a resource server (e.g. `api.myapp.com`)
+- `client_id` identifies the app client. An `aud` claim appears only when an OAuth **user** authorization request explicitly uses `resource=<URL>`. Registering `myapi/read` does not itself add an audience. M2M client-credentials grants and SDK user authentication do not support resource binding.
 - `token_use` is `"access"`
 - It is still a readable bearer credential and potentially sensitive: `username`, group affiliation,
   and customized claims can be personally identifiable information (PII). Classify and redact it as
@@ -108,21 +108,27 @@ new_tokens = response['AuthenticationResult']
 | IdToken | 1 hour | 5 min | 24 hours | Yes |
 | RefreshToken | 30 days | 1 hour | 10 years | Yes |
 
-Set them per App Client during creation or update:
+Set lifetimes on creation, or preserve the existing configuration on updates. Cognito's update
+operation resets omitted fields to defaults; a three-field patch can remove callback URLs or flows.
+The helper below is a real [local module](examples/config_updates.py), copied beside your script:
+
 ```python
-cognito_client.update_user_pool_client(
-    UserPoolId=pool_id,
-    ClientId=client_id,
-    AccessTokenValidity=15,
-    IdTokenValidity=15,
-    RefreshTokenValidity=7,
-    TokenValidityUnits={
-        'AccessToken': 'minutes',
-        'IdToken': 'minutes',
-        'RefreshToken': 'days',
-    },
+from config_updates import client_update_request
+
+request = client_update_request(
+    cognito_client, pool_id, client_id,
+    AccessTokenValidity=15, IdTokenValidity=15, RefreshTokenValidity=7,
+    TokenValidityUnits={"AccessToken": "minutes", "IdToken": "minutes", "RefreshToken": "days"},
 )
+# Review the redacted before/after configuration, then apply under one admin writer.
+cognito_client.update_user_pool_client(**request)
 ```
+
+The helper reads `DescribeUserPoolClient` and copies only fields accepted by the installed SDK's
+update schema. It excludes returned secrets and timestamps. Nested changes replace the specified
+nested object, so supply its complete intended value. Pin a current SDK, retain configuration in
+infrastructure as code, serialize administrators, and describe again after applying: this API has
+no compare-and-swap protection against concurrent updates. See [AWS update semantics](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_UpdateUserPoolClient.html).
 
 ---
 
@@ -130,151 +136,57 @@ cognito_client.update_user_pool_client(
 
 **Never trust a JWT without validating its signature.** Anyone can create a JWT — the signature is what proves Cognito issued it.
 
-### How Validation Works
+### One policy for one issuance profile
 
-Cognito signs tokens with a private RSA key. Your API validates the signature using Cognito's public key (published at a well-known URL called the JWKS endpoint).
+Cognito signs with RSA keys published at the **configured issuer's** JWKS URL. The classic issuer is
+`https://cognito-idp.<region>.amazonaws.com/<pool_id>`. Updated multi-Region issuers use a different
+prefix; never synthesize the accepted issuer from an unverified token. Pin the deployed value and
+fetch `<issuer>/.well-known/jwks.json` with bounded timeouts and caching.
 
-```
-JWKS endpoint:
-https://cognito-idp.<region>.amazonaws.com/<pool_id>/.well-known/jwks.json
-```
+| Issuance profile | Required API checks after RS256 signature, issuer, timestamps |
+|---|---|
+| M2M custom scope, no resource binding | `token_use=access`, exact allowed `client_id`, required custom scope; this lesson rejects unexpected `aud` |
+| OAuth user code flow with `resource=https://api.example.com` | Same access checks plus exact `aud=https://api.example.com` |
+| SDK user login | Access token normally has `aws.cognito.signin.user.admin`, not `myapi/read`; it does not satisfy the custom-scope API policy |
+| ID token | Separate OIDC identity handler validates client audience, type, and transaction nonce; never accepted by the API policy |
 
-**Start with the generic JWT validation algorithm in [auth/jwt.md §Validation Algorithm](../jwt.md#validation-algorithm).** Cognito adds three extra checks on top:
+`client_id` is a Cognito-specific app binding, not a generic replacement for OAuth resource
+audience. Custom scopes must remain distinct across resources when using the unbound M2M profile.
+[The Cognito resource-binding contract](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-define-resource-servers.html#cognito-user-pools-resource-servers-resource-binding)
+explains why `aud="myapi"` would reject the very M2M token this path issues.
 
-| Step | Generic JWT | Cognito addition |
-|------|-------------|------------------|
-| `iss` | match your auth server | must be `https://cognito-idp.<region>.amazonaws.com/<pool_id>` exactly |
-| `aud` vs `client_id` | check whichever your issuer sets | **IdToken** → check `aud`; **AccessToken** → check `client_id` (Cognito access tokens typically have no `aud` unless resource-server-scoped) |
-| `token_use` | n/a | must be `"id"` or `"access"` — reject if the wrong kind shows up where the other is expected |
+### Python validation
 
-### Python Validation
-
-```python
-import boto3
-import json
-import time
-import urllib.request
-from jose import jwk, jwt
-from jose.utils import base64url_decode
-
-REGION = 'us-east-1'
-POOL_ID = 'us-east-1_XXXXXXXX'
-CLIENT_ID = 'your-client-id'
-
-JWKS_URL = f'https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}/.well-known/jwks.json'
-
-# Cache this. See auth/jwt.md §"JWKS" for cache-TTL and rotation guidance —
-# the short version: cache for 15–60 minutes and refetch on `kid` miss.
-_jwks_cache: dict | None = None
-
-
-def get_jwks(force_refresh: bool = False) -> dict:
-    global _jwks_cache
-    if _jwks_cache is None or force_refresh:
-        with urllib.request.urlopen(JWKS_URL) as f:
-            _jwks_cache = json.loads(f.read())
-    return _jwks_cache
-
-
-def _find_key(jwks: dict, kid: str) -> dict | None:
-    return next((k for k in jwks['keys'] if k['kid'] == kid), None)
-
-
-def validate_token(token: str, token_use: str = 'access') -> dict:
-    """
-    Validate a Cognito JWT. Returns the decoded claims if valid.
-    Raises an exception if invalid.
-    token_use: 'access' or 'id'
-    """
-    # Decode header without verification to get kid
-    headers = jwt.get_unverified_headers(token)
-    kid = headers['kid']
-
-    # Find the matching public key. On `kid` miss, refetch JWKS once and retry —
-    # Cognito rotates keys, and a miss usually means the cache is stale, not that
-    # the token is bad. Only give up after the refetch also fails.
-    jwks = get_jwks()
-    key = _find_key(jwks, kid)
-    if not key:
-        jwks = get_jwks(force_refresh=True)
-        key = _find_key(jwks, kid)
-    if not key:
-        raise ValueError("Public key not found after JWKS refresh — token may be from a different pool")
-
-    # Verify signature and decode
-    public_key = jwk.construct(key)
-    message, encoded_sig = token.rsplit('.', 1)
-    decoded_sig = base64url_decode(encoded_sig.encode())
-
-    if not public_key.verify(message.encode(), decoded_sig):
-        raise ValueError("Signature verification failed")
-
-    # Decode claims
-    claims = jwt.get_unverified_claims(token)
-
-    # Validate expiry
-    if claims['exp'] < time.time():
-        raise ValueError("Token is expired")
-
-    # Validate issuer
-    expected_iss = f'https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}'
-    if claims['iss'] != expected_iss:
-        raise ValueError("Invalid issuer")
-
-    # Validate token use
-    if claims['token_use'] != token_use:
-        raise ValueError(f"Expected token_use={token_use}, got {claims['token_use']}")
-
-    # Validate audience (id token) or client_id (access token)
-    if token_use == 'id' and claims.get('aud') != CLIENT_ID:
-        raise ValueError("Invalid audience")
-    if token_use == 'access' and claims.get('client_id') != CLIENT_ID:
-        raise ValueError("Invalid client_id")
-
-    return claims
-
-
-# Usage in your API
-def protected_endpoint(authorization_header: str):
-    token = authorization_header.replace('Bearer ', '')
-    claims = validate_token(token, token_use='access')
-
-    user_sub = claims['sub']
-    groups   = claims.get('cognito:groups', [])
-
-    if 'admins' not in groups:
-        raise PermissionError("Admins only")
-
-    return {"user": user_sub, "groups": groups}
-```
-
-### Using PyJWT (alternative library)
+The canonical implementation is [access_policy.py](examples/access_policy.py); it is used by the
+[practical guide](oauth-jwt-guide.md). It requires the claim set, pins `RS256`, verifies issuer and
+freshness, rejects ID tokens/wrong clients, and distinguishes missing scope (403) from invalid
+authentication (401). Its `resource_audience=None` is an explicit **unbound Cognito M2M profile**, not
+a general instruction to disable audience validation.
 
 ```python
-import jwt
-import requests
+from access_policy import AccessPolicy, create_app, jwks_key_resolver
 
-JWKS_URL = f'https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}/.well-known/jwks.json'
-
-jwks_client = jwt.PyJWKClient(JWKS_URL)
-
-def validate_access_token_pyjwt(token: str) -> dict:
-    signing_key = jwks_client.get_signing_key_from_jwt(token)
-    claims = jwt.decode(
-        token,
-        signing_key.key,
-        algorithms=['RS256'],
-        issuer=f'https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}',
-        audience=RESOURCE_SERVER_AUDIENCE,
-    )
-    if claims.get('token_use') != 'access':
-        raise jwt.InvalidTokenError('expected a Cognito access token')
-    return claims
+ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE"
+policy = AccessPolicy(
+    issuer=ISSUER,
+    client_id="configured-service-client-id",
+    required_scopes=frozenset({"myapi/read"}),
+)
+app = create_app(policy, jwks_key_resolver(ISSUER))
 ```
 
-For an ID token, use a separate `validate_id_token_pyjwt()` function whose audience is
-`CLIENT_ID` and whose required `token_use` is `id`. Keeping the functions separate prevents a
-token minted for browser identity from silently crossing into an API authorization boundary.
+For the bound user branch, configure its separate user client ID and
+`resource_audience="https://api.example.com"`. Do not accept both token types by catching an
+audience failure and retrying without validation. [PyJWT](https://pyjwt.readthedocs.io/en/stable/api.html)
+validates required claims only when `options["require"]` names them; checking expiry when present
+is insufficient if `exp` can be omitted.
+
+Run the negative-fixture tests using the command in the practical guide. They generate real RSA
+signatures locally and exercise the HTTP dependency; they do not contact AWS or test live JWKS
+rotation. Production should coalesce/cache unknown-key refreshes and limit request rate, record
+rejection categories without tokens, and distinguish key-service outage (503) from invalid
+credentials. Scope success is only a coarse grant: the business handler still checks tenant and
+object permissions.
 
 ---
 
@@ -326,40 +238,40 @@ def handler(event, context):
 
 ## Token Revocation
 
-By default, tokens are stateless — Cognito can't invalidate them before expiry. But you can enable revocation.
+Revocation at Cognito and acceptance by an offline API verifier are different state machines.
+`RevokeToken` revokes one refresh-token family and its derived tokens at Cognito. It does **not**
+log out every independent session. `GlobalSignOut` (or the administrator equivalent) covers the
+user's sessions. A resource server that only verifies a JWT signature cannot discover either event.
+[AWS revocation documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/token-revocation.html).
 
-**Revoke a user's refresh token (logs them out everywhere):**
-```python
-# Get the client secret if the client has one
-cognito_client.revoke_token(
-    Token=refresh_token,
-    ClientId=client_id,
-    # ClientSecret=client_secret,  # include if client has a secret
-)
-# This invalidates the refresh token.
-# Existing access/id tokens remain valid until their expiry (up to 1 hour).
+```mermaid
+sequenceDiagram
+    participant App
+    participant Cognito
+    participant API as Offline JWT API
+    App->>Cognito: RevokeToken for session A refresh token
+    Cognito->>Cognito: Revoke A family; session B remains separate
+    App->>Cognito: Refresh session A
+    Cognito-->>App: Reject
+    App->>API: Previously issued A access token before exp
+    API-->>App: Signature still verifies unless local revocation policy rejects
 ```
 
-**Force sign-out everywhere (admin):**
+The last arrow is the operational gap. Choose a bounded access-token lifetime or make the API check
+a revocation/session-version store on each relevant request. Define the store's outage behavior and
+retention through token expiry; deleting a browser cookie alone does not revoke a stolen bearer.
+
 ```python
-cognito_client.admin_user_global_sign_out(
-    UserPoolId=pool_id,
-    Username='jane@example.com',
-)
-# Invalidates all of the user's refresh tokens and revokes access/id tokens
-# for calls made against Cognito's own APIs (e.g. GetUser, UpdateUserAttributes).
-# Access/id tokens presented to *your* backend keep passing JWT signature checks
-# until they expire — your API must check a deny-list (or the jti against a revocation store)
-# if you need immediate cutoff for downstream APIs.
+cognito_client.revoke_token(Token=refresh_token, ClientId=client_id)
+# Confidential clients also supply ClientSecret=client_secret.
+cognito_client.admin_user_global_sign_out(UserPoolId=pool_id, Username=username)
 ```
 
-**Enable token revocation on a client** (this is the default for app clients created since mid-2021, but worth confirming on older pools):
+Enable revocation without resetting other client settings:
+
 ```python
-cognito_client.update_user_pool_client(
-    UserPoolId=pool_id,
-    ClientId=client_id,
-    EnableTokenRevocation=True,
-)
+request = client_update_request(cognito_client, pool_id, client_id, EnableTokenRevocation=True)
+cognito_client.update_user_pool_client(**request)
 ```
 
 ### Refresh Token Rotation (Opt-In, since April 2025)
@@ -369,17 +281,25 @@ By default Cognito reuses the same refresh token until it expires. You can opt i
 one — a defense against refresh-token replay that lets you safely use longer refresh TTLs.
 
 ```python
-cognito_client.update_user_pool_client(
-    UserPoolId=pool_id,
-    ClientId=client_id,
-    RefreshTokenRotation={
-        'Feature': 'ENABLED',
-        'RetryGracePeriodSeconds': 30,   # old token still works briefly for client retries (max 60)
-    },
-)
-# When enabled, refresh via GetTokensFromRefreshToken or the /oauth2/token endpoint —
-# REFRESH_TOKEN_AUTH on initiate_auth is not compatible with rotation.
+request = client_update_request(cognito_client, pool_id, client_id)
+request["ExplicitAuthFlows"] = [
+    flow for flow in request.get("ExplicitAuthFlows", []) if flow != "ALLOW_REFRESH_TOKEN_AUTH"
+]
+request["RefreshTokenRotation"] = {"Feature": "ENABLED", "RetryGracePeriodSeconds": 10}
+cognito_client.update_user_pool_client(**request)
+
+result = cognito_client.get_tokens_from_refresh_token(
+    ClientId=client_id, RefreshToken=stored_refresh_token,
+    # ClientSecret=client_secret,  # confidential client only
+)["AuthenticationResult"]
+# Atomically replace stored_refresh_token with result["RefreshToken"] and the new access token.
 ```
+
+Remove `ALLOW_REFRESH_TOKEN_AUTH` in the same update: it is incompatible with rotation. For OAuth
+clients, the token endpoint also supports refresh. Serialize refresh attempts per session; two tabs
+must not overwrite a newer replacement token with an older response. A lost response can be retried
+within the configured grace interval, but after it expires require reauthentication rather than
+looping. [Cognito refresh rotation](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-refresh-token.html).
 
 ---
 
@@ -387,7 +307,7 @@ cognito_client.update_user_pool_client(
 
 ```
 On login:
-  IdToken     → decode to get user info (email, name, groups, custom attrs)
+  IdToken     → validate as an OIDC identity response before using profile attributes
   AccessToken → send in Authorization header to your API
   RefreshToken → store securely, use to get new tokens when AccessToken expires
 
@@ -395,13 +315,14 @@ On every API request:
   Authorization: Bearer <AccessToken>
 
 When AccessToken expires (after 1 hour by default):
-  Call initiate_auth with REFRESH_TOKEN_AUTH → get new AccessToken + IdToken
+  Nonrotating SDK client: REFRESH_TOKEN_AUTH
+  Rotating client: GetTokensFromRefreshToken or OAuth refresh grant; persist replacement
 
 When RefreshToken expires (after 30 days by default):
   User must log in again
 
 The only token your API should validate:
-  AccessToken (use IdToken only if you genuinely need user attributes in the request)
+  AccessToken; ID tokens never cross this API authorization boundary
 ```
 
 ---
@@ -410,3 +331,20 @@ The only token your API should validate:
 
 - [cognito.md](./cognito.md) — Mental model and overview
 - [user-pool.md](./user-pool.md) — User pool, app clients, auth flows, boto3
+
+
+## Retention and transfer
+
+**Recap:** token type, app client, scope, and optional resource audience form one issuance/validation
+contract. Revocation changes issuer state; offline verification needs its own freshness policy.
+
+**Check yourself:** will adding the `myapi/read` resource-server scope make a client-credentials
+token pass `aud="myapi"` validation?
+<details><summary>Answer</summary>No. Scope registration does not imply resource binding. Use the
+explicit unbound M2M contract, or a supported user OAuth flow with a URL resource audience.</details>
+
+**Try it:** an administrator revokes session A, but a five-minute-old token still reaches your API.
+Decide which observation distinguishes a broken signature validator from missing revocation state.
+<details><summary>Answer</summary>Check that the token remains unexpired and has the configured
+issuer/profile. Signature verification can correctly succeed. Confirm A's refresh fails at Cognito,
+then inspect the API's revocation/version check; session B is not evidence that A revocation failed.</details>

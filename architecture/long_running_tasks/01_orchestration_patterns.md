@@ -262,7 +262,7 @@ Client                    Orchestrator                    Worker
 Worker crashes, never calls send_task_success or send_task_failure
   │
   ├── Orchestrator has a HeartbeatSeconds timeout configured
-  │   (not a worker heartbeat — a "I expect a response within X seconds")
+  │   (renewed by SendTaskHeartbeat; TimeoutSeconds separately caps total duration)
   │
   └── After HeartbeatSeconds expires:
       │
@@ -270,6 +270,11 @@ Worker crashes, never calls send_task_success or send_task_failure
       ├── Cleanup logic runs (stop worker session, release resources)
       └── Task marked as failed (reason: heartbeat timeout)
 ```
+
+For `HeartbeatSeconds=60` and `TimeoutSeconds=180`, start at t=0 and heartbeat at t=40.
+Silence after that allows heartbeat expiry at t=100. Continued heartbeats never extend execution
+past t=180. These are independent clocks: renewal proves a signal arrived, not that every external
+effect finished. [AWS SendTaskHeartbeat](https://docs.aws.amazon.com/step-functions/latest/apireference/API_SendTaskHeartbeat.html), checked 2026-10-30.
 
 ### On Failure (Graceful — Worker Catches Error)
 
@@ -406,3 +411,17 @@ In production, you rarely use one pattern in isolation:
 - **Event-Driven + Sweeper**: Workers publish events, but a background sweeper catches tasks that never emitted a completion event.
 
 The general principle: **callbacks for the happy path, timeouts for the sad path**.
+
+## Decide when the callback path fails
+
+**The callback endpoint is unreachable while worker generation 1 continues. Does heartbeat expiry
+prove it died, and may its delayed callback replace generation 2's result?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Expiry proves only that renewal was not observed. The orchestrator can issue generation 2,
+but every completion and local effect must check current ownership. Generation 1's delayed callback
+is rejected; generation 2's accepted result remains the durable truth. For a remote side effect,
+the receiver must enforce an idempotency or fencing contract too.
+
+</details>

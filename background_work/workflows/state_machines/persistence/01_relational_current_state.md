@@ -259,4 +259,35 @@ Do not use this model when authoritative history must be rebuilt into several pr
 
 ---
 
+## Recap and check yourself
+
+- The current row stores the authoritative state and revision for concurrent commands.
+- A conditional update must supply every dependent job/event insert.
+- One transaction does not automatically turn zero matched rows into a failed transition.
+
+**An UPDATE matches zero rows inside BEGIN/COMMIT. Does PostgreSQL automatically prevent the next INSERT?**
+
+<details><summary>Answer</summary>
+
+No. Zero rows is not an error. Derive the insert from UPDATE RETURNING or explicitly abort before creating work.
+
+</details>
+
+**Two reviewers approve revision 6 simultaneously. What should the loser observe?**
+
+<details><summary>Answer</summary>
+
+Only one expected-version update advances the row. The loser gets a conflict or current-state response and creates no extra generation job.
+
+</details>
+
+**Try it:** Fill the source relation in `INSERT INTO jobs (...) SELECT ... FROM ___` after a compare-and-set UPDATE RETURNING.
+
+<details><summary>Hint and worked solution</summary>
+
+The dependency must be executable, not a comment. Select from the returned winning update relation. Zero update rows then mechanically produces zero job rows.
+
+</details>
+
+
 **Next**: [Event-Sourced State](02_event_sourced_state.md)

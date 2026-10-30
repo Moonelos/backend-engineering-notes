@@ -206,6 +206,24 @@ Python cannot safely kill an arbitrary running thread. Use dependency-level time
 
 ---
 
+A waiting deadline does not release the worker:
+
+```mermaid
+sequenceDiagram
+ participant C as Caller
+ participant F as Future
+ participant W as Worker thread
+ C->>F: submit slow call
+ F->>W: start
+ C->>F: result timeout 1 second
+ F-->>C: TimeoutError
+ C->>F: cancel
+ F-->>C: False: already running
+ W-->>F: completes at 5 seconds
+```
+
+The slot stays occupied until second five. `shutdown(wait=False)` also changes caller waiting, not thread termination; the process normally waits for running pool threads before exit.
+
 ## 7. Call Blocking Code from Asyncio
 
 For a simple blocking I/O call, prefer `asyncio.to_thread()`:
@@ -365,5 +383,41 @@ when state is shared or threads cross into async/free-threaded execution.
 - [`asyncio.to_thread`](https://docs.python.org/3/library/asyncio-task.html#asyncio.to_thread)
 
 ---
+
+
+## Recap
+
+- Pool workers share process objects and need invariant ownership.
+- Timeout ends a wait; dependency timeouts or cooperative stop control running work.
+
+## Check yourself
+
+**Q: A caller times out at 1 second on a 5-second function. Is its pool slot free?**
+
+<details><summary>Answer</summary>
+
+No. The function retains the worker until it returns. Cancelling a future only succeeds before it starts.
+
+</details>
+
+**Q: Can a worker in a one-thread pool safely wait for a job submitted to that same pool?**
+
+<details><summary>Answer</summary>
+
+No. It occupies the only worker while the nested job waits for it; this is pool starvation deadlock.
+
+</details>
+
+## Try it
+
+Run the timeout example and record timeout, cancel result and final completion time.
+
+Hint: Measure with monotonic time; keep the original Future.
+
+<details><summary>Worked solution</summary>
+
+Timeout occurs first, cancel returns False after work starts, and the Future completes later. Permit accounting should follow that last event.
+
+</details>
 
 **Next**: [Thread Synchronization Primitives and Patterns](02_synchronization_primitives.md)

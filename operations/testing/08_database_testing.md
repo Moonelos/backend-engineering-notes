@@ -72,10 +72,14 @@ def client(db_session):
     def override_get_db():
         yield db_session
 
+    previous = app.dependency_overrides.copy()
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as client:
-        yield client
-    app.dependency_overrides.clear()
+    try:
+        with TestClient(app) as client:
+            yield client
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
 ```
 
 Function scope is intentional. Application code may call `commit()`, so rolling back a separate
@@ -138,18 +142,41 @@ schema, tenant, or explicit reset for concurrency, outbox, and worker tests.
 
 ---
 
+The outer transaction controls only writes on its own connection:
+
+```mermaid
+sequenceDiagram
+    participant F as Fixture connection A
+    participant S as Application Session on A
+    participant W as Worker connection B
+    F->>F: BEGIN outer transaction
+    S->>F: SAVEPOINT, insert outbox 42
+    S->>F: commit releases SAVEPOINT
+    W->>W: SELECT outbox 42 sees no committed row
+    F->>F: ROLLBACK outer transaction removes row
+```
+
+Releasing a savepoint is not a database-wide commit. For worker visibility, use committed setup
+in an isolated database/schema instead; a later rollback on A cannot undo a real commit on B.
+
 ## Strategy 3: Async Database Testing (SQLAlchemy 2.0 + asyncpg)
 
 ```python
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 ASYNC_TEST_DB_URL = "postgresql+asyncpg://user:pass@localhost/test_db"
-async_engine = create_async_engine(ASYNC_TEST_DB_URL)
-AsyncTestingSession = async_sessionmaker(async_engine, class_=AsyncSession)
+@pytest.fixture
+async def async_engine():
+    engine = create_async_engine(ASYNC_TEST_DB_URL)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
 
 
 @pytest.fixture
-async def async_db_session():
+async def async_db_session(async_engine):
+    AsyncTestingSession = async_sessionmaker(async_engine, class_=AsyncSession)
     async with async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -204,7 +231,7 @@ async def engine(postgres_url):
     await engine.dispose()
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(scope="function", loop_scope="session")
 async def db_session(engine):
     """A session that rolls back after each test — isolation without teardown cost."""
     async with engine.connect() as conn:
@@ -225,7 +252,11 @@ async def db_session(engine):
 **Pros:** real database engine, real constraints, real SQL dialect — catches Postgres-only bugs (JSONB, arrays, `ON CONFLICT`, extensions).
 **Cons:** Docker dependency (CI must support Docker-in-Docker or use services). Container startup adds ~5 s to the first test; `scope="session"` amortizes that.
 
-> **Use `loop_scope="session"`** for session-scoped async fixtures like this. It keeps the engine on a session-lived event loop while ordinary per-test fixtures can stay function-scoped. See [06](06_async_testing.md).
+Every test and async client/lifespan fixture using this engine must also run on the session loop:
+mark tests with `@pytest.mark.asyncio(loop_scope="session")`, and declare dependent fixtures with
+`scope="function", loop_scope="session"`. Cache scope controls reuse of the fixture value;
+`loop_scope` controls which loop owns it. Keep those separate. The function-engine alternative
+above instead creates, uses and disposes pooled connections inside each test loop. See [06](06_async_testing.md).
 
 ---
 
@@ -300,7 +331,9 @@ A frequently-overlooked layer. Alembic migrations break silently — tests pass 
 real migration chain to an empty disposable database; `create_all()` is useful fixture setup but is
 not migration evidence.
 
-The check that catches this:
+The check below uses a **separate synchronous engine pointing to an empty disposable database**,
+not the async or pre-created-schema fixtures above. Its Alembic `env.py` must read this URL and its
+application migration directory must exist. Never point this destructive fixture at shared data.
 
 ```python
 def test_migrations_match_models(engine):
@@ -309,7 +342,9 @@ def test_migrations_match_models(engine):
     from alembic import command
 
     alembic_cfg = Config("alembic.ini")
-    alembic_cfg.set_main_option("sqlalchemy.url", str(engine.url))
+    url = engine.url.render_as_string(hide_password=False)
+    # ConfigParser needs literal percent signs escaped; never log this URL.
+    alembic_cfg.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
     command.upgrade(alembic_cfg, "head")
 
     # Compare live schema to models — fails if a model was added without a migration
@@ -329,3 +364,35 @@ See [fundamentals/database/06_alembic.md](../../fundamentals/database/06_alembic
 ## Next
 
 - [09 — Mocking External Services](09_mocking_external.md) — when the thing you're calling is not a database.
+
+## Recap and retrieval
+
+- Rollback isolation follows the connection that actually performed the writes.
+- Savepoints allow application session commits while an outer fixture transaction remains rollbackable.
+- Worker/concurrency tests need separately visible committed setup and explicit cleanup.
+
+**An outbox worker on another connection cannot see fixture rows. Is the worker broken?**
+
+<details><summary>Reasoned answer</summary>
+
+Not established. The outer rollback fixture keeps those rows uncommitted to other connections. Use a uniquely isolated database/schema with committed setup for that test.
+
+</details>
+
+**Can str(engine.url) safely configure a password-bearing migration URL?**
+
+<details><summary>Reasoned answer</summary>
+
+No. SQLAlchemy masks the password in string rendering. Render explicitly without hiding it, escape ConfigParser percent signs, never log it, and use a disposable migration database.
+
+</details>
+
+**Try it:** Adapt a same-connection rollback test into an outbox-worker test using a second connection. Leave setup/cleanup ownership blank.
+
+Hint: The worker can only see committed state.
+
+<details><summary>Worked solution</summary>
+
+Use a unique disposable database/schema, commit setup, start/join the worker, assert the durable effect via a fresh connection and explicitly remove the test database/schema. Do not wrap setup in an invisible outer transaction.
+
+</details>

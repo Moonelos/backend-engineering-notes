@@ -6,7 +6,7 @@
 
 > **Key insight**: A unit test narrows the causal search space by replacing boundaries; avoiding I/O is a consequence, not the purpose.
 
-A unit test exercises one function or class with its dependencies faked out. It runs in milliseconds, fails deterministically, and tells you *exactly* where a regression lives. If every test in your suite goes through `TestClient`, you do not have unit tests — you have slow integration tests.
+A unit test exercises one function or class with its dependencies faked out. It runs in milliseconds, fails deterministically, and tells you *exactly* where a regression lives. If every test in your suite goes through `TestClient`, you do not have unit tests — you have API-slice tests when outer effects are replaced, or integration tests when real external boundaries are included. Speed alone does not classify the boundary.
 
 ---
 
@@ -246,19 +246,29 @@ async def get_user(user_id: int):
     return await user_service.get(user_id)
 ```
 
-The import statement binds the object to the name `user_service` inside
-`app.routers.users`. The route resolves that local name when it runs. Replacing an attribute in a
-different module does not replace the already-bound name used by the route.
+Here `user_service` is a module object. Both `app.services.user_service.get` and
+`app.routers.users.user_service.get` can refer to the *same attribute on that same object*, so
+patching either can affect the route. The pitfall appears when a function is imported directly:
 
 ```python
-# ❌ Replacing a different module's name leaves users.py's bound name unchanged
-with patch("app.services.user_service.get"):
-    ...
+# app/routers/users.py — alternative import style
+from app.services.user_service import get
 
-# ✅ Replace the name resolved by the module under test
-with patch("app.routers.users.user_service.get"):
-    ...
+@router.get("/users/{user_id}")
+async def get_user(user_id: int):
+    return await get(user_id)
 ```
+
+Now `get` is a separately bound name. Replacing `app.services.user_service.get` does not update it:
+
+```python
+with patch("app.routers.users.get", new_callable=AsyncMock) as get_user:
+    get_user.return_value = {"id": 42}
+    # Call the route through the client and assert its observable response.
+```
+
+Track object identity and the lookup expression, rather than memorizing a path convention.
+[Python: where to patch](https://docs.python.org/3/library/unittest.mock.html#where-to-patch), checked 2026-10-30.
 
 > **The rule:** patch the name as seen by the module under test, not where the object is defined. This bites everyone at least once.
 
@@ -345,3 +355,35 @@ If a "unit" test is slow, flaky, or order-dependent, it is mislabelled. Move it 
 
 - [04 — Endpoint Testing](04_endpoint_testing.md) — climb one level up the pyramid to HTTP-level tests.
 - [13 — Testing LLM Code](13_testing_llm_code.md) — apply the same unit-test discipline to prompts, adapters, schemas, and agents.
+
+## Recap and retrieval
+
+- Replacing outer effects isolates the policy whose result the assertion checks.
+- Module imports can share object attributes; direct function imports bind separate names.
+- A fake preserves the declared contract only as far as its behavior and assertions establish it.
+
+**A route imports the user_service module. Can patching the module through another alias affect it?**
+
+<details><summary>Reasoned answer</summary>
+
+Yes, when both aliases refer to the same module object. Patching its get attribute changes what either attribute lookup sees. Directly importing get creates a different local binding.
+
+</details>
+
+**A fake passes while PostgreSQL rejects a duplicate. Should the database constraint be removed?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The fake has omitted an invariant; strengthen its contract or keep the uniqueness claim in a production-dialect integration test.
+
+</details>
+
+**Try it:** Write two tiny modules: one imports a module, the other imports its get function. Leave the patch target in each test blank.
+
+Hint: Follow the runtime name lookup in each caller.
+
+<details><summary>Worked solution</summary>
+
+Patch the shared module attribute for the first, and the caller’s local get binding for the second. Assert the returned value rather than only whether a mock was called.
+
+</details>

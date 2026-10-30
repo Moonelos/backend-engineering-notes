@@ -16,7 +16,7 @@ receivers:
         endpoint: 127.0.0.1:4317
 exporters:
   debug:
-    verbosity: basic
+    verbosity: detailed
 service:
   pipelines:
     traces:
@@ -24,10 +24,30 @@ service:
       exporters: [debug]
 ```
 
-Save this as `collector.yaml`, start the Collector with that config, and point the local SDK
-quick proof at `http://127.0.0.1:4317` in an explicitly plaintext development environment. The
-Collector log should show a one-span resource batch containing `checkout`. A listening port with
-no debug export means the receiver exists but the pipeline is not connected.
+That YAML is for a native Collector bound to loopback. For Docker, use the checked-in
+[collector-local.yaml](examples/collector-local.yaml), whose container listener is `0.0.0.0` but
+whose published host port is loopback-only. The console-only SDK proof from chapter 2 does not
+send OTLP: [otlp_sender.py](examples/otlp_sender.py) installs the required OTLP exporter.
+Run from the repository root in two terminals:
+
+```bash
+docker run --rm --name notes-otel-local -p 127.0.0.1:14317:4317 \
+  -v "$PWD/infrastructure/observability/examples/collector-local.yaml:/etc/otelcol-contrib/config.yaml:ro" \
+  ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.151.0
+```
+
+```bash
+uv run --with opentelemetry-sdk --with opentelemetry-exporter-otlp-proto-grpc \
+  python infrastructure/observability/examples/otlp_sender.py
+docker logs notes-otel-local
+docker stop notes-otel-local
+```
+
+Require the Collector's detailed output to contain a span named `checkout`. The sender's flush
+print proves that its queue drained, not that a backend stored the data. A connection-refused error
+usually means the container is not ready or the wrong host port was used. Receiving bytes without
+export output means the traces pipeline or exporter is missing. `verbosity: basic` summarizes batches
+and does not promise to print individual span names.
 
 > **Production:** bind beyond loopback only with authentication and verified TLS. Later sections
 > add processors, batching, retries, and backend exporters.
@@ -104,7 +124,7 @@ receivers:
 
 **Why both grpc and http?**
 
-- gRPC is more efficient (binary, multiplexed, smaller wire format) — prefer it for app-to-Collector traffic
+- Both OTLP/gRPC and OTLP/HTTP-protobuf carry protobuf. Choose using proxy support, connection behavior and measured overhead; gRPC has no universal smaller-payload guarantee.
 - HTTP/protobuf is useful for environments where gRPC is blocked (some proxies, service meshes)
 - Most Python apps use gRPC by default (`OTLPSpanExporter` uses gRPC unless you import the HTTP variant)
 
@@ -143,11 +163,14 @@ Processors sit between receivers and exporters. They transform, filter, or enric
 processors:
   batch:
     timeout: 5s             # max time to wait before sending a batch
-    send_batch_size: 1000   # max spans/metrics per batch
+    send_batch_size: 1000   # flush trigger, not a hard maximum
     send_batch_max_size: 2000
 ```
 
-The `batch` processor groups data into batches before export. Without it, the Collector sends one span per export call, which is extremely inefficient and hammers backends with tiny requests. **Always include `batch` in every pipeline.**
+The `batch` processor groups incoming data. `send_batch_size` triggers a flush, `timeout` bounds
+waiting, and `send_batch_max_size` caps outgoing batches. Incoming SDK/exporter requests may already
+contain many spans; omitting this processor does not imply one span per network call. Tune the
+processor to balance latency, memory and backend request overhead.
 
 ### memory_limiter (always use this in production)
 
@@ -155,11 +178,16 @@ The `batch` processor groups data into batches before export. Without it, the Co
 processors:
   memory_limiter:
     check_interval: 5s
-    limit_mib: 512          # hard limit — Collector starts dropping if exceeded
+    limit_mib: 512          # hard threshold: force garbage collection
     spike_limit_mib: 128    # buffer for sudden spikes above the steady-state limit
 ```
 
-If your app suddenly emits a spike of spans (traffic surge, runaway loop), the Collector's memory will grow unbounded without this. The `memory_limiter` drops data rather than OOMing. **Always put `memory_limiter` first in every pipeline.**
+With these values the soft threshold is `512 - 128 = 384 MiB`. Above it, the limiter refuses new
+data with a non-permanent error so the upstream component can retry. Above 512 MiB it also forces
+garbage collection. Loss depends on upstream retry support and finite queue capacity; the processor
+does not guarantee either losslessness or immediate dropping. Put it early to propagate pressure
+before expensive work, and leave runtime headroom below the container memory limit.
+[0.151.0 memory limiter semantics](https://github.com/open-telemetry/opentelemetry-collector/blob/v0.151.0/processor/memorylimiterprocessor/README.md), checked 2026-10-30.
 
 ### resource (add/overwrite attributes)
 
@@ -314,6 +342,10 @@ service:
 
 This config matches **Method 1B** from [03 — Metrics Export Methods](03_metrics_export_methods.md): the app sends all signals via OTLP, the Collector routes traces to Groundcover and metrics to a Prometheus-compatible backend.
 
+The client must trust the issuing CA, present a certificate accepted by `client_ca_file`, and use
+the DNS name in the server certificate. Mount these files read-only; control network access and
+client certificate issuance as well as encryption.
+
 ```yaml
 # otel-collector-config.yaml
 
@@ -322,14 +354,22 @@ receivers:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
+        tls:
+          cert_file: /tls/tls.crt
+          key_file: /tls/tls.key
+          client_ca_file: /tls/ca.crt
       http:
         endpoint: 0.0.0.0:4318
+        tls:
+          cert_file: /tls/tls.crt
+          key_file: /tls/tls.key
+          client_ca_file: /tls/ca.crt
 
 processors:
   memory_limiter:
     check_interval: 5s
-    limit_mib: 512
-    spike_limit_mib: 128
+    limit_mib: 384
+    spike_limit_mib: 96
 
   batch:
     timeout: 5s
@@ -402,7 +442,7 @@ service:
 memory_limiter → filter/drop_health → resource → batch → exporter
 ```
 
-1. **memory_limiter first** — drop data if memory is tight, before doing any work on it
+1. **memory_limiter first** — refuse with retryable pressure above the soft threshold; upstream capacity determines eventual loss
 2. **filter** — drop health check spans before enriching them (no point enriching what you discard)
 3. **resource** — stamp environment attributes onto spans
 4. **batch** — group into efficient export batches
@@ -412,34 +452,20 @@ memory_limiter → filter/drop_health → resource → batch → exporter
 
 ## 8. Where the Collector Runs
 
-### Docker Compose (local dev / simple deployments)
+### Docker Compose for the local experiment
 
 ```yaml
-# docker-compose.yml
-
 services:
-  app:
-    build: .
-    environment:
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
-      SERVICE_NAME: "orders-api"
-    depends_on:
-      - otel-collector
-
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.150.0   # current example version as of 2026-04-21
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.151.0
     volumes:
-      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+      - ./infrastructure/observability/examples/collector-local.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-      - "8888:8888"   # Collector self-metrics (Prometheus scrape)
-    environment:
-      GROUNDCOVER_API_KEY: "${GROUNDCOVER_API_KEY}"
-      ENVIRONMENT: "development"
+      - "127.0.0.1:14317:4317"
 ```
 
-> **`otel/opentelemetry-collector` vs `otel/opentelemetry-collector-contrib`**: `prometheusremotewrite` is available in current core and contrib distributions, but `-contrib` remains the safer default when you want broad component availability. Pin a recent Collector version instead of copying stale image tags from old examples.
+Run the same `otlp_sender.py` from the host. For production use the mTLS config above and mount
+server/client trust material; exposing the local fixture outside loopback changes its trust boundary.
 
 ### Kubernetes (DaemonSet — one Collector per node)
 
@@ -462,7 +488,7 @@ spec:
     spec:
       containers:
         - name: otel-collector
-          image: otel/opentelemetry-collector-contrib:0.150.0
+          image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.151.0
           args: ["--config=/conf/config.yaml"]
           ports:
             - containerPort: 4317    # OTLP gRPC
@@ -471,6 +497,9 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /conf
+            - name: tls
+              mountPath: /tls
+              readOnly: true
           env:
             - name: GROUNDCOVER_API_KEY
               valueFrom:
@@ -487,28 +516,56 @@ spec:
               memory: 128Mi
               cpu: 100m
       volumes:
+        - name: tls
+          secret:
+            secretName: otel-server-tls
         - name: config
           configMap:
             name: otel-collector-config
 ```
 
-Apps on the same node send to `http://$(NODE_IP):4317`. Each app's pod spec injects the node IP:
+A `containerPort` is documentation for the pod; it does not bind the node IP. Expose a private
+Service and have applications use its DNS name, which must also appear in the server certificate:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+```
+
+Application environment (mount its client certificate/key and CA at these paths):
 
 ```yaml
 env:
-  - name: NODE_IP
-    valueFrom:
-      fieldRef:
-        fieldPath: status.hostIP
   - name: OTEL_EXPORTER_OTLP_ENDPOINT
-    value: "http://$(NODE_IP):4317"
+    value: "https://otel-collector.monitoring.svc:4317"
+  - name: OTEL_EXPORTER_OTLP_CERTIFICATE
+    value: "/otel-client/ca.crt"
+  - name: OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE
+    value: "/otel-client/tls.crt"
+  - name: OTEL_EXPORTER_OTLP_CLIENT_KEY
+    value: "/otel-client/tls.key"
 ```
+
+Verify Service endpoints, DNS, TLS name/chain, client authentication and one canary span before
+calling the deployment ready. The ConfigMap, TLS Secret and namespace are deployment prerequisites;
+these manifests are not a certificate-issuing system. An ordinary ClusterIP may route across nodes;
+node-local delivery needs an explicit tested traffic policy or host-port design.
 
 **DaemonSet vs Deployment for the Collector:**
 
 | Mode | When to Use |
 |---|---|
-| DaemonSet | Apps send to the Collector on the same node — no cross-node network hop, scales automatically with cluster |
+| DaemonSet | One pod per node; local routing needs an explicit policy, while a normal Service may cross nodes |
 | Deployment | Single central Collector — simpler config, useful for tail sampling which needs to see all spans from a trace |
 | Sidecar | Collector runs per pod — maximum isolation, high resource overhead at scale |
 
@@ -533,9 +590,45 @@ docker run \
   -e GROUNDCOVER_ENDPOINT="ingest.groundcover.com:443" \
   -e GROUNDCOVER_API_KEY="${GROUNDCOVER_API_KEY:?set-a-test-key}" \
   -v ./config.yaml:/etc/otelcol-contrib/config.yaml \
-  otel/opentelemetry-collector-contrib:0.150.0
+  ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.151.0
 ```
 
 In Kubernetes, use `secretKeyRef` for secrets and `configMapKeyRef` for non-sensitive values, as shown in the DaemonSet example above.
 
 > **Version-sensitive note**: `service.telemetry.metrics.address` was deprecated and, as of Collector `v0.123.0`, ignored. Use `service.telemetry.metrics.readers` for Collector self-metrics in current configs.
+
+## Recap
+
+- Receiver/exporter declarations become active only through a signal pipeline.
+- Batch triggers, maximum batch size and memory refusal are distinct controls.
+- Network routing, verified transport and observed canary output complete a deployment check.
+
+## Check yourself
+
+**Q: The receiver accepts OTLP but metrics is absent from service.pipelines. Does declaring a metrics exporter elsewhere activate it?**
+
+<details><summary>Answer</summary>
+
+No. No metrics pipeline connects the receiver to that exporter. Add the signal-specific receivers/processors/exporters wiring and send a known metric to prove it.
+
+</details>
+
+**Q: At limit_mib=512 and spike_limit_mib=128, what happens above 384 MiB?**
+
+<details><summary>Answer</summary>
+
+The limiter starts refusing incoming data with non-permanent errors. Upstream retries/queues determine whether it is eventually recovered or lost; above the hard threshold it also forces garbage collection.
+
+</details>
+
+## Try it
+
+Keep the local trace fixture, remove debug from the traces pipeline and predict the evidence; then restore it and send checkout again.
+
+Hint: Listening on a socket is not the final assertion.
+
+<details><summary>Worked solution</summary>
+
+An empty exporters list may fail configuration validation; an unreferenced exporter cannot produce the detailed checkout output. Restore a valid connected pipeline, restart the Collector and require that named span in its log.
+
+</details>

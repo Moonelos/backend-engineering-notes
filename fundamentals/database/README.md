@@ -25,6 +25,9 @@ Assumed knowledge: basic Python and ordinary command-line use. SQL is taught in 
 | [08_backup_and_recovery.md](08_backup_and_recovery.md) | Recovery | RPO/RTO, logical and physical backups, PITR, disposable restore rehearsal |
 | [09_postgresql_operations.md](09_postgresql_operations.md) | Operations | MVCC version retention, autovacuum, long transactions, statistics and replica freshness |
 | [10_database_access_security.md](10_database_access_security.md) | Access Security | Runtime versus migration authority, grants, future objects and verified driver TLS |
+| [11_query_performance.md](11_query_performance.md) | Query performance | Plans, indexes, pagination, ORM query counts and benchmark hygiene |
+| [12_data_modeling_and_constraints.md](12_data_modeling_and_constraints.md) | Modeling | Constraints, state transitions, history, soft deletes and JSONB |
+| [13_multi_tenancy.md](13_multi_tenancy.md) | Tenancy | Isolation models, row policies, noisy neighbors and tenant lifecycle operations |
 
 ---
 
@@ -51,6 +54,10 @@ other abstraction.
 
 ---
 
+## New production branches
+
+After 01–06, read 11 to diagnose query cost, 12 to enforce business invariants, and 13 when multiple tenants share the service. Keep 08–10 as prerequisites for tenant recovery and runtime privilege decisions.
+
 ## Key Decisions at a Glance
 
 | Question | Answer |
@@ -70,3 +77,12 @@ other abstraction.
 
 - [Concurrency & Async](../concurrency/README.md) — understand event loops before async SQLAlchemy
 - [FastAPI Dependency Injection](../fastapi/02_dependency_injection.md) — `Depends(get_db)` pattern
+
+## What's changing — checked 2026-10-30
+
+The chapter examples retain their stated version baselines. Treat upgrades as separate verified configurations:
+
+- **SQLAlchemy 2.1:** Python 3.11+; install `SQLAlchemy[asyncio]` when using async paths because greenlet is no longer installed by default. A bare `postgresql://` URL now selects Psycopg 3; use explicit `postgresql+psycopg://` or `postgresql+asyncpg://` to make driver selection reviewable. Session execution autoflush is now unconditional when enabled, so even a textual SELECT can flush pending invalid writes earlier than a 2.0 application expects. Re-run transaction/rollback tests before deployment. [Migration guide](https://docs.sqlalchemy.org/en/21/changelog/migration_21.html).
+- **PostgreSQL 18:** `uuidv7()` provides time-ordered identifiers; they are not an authorization secret. Generated columns default to VIRTUAL, so explicitly retain STORED when persistence is required. New clusters enable checksums by default; compare source/target checksum settings before `pg_upgrade`. MD5 deprecation and SCRAM migration belong in [access security](10_database_access_security.md). OAuth requires an explicit server/client authentication design. [Release notes](https://www.postgresql.org/docs/18/release-18.html).
+
+The [2.1 upgrade probe](examples/sqlalchemy_21_probe.py) proves driver selection and the earlier flush boundary in an isolated SQLite database; it does not establish PostgreSQL performance or provider upgrade compatibility. Install `SQLAlchemy[asyncio]==2.1.6`, then run `python fundamentals/database/examples/sqlalchemy_21_probe.py`. Keep the existing 2.0 async baseline pinned until its driver, transaction and migration suite passes under the target release.

@@ -237,6 +237,10 @@ Use the simplest model that meets throughput, latency, memory, and failure-isola
 
 ---
 
+## Python 3.15 continuation
+
+Checked 2026-10-30: the stable ABI for free-threaded builds expands extension migration options. It does not prove that an installed extension is thread-safe or that the imported deployment runs without the GIL. Repeat the compatibility and runtime-state checks above. [Python 3.15](https://docs.python.org/3.15/whatsnew/3.15.html).
+
 ## References
 
 - [`InterpreterPoolExecutor`](https://docs.python.org/3/library/concurrent.futures.html#interpreterpoolexecutor)
@@ -248,5 +252,29 @@ Use the simplest model that meets throughput, latency, memory, and failure-isola
 - [PEP 779 — Supported Status for Free-Threaded Python](https://peps.python.org/pep-0779/)
 
 ---
+
+
+## Recap
+
+- Interpreter isolation and operating-system process isolation protect different boundaries.
+- Extension compatibility and measured deployment behavior decide runtime suitability.
+
+## Check yourself
+
+**Q: An interpreter-compatible native extension can segfault. Does InterpreterPoolExecutor protect the web process?**
+
+<details><summary>Answer</summary>
+
+No. Its interpreters share an OS process. Keep process isolation when a fatal native failure must not kill the web process.
+
+</details>
+
+**Q: A free-threaded build imports an incompatible extension. Is the build name enough to prove parallel threads?**
+
+<details><summary>Answer</summary>
+
+No. Check the actual GIL/runtime state after imports and verify that deployment's extension compatibility.
+
+</details>
 
 **Next**: [Asyncio](async/README.md)

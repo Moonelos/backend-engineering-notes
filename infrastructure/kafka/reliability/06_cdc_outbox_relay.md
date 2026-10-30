@@ -20,6 +20,53 @@ The outbox table is insert-only for the connector path. Updating a row to “pub
 another change event unless filters happen to suppress it, and deleting it too early can outrun a
 lagging connector. Retention must exceed the maximum connector outage plus repair time.
 
+## Stop the connector, commit another event, then resume from its position
+
+Run the complete [CDC fixture](../examples/cdc/round_trip.py) from the repository root. It needs
+Python 3.11+, Docker and image-download access; it creates a private Docker network with PostgreSQL
+17, Kafka 4.3.2 and an archived Debezium Connect 3.3 lab image. No host ports, existing databases or
+production credentials are used. These pins define a reproducible learning stack, not a current
+production support recommendation.
+
+```bash
+python3 infrastructure/kafka/examples/cdc/round_trip.py
+```
+
+The fixture enables PostgreSQL logical WAL, creates an insert-only outbox, registers a `pgoutput`
+connector with a named slot/publication, and maps events into a one-partition Kafka topic. The
+`no_data` snapshot mode intentionally starts from new changes in this freshly empty fixture. An
+existing production table needs a snapshot/reconciliation decision; skipping its old rows would
+lose historical obligations.
+
+The same order carries both transitions:
+
+```mermaid
+sequenceDiagram
+    participant D as PostgreSQL outbox and WAL
+    participant C as Debezium task
+    participant K as Kafka orders.events
+    D->>C: Commit evt-101, ord-42 version 1
+    C->>K: Key ord-42, stable event ID
+    Note over C: Persist source LSN; stop connector through Connect API
+    D->>D: Commit evt-102, ord-42 version 2 while stopped
+    Note over C: Resume task from stored source offset
+    D->>C: Read retained WAL after saved LSN
+    C->>K: Key ord-42, version 2
+    Note over C: Source checkpoint advances
+```
+
+Require the final `PASS` line, both stable IDs in version order, the same `ord-42` key and an
+advanced source checkpoint. The exact numeric LSN varies by database run; equality to a copied
+number is not the test. A task that reports RUNNING but never advances fails the fixture's deadline.
+The script removes its containers/network in `finally`; it does not delete the user's data.
+
+This exercise stops and resumes the connector task, not the database. Replaying after an unclean
+process death can duplicate already-published events; retain the consumer inbox from the preceding
+lesson. A source checkpoint describes the connector's handoff, not every downstream effect. The
+[Debezium PostgreSQL reference](https://debezium.io/documentation/reference/3.3/connectors/postgresql.html)
+and [Event Router](https://debezium.io/documentation/reference/3.3/transformations/outbox-event-router.html)
+explain the versioned slot and routing contracts (checked 2026-10-30).
+
 ## Route the outbox event explicitly
 
 This explanatory connector fragment shows the load-bearing Debezium outbox Event Router settings;
@@ -71,5 +118,42 @@ position can lose them. In both cases, compare stable `event_id` sets before res
 Do not choose CDC merely to avoid writing a polling loop. It adds database-log permissions, retained
 log capacity, connector state, plugin upgrades, and another recovery procedure. Choose it when its
 throughput, low query load, or shared integration ownership earns those costs.
+
+## Recap
+
+- The database commit makes the outbox insert visible in WAL.
+- The connector resumes from its saved source position and may repeat publication after uncertainty.
+- Retained WAL plus stable event identities make recovery inspectable; RUNNING alone does not.
+
+## Check yourself
+
+**Q: The saved checkpoint references WAL already removed. Is restarting a RUNNING task enough?**
+
+<details><summary>Answer</summary>
+
+No. The required change history is absent. Stop cleanup, select a supported re-snapshot/restore procedure and reconcile expected event IDs against destination IDs before resuming normal publication.
+
+</details>
+
+**Q: The outbox has two rows and the topic has two records. Does that alone prove delivery?**
+
+<details><summary>Answer</summary>
+
+No. They could be two copies of one event. Compare stable IDs, aggregate versions, key and source-position progress.
+
+</details>
+
+## Try it
+
+Keep the fixture but add a third event while the connector is stopped. Fill the expected record-ID set and final ordering assertion.
+
+Hint: A checkpoint integer is not an event count.
+
+<details><summary>Worked solution</summary>
+
+Expect IDs 101, 102 and the new third ID in commit order for ord-42. Require the checkpoint to advance and the consumer effect ledger to contain one application per event even if publication retries repeat an ID.
+
+</details>
+
 
 **Next**: [Testing Kafka Services](05_testing_kafka_services.md).

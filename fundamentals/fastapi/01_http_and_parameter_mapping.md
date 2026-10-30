@@ -24,9 +24,18 @@ Content-Type: application/json
 {"name":"keyboard"}
 ```
 
-Explanatory excerpt; application/import setup is omitted:
+Save this complete example as `mapping.py` in the environment from the
+[quick start](README.md#quick-start-one-route-and-one-owned-http-client):
 
 ```python
+from typing import Annotated
+
+from fastapi import FastAPI, Header
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
 class ItemIn(BaseModel):
     name: str
 
@@ -34,11 +43,22 @@ class ItemIn(BaseModel):
 def create_item(
     user_id: int,
     item: ItemIn,
-    notify: bool = False,
     x_request_id: Annotated[str, Header()],
+    notify: bool = False,
 ):
     return {"user_id": user_id, "name": item.name, "notify": notify,
             "request_id": x_request_id}
+
+if __name__ == "__main__":
+    with TestClient(app) as client:
+        response = client.post("/users/42/items?notify=true",
+                               headers={"X-Request-ID": "req-7"},
+                               json={"name": "keyboard"})
+        assert response.status_code == 200
+        assert response.json() == {"user_id": 42, "name": "keyboard",
+                                   "notify": True, "request_id": "req-7"}
+        assert client.post("/users/42/items", json={"name": "keyboard"}).status_code == 422
+        print(response.status_code, response.json())
 ```
 
 FastAPI maps `42` from the path to `user_id`, `true` from the query string to `notify`, the JSON
@@ -123,7 +143,7 @@ class ItemOut(BaseModel):
     summary="Create an item for a user",
     tags=["items"],
 )
-def create_item(user_id: int, ...):
+def create_item(user_id: int):  # Other parameters omitted from this signature excerpt
     ...
 ```
 
@@ -610,13 +630,16 @@ async def upload_many(files: Annotated[list[UploadFile], File()]):
 
 ## Part 2: FastAPI Parameter Resolution
 
-FastAPI does **not guess** where data comes from. For each parameter it inspects the **name, type, and default/annotation**, in this priority order:
+FastAPI inspects the route and signature together. These are constraints, not a rule that
+an arbitrary marker can override every other declaration:
 
-1. Is there an explicit source marker (`Query`, `Path`, `Header`, `Cookie`, `Body`, `Form`, `File`) — via `Annotated[...]` or as the default value? Use that source, full stop.
-2. Otherwise, is there a `Depends(...)` default? Resolve it as a dependency (see [02_dependency_injection.md](02_dependency_injection.md)) — it is not a request-data source at all.
-3. Otherwise, is the type a Pydantic model (or `dataclass`/`TypedDict`)? Treat it as JSON request body.
-4. Otherwise, does the parameter name match a `{placeholder}` in the route path? Treat it as a path parameter.
-5. Otherwise, it's a query parameter — required if there's no default, optional if there is one.
+1. `Depends(...)` declares a callable dependency; special types such as `Request` expose framework objects.
+2. A request-data parameter matching a route placeholder is a required path parameter.
+   `Query()` on that same name is a contradictory declaration and fails during route registration.
+3. For other request-data parameters, explicit `Header`, `Cookie`, `Body`, `Query`, `Form`, or
+   `File` annotations select their source, subject to supported type/source combinations.
+4. Without an explicit source, a Pydantic model is a body; ordinary scalar values are query parameters.
+   A default makes an inferred query parameter optional. It does not relocate a path parameter.
 
 These rules apply to:
 
@@ -638,15 +661,16 @@ def endpoint(x: int):
 - If `{x}` exists in the route path → **path parameter**
 - Otherwise → **query parameter** (required)
 
-### Rule 2: Has Default → Query
+### Rule 2: A default does not change a route placeholder
 
 ```python
 def endpoint(x: int = 1):
     ...
 ```
 
-- Always a **query parameter**
-- Optional with default value
+- With no `{x}` in the route: optional query parameter with default `1`.
+- With `{x}` in the route: required path parameter; omitting the segment does not select the default.
+  Do not write path defaults: they misleadingly suggest a request can omit the segment.
 
 ### Rule 3: Pydantic Model → Body
 
@@ -673,7 +697,7 @@ def endpoint(
     ...
 ```
 
-Explicit annotations **override** the default rules.
+Explicit annotations select a supported source; they cannot turn a route placeholder into a query parameter.
 
 Current FastAPI docs prefer `typing.Annotated` for these annotations. The older default-value style shown in the quick reference still works and is common in existing codebases.
 
@@ -685,7 +709,7 @@ Current FastAPI docs prefer `typing.Annotated` for these annotations. The older 
 | -------------------------- | --------------- | -------- |
 | `x: int` (in path)         | Path parameter  | Yes      |
 | `x: int` (not in path)     | Query parameter | Yes      |
-| `x: int = 1`               | Query parameter | No       |
+| `x: int = 1` (not in path) | Query parameter | No       |
 | `x: Model`                 | Request body    | Yes      |
 | `x: str = Header(...)`     | Header          | Yes      |
 | `x: str = Header(None)`    | Header          | No       |
@@ -764,18 +788,41 @@ FastAPI correctly routes each parameter based on the rules above.
 
 ## Key Takeaway
 
-FastAPI's parameter mapping is **deterministic**:
+Resolve a parameter's source with the route constraint first:
 
-1. Check for explicit source markers (`Header`, `Query`, `Path`, `Body`, `Cookie`, `Form`, `File`)
-2. Check for `Depends(...)` → dependency injection, not request data at all
-3. If Pydantic model → body
-4. If in path template → path parameter
-5. If has default → query parameter
-6. Otherwise → required query parameter
+1. A name in the route placeholder binds a required path value. A contradictory Query declaration is rejected; a Python default does not move the name into the query.
+2. Otherwise, an explicit supported source marker (`Query`, `Header`, `Cookie`, `Body`, `Form`, `File`) selects that source.
+3. Without a marker, a Pydantic model is a body input; an ordinary scalar is normally query input.
+4. A default controls requiredness where that source permits it. `Depends` declares a callable whose own parameters follow these rules.
 
-**Mutual exclusions to remember:**
+The function declaration determines extraction and schema, while request validation decides whether the actual value satisfies it.
 
-- `Form` / `File` fields and a JSON `Body` cannot coexist in the same endpoint
-- `GET` requests should not have a body
+## Version-sensitive request boundaries
 
-Understanding these rules eliminates confusion about where your data comes from.
+Checked 2026-10-30 against FastAPI 0.162.0. Since 0.132.0, strict JSON Content-Type checking is enabled by default: send `application/json` (or a compatible JSON media type) for JSON bodies. A body containing JSON bytes with missing or `text/plain` Content-Type is not automatically accepted as a JSON model. This matters for browser request security, not merely documentation; prefer fixing clients over globally disabling the policy. [Strict Content-Type checking](https://fastapi.tiangolo.com/advanced/strict-content-type/).
+
+Recent migrations change copyable parameter declarations:
+
+| Version | Changed contract | Migration check |
+|---|---|---|
+| 0.155.0 | Arbitrary extra keyword arguments to parameter helpers are rejected | Replace `Query(custom="x")` with `Query(json_schema_extra={"custom": "x"})` |
+| 0.160.0 | Parameter-model `extra` applies to all fields submitted in that location, including sibling/dependency fields | A query model with `extra="forbid"` can reject `trace` even when another dependency declares it; consolidate the location contract or choose an explicit extra policy |
+| 0.162.0 | Omitted boolean form fields use declared defaults or missing-field errors | Declare `enabled: Annotated[bool, Form()] = False` for an unchecked checkbox; a required boolean is still required |
+
+These changes are documented in the [FastAPI release notes](https://fastapi.tiangolo.com/release-notes/). The executable [runtime contract tests](./examples/test_runtime_contracts.py) cover path conflicts, strict JSON headers, sibling query fields and omitted forms. Run with `python -m pytest -q fundamentals/fastapi/examples/test_runtime_contracts.py` from the root after installing the pinned FastAPI quickstart environment plus `pytest` and `python-multipart`.
+
+## Check your understanding
+
+Route placeholders determine path binding; explicit compatible source markers then disambiguate input. Defaults describe requiredness within a supported source.
+
+**Prediction:** For /items/{item_id}, does item_id: int = 5 become an optional query parameter?
+
+<details><summary>Answer</summary>
+No. The matching route name binds the required path value. A non-route scalar named limit with that default would normally be query.
+</details>
+
+**Diagnosis:** Can Query override a matching path-placeholder name?
+
+<details><summary>Answer</summary>
+No. The contradictory declaration is rejected; it does not relocate the route value.
+</details>

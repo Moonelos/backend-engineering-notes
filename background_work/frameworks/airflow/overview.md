@@ -114,16 +114,37 @@ def daily_customer_counts():
 daily_customer_counts()
 ```
 
-Get a UI to look at with `airflow standalone`, which starts the API server, scheduler, and triggerer with a local database and prints generated admin credentials.
+### Install, place and run the DAG
+
+The repository includes that DAG and the next partition example in [complete example assets](../../examples/airflow/dags/daily_customer_counts.py), including a local warehouse and the execution assertions. Use Python 3.12 for this pinned Airflow 3.3.1 lab; its constraints are not interchangeable with the Python 3.14 environment used elsewhere. From the repository root:
+
+```bash
+cd background_work/examples/airflow
+python3.12 -m venv .venv
+.venv/bin/python -m pip install 'apache-airflow==3.3.1' \
+  --constraint 'https://raw.githubusercontent.com/apache/airflow/constraints-3.3.1/constraints-3.12.txt'
+export AIRFLOW_HOME="$PWD/.airflow-lab"
+export AIRFLOW__CORE__DAGS_FOLDER="$PWD/dags"
+export AIRFLOW__CORE__LOAD_EXAMPLES=False
+export PYTHONPATH="$PWD"
+export WAREHOUSE_DB="$AIRFLOW_HOME/warehouse.sqlite"
+.venv/bin/airflow db migrate
+.venv/bin/python check_dags.py
+```
+
+The exact check runs the two-task count DAG, runs the partition DAG twice, and inspects the durable warehouse effect: `DAGs parsed, counts=42, repeated partition still has one row`. The [warehouse adapter](../../examples/airflow/warehouse.py) is SQLite only as a local effect fixture; it uses a stable partition primary key and parameterized upsert. This does not test a remote warehouse or a distributed executor. `AIRFLOW_HOME` keeps this lab's metadata separate from other Airflow environments.
+
+For UI exploration, run `.venv/bin/airflow standalone` in the same environment. This starts a local development stack and prints generated admin credentials; it is not the production deployment recipe. The DAG files already live in the configured `dags` directory, so no unmentioned copy step is required.
 
 Success is a parsed `daily_customer_counts` DAG in the UI and a run whose two task instances finish in dependency order, with `warehouse.customers = 42` in `record_metric`'s task log. If the DAG is absent, inspect DAG-processor import errors; if `record_metric` receives no value, inspect serialization/XCom logs and confirm the upstream task returned successfully.
 
-Harden a real task with explicit retry, timeout, and an idempotent partition key:
+Harden the same run with explicit retry, timeout, and an idempotent partition key. The following excerpt uses the `warehouse` adapter supplied with the complete [daily_orders.py](../../examples/airflow/dags/daily_orders.py):
 
 ```python
 from datetime import timedelta
 from airflow.sdk import dag, task, get_current_context
 from pendulum import datetime
+import warehouse
 
 @dag(
     schedule="0 3 * * *",
@@ -238,6 +259,26 @@ The default choice is **deferrable**. Airflow's own framing: with 100 worker slo
 
 ⚠️ **Native async tasks are not a deferral substitute, and the docs are explicit about the difference.** An `async def` task keeps its task process — and therefore its worker slot — running; the event loop only lets it overlap I/O *within* that slot. So it is the right tool for a task making 50 concurrent HTTP calls and the wrong tool for a task waiting six hours for a file to land. Choosing it for the second case gives you all the cost of a sync sensor with none of the visibility.
 
+The transition releases the worker slot only after it hands a serializable wait to the triggerer.
+
+```mermaid
+sequenceDiagram
+    participant W as Airflow worker
+    participant E as External batch job
+    participant T as Triggerer
+    W->>E: Submit stable job ID export-42
+    W->>T: Defer with export-42
+    Note over W: Worker slot released
+    T->>E: Poll export-42
+    E-->>T: Terminal result available
+    T-->>W: Schedule resumed task
+    W->>E: Collect export-42 result
+```
+
+Native async multiplexes calls within the worker; it does not perform this slot handoff. A triggerer restart must reconstruct its poll from `export-42`, so the identifier must be persisted before waiting.
+
+**What's changing — GA, checked 2026-10-30:** Airflow 3.3 adds [resumable tasks and `ResumableJobMixin`](https://airflow.apache.org/docs/apache-airflow/3.3.1/core-concepts/resumable-tasks.html). Task state can checkpoint progress or external job identity across retries using `task_state_store`. Resumable tasks still retain their worker slot; deferral remains the choice for releasing a long idle wait. Recording an external ID narrows duplicate-submission risk, but a provider accepting the submit before its ID is saved still needs a stable idempotency key or reconciliation. Treat recovery identity and slot occupancy as separate decisions.
+
 Use deferrable variants for long waits when the provider/operator supports them. Set a timeout and define the failure path; a sensor without a deadline can leave a DAG run active indefinitely.
 
 **Recovering an external job across a resume is a separate problem from where the wait happens.** The submit-then-wait shape — submit a Spark job / provider export, record its external ID, then wait for completion — must survive the task process being restarted, and neither deferral nor async gives you that for free. Airflow's guidance is that a trigger must "get everything they need from their `__init__`, so they can be serialized and moved around freely" — meaning the external job ID has to be captured *before* the wait begins and carried into the trigger, not held in the task's local memory. The consequence for your code:
@@ -289,8 +330,11 @@ import httpx
 class AirflowClient:
     def __init__(self, base_url: str, username: str, password: str):
         self._base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=15))
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(connect=3, read=15, write=10, pool=2))
         self._creds = {"username": username, "password": password}
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def _token(self) -> str:
         # The auth manager owns /auth/token; with a non-default auth manager the
@@ -328,7 +372,7 @@ class AirflowClient:
 
 ⚠️ **A DAG with import errors returns `400`, not `404`** — `"has import errors and cannot be triggered"`. If triggers start failing after a deploy and the DAG is visibly present in the UI, read the status code before suspecting auth.
 
-Store large inputs externally and pass references in `conf`.
+Store large inputs externally and pass references in `conf`. Own this client at application lifespan and call `await client.aclose()` during cleanup; a fresh client per trigger discards pooling and an unclosed one leaks resources.
 
 Close the domain-DB/Airflow trigger dual write with an outbox or reconciler when user-visible work must not be lost. Airflow’s run state and the domain job state still need an explicit synchronization contract.
 
@@ -358,51 +402,11 @@ Compensation belongs in an explicit task/path and is a new business operation, n
 
 Keep business functions importable without an Airflow runtime, then wrap them in thin tasks. Unit-test deterministic transform/upsert code directly. Separately validate that DAGs parse, task IDs are stable, dependencies are correct, and policy defaults are applied.
 
-Two tests earn their keep, and neither needs a scheduler running.
+The complete [check_dags.py](../../examples/airflow/check_dags.py) performs three checks without a running scheduler: it parses the actual DAG directory and asserts no import errors, checks stable task IDs/dependency edges and `max_active_runs`, then uses `dag.test()` to execute both DAGs. It repeats `daily_orders` with the same explicit partition and queries the SQLite effect table for exactly one row. Run it with the installation/environment commands above; there is no undeclared `fake_warehouse` fixture.
 
-**Parse test — catches the failure that takes a DAG out of production entirely.** A DAG with an import error does not appear in the UI as broken business logic; it does not appear at all, and its schedule silently stops:
+Task success alone is insufficient: an incorrect partition key can create two successful but duplicate outputs. The effect assertion distinguishes an operational retry from a second business write. Changing the run date while retaining `conf.partition=2026-02-01` must still write the same partition. Conversely, a different partition is a distinct output and should add a row.
 
-```python
-# tests/test_dag_integrity.py
-from airflow.models import DagBag
-
-
-def test_dags_import_without_errors():
-    bag = DagBag(include_examples=False)
-    # import_errors is a {filename: traceback} dict. Assert on the dict itself so
-    # the failure message contains the traceback instead of just "1 != 0".
-    assert bag.import_errors == {}, bag.import_errors
-
-
-def test_daily_orders_structure():
-    dag = DagBag(include_examples=False).get_dag("daily_orders")
-    assert dag is not None, "dag_id changed or the file failed to import"
-    # Task IDs are the contract for clearing, alerting, and every dashboard
-    # query — a rename is a breaking change and should fail here.
-    assert set(dag.task_dict) == {"build_partition", "check_partition"}
-    assert dag.get_task("check_partition").upstream_task_ids == {"build_partition"}
-    assert dag.max_active_runs == 2          # policy default actually applied
-```
-
-**Execution test — `dag.test()` runs the whole DAG in one process**, no scheduler, no workers, no triggerer:
-
-```python
-# tests/test_daily_orders_run.py
-from pendulum import datetime
-
-from dags.daily_orders import daily_orders
-
-
-def test_dag_run_completes(fake_warehouse):
-    dag = daily_orders()
-    dag_run = dag.test(logical_date=datetime(2026, 2, 1, tz="UTC"))
-
-    assert dag_run.state == "success"
-    # The point of the test: the deterministic partition, not just green tasks.
-    assert fake_warehouse.upserted == ["2026-02-01"]
-```
-
-Success looks like `state == "success"` plus each task logging in dependency order — `build_partition` before `check_partition`, with the partition value passed through XCom. The most common failure tell is a run that reports `success` while a downstream task was never executed: `dag.test()` skips tasks whose dependencies were not met, so **assert on the effect (the upserted partition), not only on the run state.** The second most common is `dag.test()` failing on a missing connection or variable — it uses the real backends, so give the test its own `AIRFLOW_HOME` or set `AIRFLOW_CONN_*` environment variables rather than pointing it at a shared metadata database.
+`dag.test()` exercises this local execution boundary. Separately rehearse your real executor, auth manager, connections, secret resolution, logs, deferrals and recovery. A source import check is not proof that those components work together.
 
 Production observability should include:
 
@@ -439,5 +443,28 @@ Success is not merely green task instances. A green DAG that produced an incompl
 ⚠️ Unbounded dynamic mapping, catchup, or backfills can create expensive fan-out. Bound runs, tasks, pools, and provider budgets before enabling them.
 
 ---
+
+## Recap and check yourself
+
+- DAG runs coordinate task instances for logical data work; external outputs need their own stable keys.
+- A retry reruns code rather than rolling back a previously committed warehouse partition.
+- Deferral releases the worker slot; async and resumable tasks solve different execution/recovery problems.
+
+**Fifty bounded HTTP calls take twenty seconds; another task waits six hours for an external job. Which mechanism fits each?**
+
+<details><summary>Answer</summary>
+
+Native async can overlap the calls while retaining one worker slot. Deferral frees the slot during the long idle wait. Both need stable external identity to avoid duplicate submission.
+
+</details>
+
+**A retry runs tomorrow with the same conf.partition. Which warehouse row should it write?**
+
+<details><summary>Answer</summary>
+
+The same partition as the original run. A key based on current time would create a second output and break repeatable backfills.
+
+</details>
+
 
 **Next**: [Decision Guide](../00_system_selection.md)

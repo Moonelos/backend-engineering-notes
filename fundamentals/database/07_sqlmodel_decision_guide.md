@@ -115,3 +115,19 @@ service might grow; start from today's concrete mapping needs and keep escape ha
 ---
 
 **Next**: [Async SQLAlchemy](04_async_sqlalchemy.md)
+
+## Check your understanding
+
+Shared declarations can reduce glue, but table identity and public field authority remain separate contracts.
+
+**Prediction:** Order adds an internal fraud_score that clients cannot send or receive. Must SQLModel be abandoned?
+
+<details><summary>Answer</summary>
+No. Keep separate non-table create/read schemas and the table model. Choose direct SQLAlchemy when broader mapping/evolution needs outweigh declaration savings.
+</details>
+
+**Diagnosis:** Does a generated database ID belong in the create schema?
+
+<details><summary>Answer</summary>
+Only if clients are authorized to choose it. A table column alone does not grant that authority.
+</details>

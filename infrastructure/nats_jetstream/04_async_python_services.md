@@ -94,30 +94,44 @@ finish or release it for redelivery, and then drain the connection.
 
 ## 3. The fetch loop must enforce its own concurrency budget
 
-A production loop should fetch no more work than it can run and acknowledge only after the effect
-commits. This excerpt assumes `handle()` is idempotent as defined in the next note:
+A one-second fetch timeout bounds waiting for messages; it does not bound a handler already
+running inside a TaskGroup. The complete [bounded_worker.py](examples/bounded_worker.py) carries
+one lifetime through connection, bounded fetches, per-handler deadlines, durable SQLite effects,
+acknowledgement, shutdown and drain. Its default mode keeps the effect ledger on disk; the isolated
+`--demo` mode creates and removes its own stream and proves two deliveries collapse to one effect.
+From the repository root, with the local server still running:
 
-```python
-async def run_worker(subscription, handle, stopping: asyncio.Event) -> None:
-    while not stopping.is_set():
-        try:
-            messages = await subscription.fetch(batch=10, timeout=1)
-        except nats.errors.TimeoutError:
-            continue  # an empty poll is normal; it is not a broker outage
-
-        async with asyncio.TaskGroup() as tasks:
-            for message in messages:
-                tasks.create_task(process_one(message, handle))
-
-
-async def process_one(message, handle) -> None:
-    try:
-        await handle(json.loads(message.data))
-    except Exception:
-        await message.nak(delay=5)  # avoid a hot retry loop against a failing dependency
-        return
-    await message.ack()  # the effect is durable before delivery progress advances
+```bash
+uv run --with 'nats-py==2.15.0' python infrastructure/nats_jetstream/examples/bounded_worker.py --demo
 ```
+
+The expected result is `PASS: 2 deliveries; 1 committed effect; 0 ack pending; bounded shutdown`.
+The demo must finish within fifteen seconds. It uses a ten-message batch, a two-second processing
+deadline, ten-second AckWait and five-second shutdown allowance. It therefore leaves time to settle
+ordinary work before redelivery. A paused process can still exceed all those timings; the persistent
+idempotency record is the correctness boundary.
+
+```mermaid
+sequenceDiagram
+    participant S as Supervisor
+    participant W as Worker task
+    participant D as Effect database
+    participant N as JetStream
+    W->>N: Fetch up to 10
+    W->>D: Commit event ID plus result within handler budget
+    W->>N: AckSync after commit
+    S->>W: SIGTERM sets stopping event
+    Note over W: Stop new fetches; finish current bounded batch
+    S->>W: Cancel if 5-second drain budget expires
+    Note over N: Unacknowledged work remains eligible for redelivery
+    S->>N: Drain connection within 5 seconds, otherwise close
+```
+
+Cancellation is re-raised instead of acknowledged. An ordinary handler failure sends a delayed
+negative acknowledgement, while a failed connection propagates to the supervisor; the supervisor
+waits for either stop or worker failure so it cannot silently idle after its worker dies. The
+blocking SQLite transaction is deliberately tiny for the fixture. A real slow database requires an
+async driver or a bounded executor, and a remote provider requires provider-side idempotency.
 
 Bound `batch`, `MaxAckPending`, and application concurrency together. Fetching 1,000 messages into a
 10-task worker only moves backlog from the server into process memory and starts acknowledgment
@@ -144,5 +158,42 @@ fail loudly when it differs.
 > work units when heartbeats would merely hide an unbounded task.
 
 ---
+
+## Recap
+
+- Connection ownership spans application startup through bounded shutdown.
+- Fetch timeout, handler timeout and shutdown timeout bound different waits.
+- Commit the effect before acknowledgement; cancellation leaves unfinished delivery unsettled.
+
+## Check yourself
+
+**Q: Stopping is set while a handler is blocked. Does a one-second fetch timeout bound shutdown?**
+
+<details><summary>Answer</summary>
+
+No. The worker is inside processing, not fetch. The handler deadline and supervisor drain/cancel budget bound that phase; an unacknowledged event remains eligible for replay.
+
+</details>
+
+**Q: A final ack times out after the effect commits. Should the worker roll back the already-committed business result?**
+
+<details><summary>Answer</summary>
+
+No. The ack outcome is ambiguous but the durable event identity proves the effect. Redelivery must inspect that identity and acknowledge the duplicate.
+
+</details>
+
+## Try it
+
+Change process_one timeout to 0.05 seconds and supply a handler that waits 0.2 seconds before its effect.
+
+Hint: Cancellation must propagate through the wait; do not acknowledge in finally.
+
+<details><summary>Worked solution</summary>
+
+The handler times out before the effect, sends a delayed nak and leaves the business ledger unchanged. A later successful retry may commit then acknowledge.
+
+</details>
+
 
 **Next**: [Reliable Effects and Publishing](05_reliable_effects_and_publishing.md)

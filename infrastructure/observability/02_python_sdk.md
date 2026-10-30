@@ -17,6 +17,7 @@ trace.set_tracer_provider(provider)
 
 with trace.get_tracer("notes.quickstart").start_as_current_span("checkout"):
     pass
+provider.shutdown()
 ```
 
 Run the file after installing `opentelemetry-api` and `opentelemetry-sdk`. Standard output should
@@ -174,13 +175,16 @@ meter = metrics.get_meter(__name__)
 
 ### Metric instruments
 
-OTel has six instrument types. Choose based on what the value represents.
+The current Python API has seven instrument types. Choose based on what the value represents.
+A synchronous Gauge receives `set(value)` from the application; an observable gauge invokes a
+callback during collection. [Python metrics API](https://opentelemetry-python.readthedocs.io/en/latest/api/metrics.html), checked 2026-10-30.
 
 | Instrument | Created With | When to Use | Example |
 |---|---|---|---|
 | `Counter` | `create_counter` | Monotonically increasing count | `http_requests_total` |
 | `UpDownCounter` | `create_up_down_counter` | Value that goes up and down | `active_connections` |
 | `Histogram` | `create_histogram` | Distribution of values | `request_duration_ms` |
+| `Gauge` (synchronous) | `create_gauge` | Current value supplied by the application (`set`) | `queue_depth` |
 | `Gauge` (observable) | `create_observable_gauge` | Snapshot of current state (polled) | `cpu_usage_percent` |
 | `ObservableCounter` | `create_observable_counter` | Count gathered via callback | `system.cpu.time` |
 | `ObservableUpDownCounter` | `create_observable_up_down_counter` | UpDownCounter gathered via callback | `process.open_files` |
@@ -218,12 +222,13 @@ Histograms are the right instrument for latency. They let the backend compute di
 import psutil
 
 def get_cpu_usage(_: metrics.CallbackOptions):
-    yield metrics.Observation(psutil.cpu_percent(), {})
+    yield metrics.Observation(psutil.cpu_percent() / 100, {})
 
 meter.create_observable_gauge(
-    name="process.cpu.utilization",
+    name="system.cpu.utilization",
     callbacks=[get_cpu_usage],
-    description="CPU utilization percentage",
+    description="Host CPU utilization fraction",
+    unit="1",
 )
 ```
 
@@ -257,7 +262,7 @@ import os
 resource = Resource.create({SERVICE_NAME: os.getenv("SERVICE_NAME", "my-service")})
 
 
-def init_telemetry(app: FastAPI) -> None:
+def init_telemetry(app: FastAPI) -> tuple[TracerProvider, MeterProvider]:
     # Tracing
     trace_provider = TracerProvider(resource=resource)
     trace_provider.add_span_processor(
@@ -275,7 +280,8 @@ def init_telemetry(app: FastAPI) -> None:
             endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel-collector:4317"),
         )
     )
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    metrics.set_meter_provider(meter_provider)
 
     # Instrument this FastAPI app instance explicitly.
     FastAPIInstrumentor.instrument_app(app)
@@ -285,20 +291,61 @@ def init_telemetry(app: FastAPI) -> None:
 
     # HTTPX can instrument all clients created after this call.
     HTTPXClientInstrumentor().instrument()
+    return trace_provider, meter_provider
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_telemetry(app)
-    yield
+    try:
+        yield
+    finally:
+        trace_provider, meter_provider = app.state.telemetry
+        # Export queues are independent of HTTP response completion.
+        trace_provider.force_flush(timeout_millis=3000)
+        meter_provider.force_flush(timeout_millis=3000)
+        meter_provider.shutdown(timeout_millis=3000)
+        trace_provider.shutdown()
+        HTTPXClientInstrumentor().uninstrument()
 
 
 app = FastAPI(lifespan=lifespan)
+app.state.telemetry = init_telemetry(app)  # before ASGI builds the middleware stack
 ```
 
-> **Production:** Call `init_telemetry()` before the first request is handled. The `lifespan` hook is the cleanest place in FastAPI. If you instrument after requests start, spans from early requests will be lost.
+> **Production:** install middleware instrumentation while constructing the app, before the ASGI
+> middleware stack is built. Lifespan startup is too late for middleware additions in supported
+> Starlette versions. Lifespan owns cleanup. Give exporters finite network timeouts and reserve
+> shutdown time for flushing; a flush timeout is telemetry-loss evidence, not success.
 
 For SQLAlchemy, instrument either specific engines with `SQLAlchemyInstrumentor().instrument(engine=engine)` or rely on the `opentelemetry-instrument` launcher for broader auto-instrumentation. Programmatic SQLAlchemy setup usually needs a real engine object, not just a bare `instrument()` call.
+
+The lifecycle explains why a returned HTTP 200 does not certify exported telemetry:
+
+```mermaid
+sequenceDiagram
+    participant B as App builder
+    participant A as ASGI lifespan
+    participant Q as SDK export queue
+    participant C as Collector
+    B->>A: Providers and middleware installed before serving
+    A->>Q: Request checkout span ends
+    Note over Q: Batch may still be buffered after response
+    A->>Q: Shutdown force_flush with finite budget
+    Q->>C: Export final batch
+    C-->>Q: Accept or return export error
+    A->>Q: Shutdown readers/processors and close resources
+```
+
+Ending a span makes it eligible for export. The batch queue and network can still fail later.
+The local [lifecycle_demo.py](examples/lifecycle_demo.py) uses an in-memory exporter to assert that
+`checkout` survives shutdown. From the repository root:
+
+```bash
+uv run --with fastapi --with httpx --with opentelemetry-sdk --with opentelemetry-instrumentation-fastapi \
+  python infrastructure/observability/examples/lifecycle_demo.py
+```
+
+Require `PASS: HTTP 200 before export; checkout exported by lifespan shutdown`; the next chapter's OTLP experiment tests the network handoff.
 
 ### What auto-instrumentation produces
 
@@ -325,6 +372,7 @@ Health check endpoints create noise in trace backends. Exclude them:
 
 ```python
 FastAPIInstrumentor.instrument_app(
+    app,
     excluded_urls="health,readiness,liveness,metrics"
 )
 ```
@@ -383,3 +431,39 @@ structlog.configure(
 ```
 
 With this in place, every log line emitted during a request carries the trace ID. In Groundcover or any backend that indexes both logs and traces, you can click from a log line directly into the trace.
+
+## Recap
+
+- A resource identifies the emitting service and accompanies its telemetry.
+- Install framework instrumentation before the middleware stack is built.
+- Span end and export are separate events; shutdown owns flushing and closing providers.
+
+## Check yourself
+
+**Q: One request succeeds and the process exits before the periodic export. Did HTTP success prove the span reached storage?**
+
+<details><summary>Answer</summary>
+
+No. The span can remain buffered after the response. Flush/shutdown with a finite exporter deadline and inspect actual export evidence; process termination can still lose queued telemetry.
+
+</details>
+
+**Q: A measurement is the current queue depth, supplied when it changes. Which instrument matches it?**
+
+<details><summary>Answer</summary>
+
+A synchronous Gauge with set(value). A Counter would incorrectly accumulate snapshots; an observable gauge fits when collection should call back to read existing state.
+
+</details>
+
+## Try it
+
+Run lifecycle_demo.py, then remove the shutdown flush and keep the long batch interval. Predict the assertion that exposes lost final telemetry.
+
+Hint: HTTP 200 and exporter contents are intentionally checked at different times.
+
+<details><summary>Worked solution</summary>
+
+The before-shutdown exporter is empty. The final check requires checkout after cleanup; without a working flush/shutdown path it can fail even though the endpoint succeeded. Keep provider.shutdown so threads/resources close.
+
+</details>

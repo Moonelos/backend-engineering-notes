@@ -101,6 +101,23 @@ GraphQL solves response-shape flexibility. It does not solve storage access, dis
 
 ---
 
+Trace one OrderScreen execution with four resolver calls.
+
+```mermaid
+sequenceDiagram
+ participant R as OrderScreen resolvers
+ participant L as Request loader
+ participant DB as Customer store
+ R->>L: load c1,c8,c1,c4
+ L->>DB: fetch c1,c8,c4
+ DB-->>L: rows by customer ID
+ L-->>R: results in c1,c8,c1,c4 order
+```
+
+The request loader collects keys before dispatch, fetches three distinct customers, and restores four result positions, including c1 twice. A missing customer still occupies its corresponding result position. Discard the loader after the request so cached values cannot cross authorization boundaries.
+
+---
+
 ## 4️⃣ Security and Cost Controls
 
 Authentication at the HTTP edge is only the first gate. Enforce authorization at the business object or field boundary, including nested resolvers.
@@ -167,5 +184,30 @@ GraphQL and REST can coexist: GraphQL may serve as a client-facing aggregation l
 - [GraphQL project](https://graphql.org/)
 
 ---
+
+
+## Recap
+
+- The schema exposes authorized fields, not direct database access.
+- A request loader batches distinct keys and restores each requested output position.
+- Request-local caching avoids cross-user data reuse but does not replace authorization.
+
+## Check yourself
+
+**A request asks for customers [c1,c8,c1,c4]. How many distinct keys should its batch fetch, and why must that cache not be global?**
+
+<details><summary>Reasoned answer</summary>
+
+Three; repeated c1 is reused within this request, while a global cache can cross tenant/authorization boundaries and outlive valid data.
+
+</details>
+
+**Does one HTTP request imply one database query?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Each resolver may perform I/O; without batching, one list query can trigger a query for every nested customer.
+
+</details>
 
 **Next**: [gRPC Overview](06_grpc_overview.md)

@@ -60,11 +60,15 @@ printf '%s\n' 'acl-check-20260916T120000Z' | \
     --topic orders.events.v1
 
 set -o pipefail
+# Capture the bounded run; grep must not close a live consumer pipe early.
+consumer_status=0
 timeout 30s kafka-console-consumer.sh \
   --bootstrap-server broker-1.example.com:9093 \
   --consumer.config /run/secrets/billing-worker.properties \
-  --topic orders.events.v1 --group billing-v1-test --from-beginning | \
-  grep --fixed-strings --max-count=1 'acl-check-20260916T120000Z'
+  --topic orders.events.v1 --group billing-v1-test --from-beginning \
+  > acl-consumer.out 2> acl-consumer.err || consumer_status=$?
+test "$consumer_status" -eq 0 || test "$consumer_status" -eq 124
+grep --fixed-strings 'acl-check-20260916T120000Z' acl-consumer.out
 
 printf '%s\n' 'must-not-write' | \
   kafka-console-producer.sh --bootstrap-server broker-1.example.com:9093 \
@@ -77,7 +81,9 @@ kafka-console-consumer.sh --bootstrap-server broker-1.example.com:9093 \
   --max-messages 1 --timeout-ms 10000
 ```
 
-The bounded consumer prints the unique value and the pipeline exits zero. The negative producer fails with a topic-authorization
+The captured output must contain the exact unique value. Exit 124 is the expected GNU timeout
+termination of a still-running consumer; it proves neither delivery nor denial. The final `grep`
+returns zero only after the record was observed. The negative producer fails with a topic-authorization
 error, and the negative consumer fails with a group-authorization error. A timeout is not proof of
 denial: the client must report authorization failure. If either forbidden operation succeeds,
 inspect the complete effective ACL set with the same authenticated endpoint:

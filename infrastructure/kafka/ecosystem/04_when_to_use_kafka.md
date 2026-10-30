@@ -52,5 +52,29 @@ the contract with fewer operational states.
 
 ---
 
-**Next**: [Kafka Learning Map](../README.md)
+## Recap
 
+- Choose Kafka when independently replayable, retained event history is a requirement.
+- A work queue emphasizes delivery ownership; a log emphasizes replayable ordered partitions.
+- Operational ownership and recovery costs belong in the decision.
+
+## Check yourself
+
+**Q: Only one worker needs a task and nobody needs historical replay. Does future growth alone justify Kafka?**
+
+<details><summary>Answer</summary>
+
+No. A database queue or mature task broker may meet the smaller contract. Revisit Kafka when independent consumers, retained history or partitioned throughput become real requirements.
+
+</details>
+
+**Q: A second independent audit consumer must reconstruct the last month. What requirement changed?**
+
+<details><summary>Answer</summary>
+
+Independent replay from retained history. A durable log now has a concrete benefit, provided retention, access and schema compatibility cover that month.
+
+</details>
+
+
+**Next**: [Kafka Learning Map](../README.md)

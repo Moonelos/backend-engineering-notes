@@ -111,3 +111,15 @@ contract. Kafka is valuable only when its retained, partitioned log is part of t
   the Reliability and Operations paths; their Kafka-specific consequences are taught there.
 - [Background work](../../background_work/README.md) is useful when comparing events with durable jobs.
 - [Redis Streams](../redis/02_pubsub_and_streams.md) provides a smaller-system comparison.
+
+## What's changing — checked 2026-10-30
+
+**GA / baseline patch:** the local 4.3 lab now uses 4.3.2. It fixes retention-related data loss in
+tiered storage and time-index truncation; a tutorial pin should not be treated as a production
+patch policy. Rehearse leader replacement and retained-record reads before rolling the patch.
+[4.3.2 release](https://kafka.apache.org/blog/2026/10/23/apache-kafka-4.3.2-release-announcement/).
+
+**GA / optional upgrade:** 4.4 adds share-group dead lettering and changes storage-format
+compatibility. Read the [share-group boundary](ecosystem/03_share_groups_and_queue_semantics.md)
+and [upgrade cutoffs](operations/04_deployment_upgrades_and_disaster_recovery.md) before adopting it.
+Broker feature availability does not establish readiness of a particular Python client.

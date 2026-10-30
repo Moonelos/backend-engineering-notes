@@ -179,6 +179,18 @@ Use explicit parameters and separate sessions/transactions when operations truly
 
 ---
 
+The binding/value graph separates copied context from shared mutable data:
+
+```mermaid
+flowchart LR
+ P[Parent context: tags binding] --> L[One tags list]
+ C[Child context: copied tags binding] --> L
+ P --> A[Parent request ID binding]
+ C --> B[Captured request ID binding]
+```
+
+Changing a binding in one context leaves the other binding alone. Appending to the shared list changes the object reached by both. Prefer immutable request metadata and explicit resource ownership.
+
 ## 5. Propagation Across Boundaries
 
 The **bold rows** form the normal path: same-task awaits, task creation, `to_thread`, and explicit
@@ -332,7 +344,7 @@ class RequestContextFilter(logging.Filter):
         return True
 ```
 
-Configure the formatter to include `%(request_id)s`, or bind the value through a structured-logging processor. See the [Structured Logging guide](../../core_concepts/structlog_guide.md) for a complete logging pipeline.
+Configure the formatter to include `%(request_id)s`, or bind the value through a structured-logging processor. See the [Structured Logging guide](../../core_concepts/runtime/logging/structlog_guide.md) for a complete logging pipeline.
 
 Prefer explicit arguments for values that change results:
 
@@ -386,5 +398,29 @@ Also test two concurrent tasks with different values. A serial unit test will no
 - [`threading.Thread`](https://docs.python.org/3/library/threading.html#threading.Thread)
 
 ---
+
+
+## Recap
+
+- Task creation captures bindings; token reset restores the enclosing binding.
+- Context copying is shallow and process transport is explicit.
+
+## Check yourself
+
+**Q: Does copy_context isolate a bound tags list?**
+
+<details><summary>Answer</summary>
+
+No. Both bindings may reach the same list. Use an immutable value or copy that value deliberately.
+
+</details>
+
+**Q: Can a detached child keep using its inherited request session after the request closes it?**
+
+<details><summary>Answer</summary>
+
+No. The inherited reference does not extend the resource lifetime. Give the child a separate owned session or keep it inside the request scope.
+
+</details>
 
 **Next**: [Threads and Blocking I/O](../threads/README.md)

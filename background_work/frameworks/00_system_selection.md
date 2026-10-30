@@ -202,4 +202,27 @@ The design works when these tests leave an explainable state and an operator can
 
 ---
 
+## Recap and check yourself
+
+- Choose the authoritative business state before choosing a delivery/runtime product.
+- Use the smallest runtime that provides the recovery and interaction requirements.
+- Scheduling, durable coordination and execution resources remain separate choices.
+
+**PDF rendering now pauses for finance approval for three weeks. Which requirement changed?**
+
+<details><summary>Answer</summary>
+
+A persisted wait and external signal now control legal progress, so workflow orchestration may be justified. CPU rendering still needs suitable process workers.
+
+</details>
+
+**The only new requirement is twice the CPU throughput. Is a workflow engine the first response?**
+
+<details><summary>Answer</summary>
+
+No. Scale or isolate the execution pool after measuring capacity; the business state model has not changed.
+
+</details>
+
+
 **Next**: [Framework Notes](README.md)

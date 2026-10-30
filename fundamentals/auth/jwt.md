@@ -48,7 +48,9 @@ JWT approach:         Request → verify token signature (local, fast) → read 
 
 ## JWT Structure
 
-A JWT is three chunks of JSON, individually encoded with URL-safe Base64 (base64url), joined by dots:
+The signed compact JWT (JWS) taught here has three base64url segments separated by dots.
+The header and payload encode JSON; the third encodes signature bytes. Encrypted JWTs use
+a different structure and are outside this example.
 
 ```
 eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYzEyMyJ9  .  eyJzdWIiOiJ1c2VyLXV1aWQiLCJleHAiOjE3MDB9  .  <signature>
@@ -219,12 +221,17 @@ When your API receives `Authorization: Bearer <token>`, validate in this order:
    → If expired: reject with 401
 7. Check iss == your expected issuer URL
    → If wrong: reject (token from a different auth server)
-8. Check aud (or client_id for OAuth access tokens) == your expected value
+8. Check aud contains this receiving API for the RFC 9068 access-token profile
    → If wrong: reject (token not intended for your API)
-9. (Optional) Check token_use, scope, groups — your authorization logic
+9. Require the chosen token profile and the scopes/permissions needed by this operation
 ```
 
 **Order matters.** Verify the signature before reading any claims. A tampered payload could have any exp or iss value.
+
+`client_id` identifies the OAuth client, not the receiving resource. It cannot substitute for
+`aud` in the [RFC 9068 profile](https://www.rfc-editor.org/rfc/rfc9068.html#section-4).
+Provider-specific profiles such as [Cognito M2M](cognito/oauth-jwt-guide.md) must be configured
+separately. Never fall back from a failed audience check to a client-ID check.
 
 ### Clock-Skew Leeway on `exp` / `nbf` / `iat`
 
@@ -335,6 +342,7 @@ def validate_token(
         issuer=issuer,
         audience=audience,
         options={
+            "require": ["exp", "iat", "iss", "aud", "sub"],
             "verify_exp": True,
             "verify_iss": True,
             "verify_aud": True,
@@ -410,56 +418,48 @@ The usual production pattern, aligned with [RFC 9700 OAuth 2.0 Security BCP](htt
 
 Why the family? Reuse means either the legitimate client retried with an old token or an attacker has a stolen token. The server cannot reliably know which one. Revoking the family stops the replay and forces a fresh login.
 
-```python
-import hashlib
-import secrets
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+Rotation is a **transaction**, not a read followed by two independent writes. Two requests can
+both read `used_at=NULL`; without serialization each could mint a valid successor. Serialize by
+family, re-read under that lock, consume the old token and insert exactly one successor, then commit.
+On reuse, persist family revocation before reporting failure. Raising inside a transaction that
+rolls back the revocation silently defeats the protection.
 
-
-def new_refresh_token() -> str:
-    return secrets.token_urlsafe(48)
-
-
-def refresh_token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-@dataclass
-class RefreshTokenRecord:
-    token_hash: str
-    user_id: str
-    family_id: str
-    expires_at: datetime
-    used_at: datetime | None = None
-    revoked_at: datetime | None = None
-
-
-async def rotate_refresh_token(raw_token: str) -> str:
-    token_hash = refresh_token_hash(raw_token)
-    record = await refresh_tokens.get_by_hash(token_hash)
-
-    if record is None or record.revoked_at or record.expires_at <= datetime.now(timezone.utc):
-        raise InvalidToken()
-
-    if record.used_at is not None:
-        # Reuse detection: assume the family is compromised.
-        await refresh_tokens.revoke_family(record.family_id)
-        raise InvalidToken()
-
-    new_raw = new_refresh_token()
-    new_record = RefreshTokenRecord(
-        token_hash=refresh_token_hash(new_raw),
-        user_id=record.user_id,
-        family_id=record.family_id,
-        expires_at=datetime.now(timezone.utc) + timedelta(days=30),
-    )
-
-    await refresh_tokens.mark_used_and_insert(record.token_hash, new_record)
-    return new_raw
+```mermaid
+sequenceDiagram
+    participant A as Browser tab A
+    participant B as Browser tab B
+    participant DB as Family f1 transaction
+    A->>DB: Lock f1 and consume refresh r1
+    B->>DB: Wait for f1 lock
+    DB-->>A: Commit r1 used and successor r2
+    B->>DB: Re-read r1 after lock acquired
+    DB-->>B: r1 already used
+    B->>DB: Commit f1 revoked
+    DB-->>B: Reject reuse
+    A->>DB: Later refresh with r2
+    DB-->>A: Reject revoked f1
 ```
 
-This is the generic version of what managed IdPs call refresh-token rotation. If you use Cognito, Auth0, Okta, or another provider, prefer the provider's built-in rotation/revocation features and make your API validate the resulting access tokens.
+The strict policy deliberately logs out both tabs: after reuse the server cannot identify the
+legitimate holder. Serialize refreshes in the client and atomically persist the replacement token.
+A provider's documented grace period is a different policy; do not invent a grace window that
+permits unrestricted parallel successors. Lost responses still need an explicit retry/re-login
+policy. Family expiry is absolute here, so repeated rotation cannot extend a session forever.
+
+Run the complete [SQLite concurrency fixture](examples/refresh_rotation.py) from the repository root:
+
+```bash
+python3 fundamentals/auth/examples/refresh_rotation.py
+# PASS: one concurrent successor; reuse revocation persists; successor rejected
+```
+
+It races two real connections and checks durable revocation after reopening. SQLite serializes
+writes for this local demonstration. A PostgreSQL implementation locks the **family row** with
+`FOR UPDATE`, then reads/consumes the token and inserts its successor in that same transaction.
+Keep token hashes unique and never store or log the raw refresh token. The fixture demonstrates
+state transitions; it does not implement an authorization server, rate limiting, cookie security,
+or a managed provider's exact rotation semantics. Prefer the provider's supported mechanism when
+one is available.
 
 ---
 
@@ -493,3 +493,41 @@ print(json.loads(base64.urlsafe_b64decode(payload)))
 
 Decoding does not validate a token. Never send a real bearer token to a third-party debugging site;
 anyone who receives it can use it until it expires.
+
+
+## Rotation diagnosis and retention
+
+When key `K2` first appears, a cached `K1` cannot verify it. Fetch the configured issuer's JWKS once
+on the unknown `kid`, retry lookup, and reject if absent. An unknown identifier is attacker input,
+so coalesce/rate-limit misses and bound HTTP timeouts; do not let each random `kid` produce an
+unlimited fetch. Keep the old published key until its valid tokens age out; never accept an
+unverified token because key discovery is unavailable.
+
+```mermaid
+sequenceDiagram
+    participant Issuer
+    participant API
+    participant Cache as JWKS cache
+    Issuer->>Cache: Publish K1 and K2 before switching signer
+    Issuer->>API: Token signed by K2
+    API->>Cache: Lookup kid K2
+    Cache-->>API: Miss in old cached set
+    API->>Issuer: Bounded refresh from configured JWKS URL
+    Issuer-->>API: K1 and K2
+    API->>API: Verify K2 plus issuer audience and freshness
+```
+
+A successful key lookup supplies only the verification key. It does not establish the token's
+intended recipient, type, scopes, or application permissions.
+
+**Recap:** a decoded claim is input until signature and the complete endpoint policy succeed.
+Rotation protects two separate lifecycles: issuer signing keys and server-tracked refresh families.
+
+**Check yourself:** a signed token has the right issuer but another API's audience. Accept it?
+<details><summary>Answer</summary>No. The issuer vouched for a token intended for another recipient;
+your endpoint must reject it despite the valid signature.</details>
+
+**Try it:** run the refresh fixture, then remove the commit before reporting reuse. Predict which
+assertion must fail and why. Restore the code after the experiment.
+<details><summary>Reasoned answer</summary>The family's revoked state would roll back, so its
+successor could refresh again. Durable state must commit before the failure response.</details>

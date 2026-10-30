@@ -64,6 +64,26 @@ For time-based behavior, inject a clock into policy calculations and use databas
 
 ## 4. A real PostgreSQL race proves claim and fencing semantics
 
+The two scripts below exercise this ordering. Keep the assertions at the arrows where authority changes rather than relying on incidental thread timing.
+
+```mermaid
+sequenceDiagram
+    participant A as Connection A
+    participant D as PostgreSQL
+    participant B as Connection B
+    A->>D: Claim pending job, token A
+    B->>D: Competing claim
+    D-->>B: No eligible row
+    Note over D: Test advances lease expiry
+    B->>D: Recover and claim token B
+    A->>D: Complete using token A
+    D-->>A: rowcount = 0
+    B->>D: Complete using token B
+    D-->>B: rowcount = 1
+```
+
+The first conflict tests atomic claim; the late completion tests fencing. They are separate invariants: a perfectly atomic claim still permits stale writes if completion omits its token predicate. The [assembled lifecycle tests](../examples/durable_job/test_lifecycle.py) exercise the same race in the runnable API/worker example.
+
 Start with one invariant: two connections racing for one `PENDING` row produce one winner. Save this as `test_claim_race.py`, set `DATABASE_URL` to a disposable PostgreSQL database, install `psycopg[binary]`, and run `python test_claim_race.py`:
 
 ```python
@@ -344,5 +364,36 @@ Do not unit-test database isolation with mocks. Do not require every pull reques
 **How you know the suite is working**: deliberately remove one attempt-token predicate, request-hash comparison, or outbox dependency and see the corresponding test fail for the expected invariant—not merely by timeout.
 
 ---
+
+## Recap and check yourself
+
+- Place failures at commit boundaries so tests distinguish lost work from duplicate delivery.
+- Assert durable state and effect counts instead of only task completion logs.
+- A useful fencing test includes a stale attempt after a replacement has claimed.
+
+**Remove attempt_token from the completion predicate. What should fail?**
+
+<details><summary>Answer</summary>
+
+The stale update affects one row rather than zero and violates fencing. The test should fail on that invariant, not merely time out.
+
+</details>
+
+**Both worker tasks return successfully in a duplicate-delivery test. Is that enough?**
+
+<details><summary>Answer</summary>
+
+No. One may return because it lost the claim. Inspect one authoritative result and the provider/effect count to detect accidental repeated business work.
+
+</details>
+
+**Try it:** Move the injected crash from before the publisher send to after send but before its DB mark. Fill the two expected counts: delivery attempts and business effects.
+
+<details><summary>Hint and worked solution</summary>
+
+The outbox cannot atomically commit with the broker. Delivery attempts may be two; the intended business effect remains one. A test demanding one delivery rejects a correct at-least-once protocol.
+
+</details>
+
 
 **Next**: [System Selection Guide](../frameworks/00_system_selection.md)

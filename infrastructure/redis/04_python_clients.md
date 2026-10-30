@@ -272,6 +272,8 @@ print(results)
 
 ```python
 async def transfer(r, from_user: str, to_user: str, amount: int):
+    if from_user == to_user or not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        raise ValueError("transfer requires distinct users and a positive integer amount")
     from_key = f"balance:{from_user}"
     to_key = f"balance:{to_user}"
 
@@ -305,6 +307,25 @@ async def transfer(r, from_user: str, to_user: str, amount: int):
 
 > **WATCH + MULTI/EXEC** gives you optimistic concurrency control. It is the Redis equivalent of a compare-and-swap. Useful for counters, balances, and any read-modify-write operation.
 
+Queueing and execution are separate phases; this is the interleaving that `WATCH` detects:
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant R as Redis
+    participant B as Client B
+    A->>R: WATCH balance:alice; read 100
+    A->>R: MULTI; queue SET balance:alice 90
+    B->>R: SET balance:alice 50
+    A->>R: EXEC
+    R-->>A: Abort watched transaction
+```
+
+Client B is free to write before `EXEC`. Without `WATCH`, A would overwrite 50 with its stale
+computed value 90. With it, A retries from the changed state. The transfer example is a standalone
+Redis exercise; cross-user keys on a Cluster must share a chosen hash slot, and financial durability
+still belongs in a database transaction with the required persistence guarantees.
+
 ### MULTI/EXEC vs Pipelines — They Are Not The Same Thing
 
 The `redis-py` API puts both behind the same `pipeline()` method, but the semantics are different.
@@ -320,7 +341,7 @@ The `redis-py` API puts both behind the same `pipeline()` method, but the semant
 **Key subtleties:**
 
 - A Redis "transaction" is **not a SQL transaction.** There's no rollback. If command 5 of 10 fails with a runtime error, commands 1–4 have already executed and 6–10 still will execute. You get the error in the results array — you do not get a rollback.
-- `MULTI/EXEC` does **not** block other clients. Redis is single-threaded, so between MULTI and EXEC nothing else runs anyway — atomicity is a single-threaded-execution side effect, not a locking mechanism.
+- `MULTI/EXEC` does **not** block other clients. `MULTI` queues this connection's commands while other clients continue running. Only the command batch started by `EXEC` runs without interleaving. A watched key can therefore change during queueing.
 - `WATCH` is how you get isolation against other clients. Without WATCH, another client can change a key you read before your MULTI block, and you'll compute your updates on stale data. That's why the transfer example above uses `WATCH`.
 - In **Redis Cluster**, all keys touched in a MULTI/EXEC must hash to the same slot — otherwise Redis rejects it with `CROSSSLOT`. Use hash tags (`balance:{user42}:available` / `balance:{user42}:pending`) to force them together.
 
@@ -402,11 +423,11 @@ async def health(r: aioredis.Redis = Depends(get_redis)):
 ```
 redis.RedisError
 +-- redis.ConnectionError        # Cannot connect to Redis
-|   +-- redis.TimeoutError       # Connection or command timed out
+|   +-- redis.AuthenticationError # Wrong password
++-- redis.TimeoutError           # Separate RedisError subtype
 +-- redis.ResponseError          # Redis returned an error (e.g., wrong type)
+|   +-- redis.ReadOnlyError      # Write to a read-only replica
 +-- redis.WatchError             # WATCH key was modified (transaction aborted)
-+-- redis.ReadOnlyError          # Write to a read-only replica
-+-- redis.AuthenticationError    # Wrong password
 ```
 
 ### Practical Error Handling
@@ -443,7 +464,7 @@ async def safe_get(r: aioredis.Redis, key: str, default=None):
 from redis.backoff import ExponentialBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
-from redis.retry import Retry
+from redis.asyncio.retry import Retry
 
 retry = Retry(ExponentialBackoff(), retries=3)
 
@@ -530,7 +551,7 @@ user = pickle.loads(await r.get("user:42"))
 ```python
 import redis.asyncio as aioredis
 from redis.backoff import ExponentialBackoff
-from redis.retry import Retry
+from redis.asyncio.retry import Retry
 
 # Production-ready client setup
 r = aioredis.Redis(
@@ -547,3 +568,39 @@ r = aioredis.Redis(
     ssl=True,  # Enable for cloud-hosted Redis
 )
 ```
+
+## Recap
+
+- A pool reuses connections while each operation retains its own error and lifetime boundary.
+- MULTI queues commands; EXEC executes the batch without interleaving.
+- WATCH detects intervening writes, and retry policy must match sync versus async clients.
+
+## Check yourself
+
+**Q: A queues a SET after MULTI; B writes a watched key before A sends EXEC. Does single-threaded execution prevent B?**
+
+<details><summary>Answer</summary>
+
+No. Queueing does not lock the server. B can write and A's WATCH causes abort. Without WATCH the queued SET could overwrite the newer value.
+
+</details>
+
+**Q: A transfer sends 10 units from Alice to Alice. Why reject it before queuing two SETs?**
+
+<details><summary>Answer</summary>
+
+Both keys are identical. Independent subtraction/addition values would make the second SET overwrite the first and could mint balance. Reject self-transfers and nonpositive amounts before reading.
+
+</details>
+
+## Try it
+
+Add a concurrent write between WATCH and EXEC in the transfer exercise.
+
+Hint: Use a second connection and assert the retry recomputes balances.
+
+<details><summary>Worked solution</summary>
+
+The first EXEC aborts; retry rereads both balances and either transfers the valid amount or reports insufficient funds. Also test self-transfer and amount=0 reject without mutation.
+
+</details>

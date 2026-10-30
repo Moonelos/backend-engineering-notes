@@ -12,6 +12,115 @@ How the client gets the result back after submitting a long-running task. Every 
 
 ---
 
+## One result contract survives every connection
+
+The canonical [durable job](../../background_work/foundations/03_minimal_durable_task.md)
+retains the state. Every transport below carries the same envelope:
+
+```json
+{"job_id":"abc","state":"succeeded","generation":2,"result":{"label":"billing"}}
+```
+
+`state` is `pending`, `running`, `succeeded`, or `failed`; a failed envelope carries a public
+`error` code. `generation` identifies the accepted worker attempt. Treat cancellation separately
+if your application adds it. These are protocol excerpts: authentication, authorization, durable
+storage and notification adapters come from the application, not an in-memory replacement here.
+
+This timeline separates a result from the connection that announces it:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant J as Durable job abc
+    participant A as Worker generation 1
+    participant B as Worker generation 2
+    A->>J: Claim generation 1
+    Note over A,J: Lease expires; process may still run
+    B->>J: Claim generation 2
+    B->>J: Commit succeeded plus result if owner is 2
+    J--xC: Completion notification lost
+    A->>J: Complete with generation 1
+    J-->>A: Reject stale owner
+    C->>J: Authorized GET after reconnect
+    J-->>C: state=succeeded, generation=2
+```
+
+The successful row survives a missed notification. The stale worker cannot replace it because its
+conditional write names generation 1. A heartbeat timeout permits reassignment; it cannot prove
+that worker 1 has stopped. Start with the read contract, then add whichever connection lowers the
+latency your client needs.
+
+## Start with short polling
+
+The client periodically hits a status endpoint. Simplest pattern to implement; most wasteful of resources.
+
+### Flow
+
+```
+Client                              Server
+  │                                      │
+  │── POST /jobs {payload} ──►           │
+  │◄── 202 {job_id} ──                   │
+  │                                      │
+  │── GET /jobs/{job_id} ──►             │
+  │◄── {"state": "pending"} ──          │
+  │                                      │
+  │    (wait 2 seconds)                  │
+  │                                      │
+  │── GET /jobs/{job_id} ──►             │
+  │◄── {"state": "running",             │
+  │     "progress": 45} ──               │
+  │                                      │
+  │    (wait 2 seconds)                  │
+  │                                      │
+  │── GET /jobs/{job_id} ──►             │
+  │◄── {"state": "succeeded",           │
+  │     "result": {...}} ──              │
+```
+
+### Client Implementation
+
+The caller supplies an authenticated HTTPX client; the helper owns the *whole* waiting budget.
+HTTP status errors are not job states. Reconnects use this same durable read, even after push fails.
+
+```python
+import asyncio
+import httpx
+
+async def poll_for_result(client: httpx.AsyncClient, job_id: str,
+                          interval: float = 2.0, timeout: float = 600.0):
+    if interval <= 0 or timeout <= 0:
+        raise ValueError("positive interval and timeout required")
+    async with asyncio.timeout(timeout):
+        while True:
+            response = await client.get(f"/jobs/{job_id}", timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+            if data["state"] == "succeeded":
+                return data["result"]
+            if data["state"] == "failed":
+                raise RuntimeError(data.get("error", "Task failed"))
+            await asyncio.sleep(interval)
+```
+
+The outer timeout includes slow response bodies and sleeps, whereas HTTPX's phase timeouts
+limit inactivity within one request. For backoff, update the interval after the sleep with
+`interval = min(interval * 1.5, 30.0)` and add jitter across clients. Keep the same outer deadline;
+backoff changes request frequency, not how long the caller agreed to wait.
+
+### Characteristics
+
+| Aspect | Detail |
+|--------|--------|
+| **Latency** | Medium — bounded by polling interval |
+| **Server cost** | Medium — repeated HTTP requests, but no held connections |
+| **Client complexity** | Lowest — just a loop |
+| **Progress updates** | Yes — each poll returns current status |
+| **Infrastructure** | Any HTTP stack, no special requirements |
+| **Best for** | Server-to-server integrations, simple clients, batch scripts |
+
+---
+
 ## Pattern 1: WebSocket
 
 The client opens a persistent bidirectional connection. The server pushes the result (and optionally progress updates) when ready.
@@ -31,7 +140,7 @@ Client                              Server (Orchestrator)
   │                                      │
   │◄── WS: {"progress": 30} ──           │◄── worker heartbeat
   │◄── WS: {"progress": 70} ──           │◄── worker heartbeat
-  │◄── WS: {"status": "done",            │◄── worker callback
+  │◄── WS: {"state": "succeeded",            │◄── worker callback
   │         "result": {...}} ──          │
   │                                      │
   │── WS CLOSE ──►                       │
@@ -39,60 +148,34 @@ Client                              Server (Orchestrator)
 
 ### Server Implementation
 
-```python
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import asyncio
+Use the complete [bounded notification server](../../apis/examples/websocket_notifications/app.py)
+and its [launch and test instructions](../../apis/websockets/06_implementation_testing_and_operations.md).
+It owns one sender per connection, a bounded outbound queue, a send deadline, and a supervisor
+that cancels and joins the sender/receiver before attempting a bounded close. Publishers put
+messages in the queue; they never call `send_json` on another task's connection. A full queue
+signals the supervisor independently of that queue, so a blocked send cannot hide overload.
 
-app = FastAPI()
+For jobs, adapt the application boundary as follows; these adapters require your durable store:
 
-# In-memory or Redis-backed: maps job_id → set of connected WebSockets
-_subscribers: dict[str, set[WebSocket]] = {}
+| Boundary | Job adapter and invariant |
+|---|---|
+| Authentication | Keep the canonical route's session validation, Origin allowlist and required subprotocol; authorize each requested job against the authenticated tenant/user. |
+| Subscription | Register the connection before reading authorized durable status; queue that snapshot through the same sender. Serialize snapshot and later updates or reject an older generation/revision at the client. |
+| Publication | After committed job changes, route the shared envelope only to currently authorized job subscribers; both progress and heartbeat responses use the outbound queue. |
+| Slow consumer | Close with `1013` after the bounded sender stops; the client reconnects and reads durable status. Progress may be coalesced, but the durable terminal state remains recoverable. |
+| Revocation | Recheck permission on subscription and application policy expiry; close sessions whose authorization expires. The canonical local fixture validates its short session at connection setup only. |
 
-@app.websocket("/ws/jobs/{job_id}")
-async def job_websocket(ws: WebSocket, job_id: str):
-    principal = await authenticate_websocket(ws)
-    if not await principal_can_read_job(principal, job_id):
-        await ws.close(code=1008, reason="not authorized for this job")
-        return
-    await ws.accept()
-    _subscribers.setdefault(job_id, set()).add(ws)
-
-    try:
-        # Check if already complete (late connection)
-        status = await get_job_status(job_id)
-        if status["state"] in ("succeeded", "failed"):
-            await ws.send_json(status)
-            return
-
-        # Hold connection open, waiting for updates
-        # The push happens in notify_subscribers() below
-        while True:
-            # Keep-alive ping or wait for client messages
-            try:
-                await asyncio.wait_for(ws.receive_text(), timeout=30)
-            except asyncio.TimeoutError:
-                await ws.send_json({"type": "ping"})
-    except WebSocketDisconnect:
-        pass
-    finally:
-        _subscribers.get(job_id, set()).discard(ws)
-
-
-async def notify_subscribers(job_id: str, message: dict):
-    """Called by the orchestrator when a worker sends an update."""
-    for ws in list(_subscribers.get(job_id, set())):
-        try:
-            await ws.send_json(message)
-        except Exception:
-            _subscribers[job_id].discard(ws)
-```
+A process-local hub only reaches that process. A broker subscriber per API process can feed its
+hub; a lost broker hint still recovers from the job row. The complete server is a transport lab,
+not a job database or a substitute for tenant-aware subscription policy.
 
 ### Client Implementation (JavaScript)
 
 ```javascript
 async function submitAndWait(payload) {
     // 1. Submit the job
-    const res = await fetch('/jobs', { method: 'POST', body: JSON.stringify(payload) });
+    const res = await fetch('/jobs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    if (!res.ok) throw new Error(`Submit failed: ${res.status}`);
     const { job_id } = await res.json();
 
     // 2. Connect WebSocket for result
@@ -101,13 +184,13 @@ async function submitAndWait(payload) {
 
         ws.onmessage = (event) => {
             const msg = JSON.parse(event.data);
-            if (msg.status === 'done') {
+            if (msg.state === 'succeeded') {
                 resolve(msg.result);
                 ws.close();
-            } else if (msg.status === 'failed') {
+            } else if (msg.state === 'failed') {
                 reject(new Error(msg.error));
                 ws.close();
-            } else if (msg.progress) {
+            } else if (msg.progress !== undefined) {
                 updateProgressBar(msg.progress);
             }
         };
@@ -129,7 +212,7 @@ async function submitAndWait(payload) {
 | **Client complexity** | Medium — must handle reconnection, missed messages |
 | **Progress updates** | Native — bidirectional channel |
 | **Infrastructure** | Requires WebSocket-capable load balancer (ALB, nginx, Cloudflare) |
-| **Scalability** | Limited by max open connections (typically 10K–100K per server) |
+| **Scalability** | Measure connection memory, file descriptors, send buffers and proxy limits |
 | **Best for** | Interactive UIs, real-time dashboards, when progress updates matter |
 
 ### Edge Cases
@@ -156,7 +239,7 @@ Client                              Server
   │◄── Content-Type: text/event-stream   │
   │◄── data: {"progress": 30}            │
   │◄── data: {"progress": 70}            │
-  │◄── data: {"status": "done", ...}     │
+  │◄── data: {"state": "succeeded", ...}     │
   │◄── (connection closed by server)     │
 ```
 
@@ -194,8 +277,11 @@ const evtSource = new EventSource(`/jobs/${jobId}/stream`);
 
 evtSource.onmessage = (event) => {
     const data = JSON.parse(event.data);
-    if (data.status === 'done') {
+    if (data.state === 'succeeded') {
         handleResult(data.result);
+        evtSource.close();
+    } else if (data.state === 'failed') {
+        handleError(data.error);
         evtSource.close();
     }
 };
@@ -221,93 +307,6 @@ before the shortest proxy idle timeout, and cancel the generator when the client
 Verify with `curl -N`: progress lines should appear at their production intervals, not arrive in
 one batch when the response closes. A buffered SSE response is not working push delivery.
 
-## Pattern 3: Short Polling
-
-The client periodically hits a status endpoint. Simplest pattern to implement; most wasteful of resources.
-
-### Flow
-
-```
-Client                              Server
-  │                                      │
-  │── POST /jobs {payload} ──►           │
-  │◄── 202 {job_id} ──                   │
-  │                                      │
-  │── GET /jobs/{job_id} ──►             │
-  │◄── {"status": "pending"} ──          │
-  │                                      │
-  │    (wait 2 seconds)                  │
-  │                                      │
-  │── GET /jobs/{job_id} ──►             │
-  │◄── {"status": "running",             │
-  │     "progress": 45} ──               │
-  │                                      │
-  │    (wait 2 seconds)                  │
-  │                                      │
-  │── GET /jobs/{job_id} ──►             │
-  │◄── {"status": "succeeded",           │
-  │     "result": {...}} ──              │
-```
-
-### Client Implementation
-
-```python
-import httpx
-import asyncio
-
-async def poll_for_result(base_url: str, job_id: str, interval: float = 2.0, timeout: float = 600.0):
-    deadline = asyncio.get_running_loop().time() + timeout
-
-    async with httpx.AsyncClient() as client:
-        while asyncio.get_running_loop().time() < deadline:
-            resp = await client.get(f"{base_url}/jobs/{job_id}")
-            data = resp.json()
-
-            if data["status"] == "succeeded":
-                return data["result"]
-            elif data["status"] == "failed":
-                raise RuntimeError(data.get("error", "Task failed"))
-
-            await asyncio.sleep(interval)
-
-    raise TimeoutError(f"Job {job_id} did not complete within {timeout}s")
-```
-
-### With Exponential Backoff
-
-```python
-async def poll_with_backoff(base_url: str, job_id: str, timeout: float = 600.0):
-    interval = 1.0  # Start at 1 second
-    max_interval = 30.0
-    deadline = asyncio.get_running_loop().time() + timeout
-
-    async with httpx.AsyncClient() as client:
-        while asyncio.get_running_loop().time() < deadline:
-            resp = await client.get(f"{base_url}/jobs/{job_id}")
-            data = resp.json()
-
-            if data["status"] in ("succeeded", "failed"):
-                return data
-
-            await asyncio.sleep(interval)
-            interval = min(interval * 1.5, max_interval)  # Backoff
-
-    raise TimeoutError(f"Job {job_id} timed out")
-```
-
-### Characteristics
-
-| Aspect | Detail |
-|--------|--------|
-| **Latency** | Medium — bounded by polling interval |
-| **Server cost** | Medium — repeated HTTP requests, but no held connections |
-| **Client complexity** | Lowest — just a loop |
-| **Progress updates** | Yes — each poll returns current status |
-| **Infrastructure** | Any HTTP stack, no special requirements |
-| **Best for** | Server-to-server integrations, simple clients, batch scripts |
-
----
-
 ## Pattern 4: Long Polling
 
 The client sends a request, and the server holds it open until the result is ready (or a timeout elapses). Reduces the number of round-trips compared to short polling.
@@ -324,35 +323,44 @@ Client                              Server
   │    (server holds request for         │
   │     up to 30 seconds)               │
   │                                      │    (worker completes at T+12s)
-  │◄── {"status": "succeeded", ...} ──  │    (server responds immediately)
+  │◄── {"state": "succeeded", ...} ──  │    (server responds immediately)
 ```
 
 ### Server Implementation
 
 ```python
+from typing import Annotated
+from fastapi import Depends, HTTPException, Query
+
+_waiters: dict[str, set[asyncio.Event]] = {}
+
 @app.get("/jobs/{job_id}")
-async def get_job(job_id: str, wait: int = 0):
-    """
-    If wait > 0, hold the request until status changes or timeout.
-    """
-    status = await get_job_status(job_id)
-
-    if wait > 0 and status["state"] == "pending":
-        # Subscribe to updates and wait
-        event = asyncio.Event()
-        _waiters.setdefault(job_id, []).append(event)
-
-        try:
-            await asyncio.wait_for(event.wait(), timeout=wait)
-        except asyncio.TimeoutError:
-            pass
-        finally:
-            _waiters.get(job_id, []).remove(event)
-
-        status = await get_job_status(job_id)  # Re-fetch after wait
-
-    return status
+async def get_job(job_id: str, wait: Annotated[int, Query(ge=0, le=30)] = 0,
+                  principal=Depends(get_current_principal)):
+    if not await principal_can_read_job(principal, job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    event = asyncio.Event()
+    _waiters.setdefault(job_id, set()).add(event)  # subscribe before reading
+    try:
+        status = await get_job_status(job_id)
+        if wait and status["state"] not in ("succeeded", "failed"):
+            try:
+                await asyncio.wait_for(event.wait(), timeout=wait)
+            except TimeoutError:
+                pass
+            status = await get_job_status(job_id)
+        return status
+    finally:
+        _waiters[job_id].discard(event)
+        if not _waiters[job_id]:
+            del _waiters[job_id]
 ```
+
+A local notifier sets every registered event after a committed change. Multiple API processes need
+a broadcast adapter per process; reconnect and the bounded timeout always re-read durable state.
+Subscribe-before-read closes the commit-between-read-and-subscribe race. A lost broadcast can
+increase latency to 30 seconds, but does not lose the result. Recheck permission on each new request.
+
 
 ### Characteristics
 
@@ -388,49 +396,99 @@ Client                              Server                      Worker
 
 ### Server Implementation
 
+Submission and completion each commit their durable intent in one database transaction. The
+following asyncpg excerpt uses this minimal schema (run only in a disposable learning database):
+
+```sql
+CREATE TABLE delivery_jobs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    callback_registration_id TEXT,
+    state TEXT NOT NULL DEFAULT 'pending',
+    generation BIGINT NOT NULL DEFAULT 0,
+    lease_expires_at TIMESTAMPTZ,
+    result JSONB
+);
+CREATE TABLE job_dispatch_outbox (
+    job_id TEXT PRIMARY KEY REFERENCES delivery_jobs(id),
+    state TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE callback_deliveries (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES delivery_jobs(id),
+    registration_id TEXT NOT NULL,
+    body BYTEA NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (job_id)
+);
+```
+
+```python
+import json
+from uuid import uuid4
+
+async def create_job_intent(db, tenant_id: str, payload: dict, callback_id: str | None):
+    job_id = uuid4().hex
+    async with db.transaction():
+        await db.execute(
+            "INSERT INTO delivery_jobs (id,tenant_id,payload,callback_registration_id) "
+            "VALUES ($1,$2,$3::jsonb,$4)",
+            job_id, tenant_id, json.dumps(payload), callback_id,
+        )
+        await db.execute("INSERT INTO job_dispatch_outbox (job_id) VALUES ($1)", job_id)
+    return job_id  # Both rows have committed before the HTTP response.
+
+async def on_worker_complete(db, job_id: str, generation: int, result: dict) -> bool:
+    async with db.transaction():
+        job = await db.fetchrow(
+            "UPDATE delivery_jobs SET state='succeeded', result=$3::jsonb "
+            "WHERE id=$1 AND generation=$2 AND state='running' "
+            "AND lease_expires_at > clock_timestamp() "
+            "RETURNING callback_registration_id",
+            job_id, generation, json.dumps(result),
+        )
+        if job is None:
+            return False  # Stale generation, expired lease, or already terminal.
+        if job["callback_registration_id"] is not None:
+            body = json.dumps(
+                {"job_id": job_id, "state": "succeeded", "generation": generation,
+                 "result": result}, separators=(",", ":"), sort_keys=True,
+            ).encode("utf-8")
+            await db.execute(
+                "INSERT INTO callback_deliveries (id,job_id,registration_id,body) "
+                "VALUES ($1,$2,$3,$4)",
+                f"{job_id}-{generation}", job_id, job["callback_registration_id"], body,
+            )
+    return True  # Terminal result and callback intent commit or roll back together.
+```
+
+The authenticated POST handler resolves a tenant-owned `callback_id` before calling
+`create_job_intent`; it never persists an arbitrary callback URL. Return `202` with the job ID
+only after this call commits. Give retrying POSTs a tenant-scoped idempotency key as taught in
+[the durable submission contract](../../background_work/foundations/03_minimal_durable_task.md).
+A dispatcher scans `job_dispatch_outbox`; a broker outage leaves a pending row, and a crash after
+publish can redeliver the same job ID. The worker claim/reclaim protocol in
+[Part 2](02_worker_patterns.md) increments the generation and sets the lease in `delivery_jobs`.
+Only a trusted worker identity may request completion, and its generation must match the live
+claim. The conditional update locks the matching row until the callback insert commits. No
+remote call occurs inside that transaction.
+
+A callback dispatcher scans the committed `callback_deliveries` table directly. There is no
+separate record-then-enqueue step that can strand a notification. The adapter below maps its
+`delivery.delivery_id` to the table's stable `id`; claiming and retry scheduling must use the
+same owner/generation predicates described in Part 2. Two send attempts can still overlap after
+a lease expires, so the receiver must deduplicate the stable signed ID.
+
 ```python
 import base64
 import hashlib
 import hmac
 import httpx
-import json
 import random
 import time
-
-@app.post("/jobs")
-async def create_job(
-    payload: dict,
-    callback_id: str | None = None,
-    principal=Depends(get_current_principal),
-):
-    # callback_id names a destination registered and verified for this tenant.
-    # The request cannot persist an arbitrary URL.
-    callback = (
-        await get_callback_registration(principal.tenant_id, callback_id)
-        if callback_id is not None
-        else None
-    )
-    job = await store_job(payload, callback_registration_id=callback.id if callback else None)
-    await dispatch_to_worker(job)
-    return {"job_id": job.id}
-
-async def on_worker_complete(job_id: str, result: dict):
-    job = await get_job(job_id)
-
-    if job.callback_registration_id:
-        body = json.dumps(
-            {"job_id": job_id, "status": "succeeded", "result": result},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        delivery = await callback_deliveries.create(
-            registration_id=job.callback_registration_id,
-            delivery_id=job_id,
-            body=body,
-            state="pending",
-        )
-        await enqueue_callback_delivery(delivery.id)
-
 
 async def deliver_callback(delivery_id: str):
     delivery = await callback_deliveries.get(delivery_id)
@@ -440,7 +498,7 @@ async def deliver_callback(delivery_id: str):
         timestamp = str(int(time.time()))
         signature = hmac.new(
             registration.signing_secret,
-            timestamp.encode("ascii") + b"." + body,
+            delivery.delivery_id.encode("ascii") + b"." + timestamp.encode("ascii") + b"." + body,
             hashlib.sha256,
         ).hexdigest()
 
@@ -486,34 +544,76 @@ A dispatcher queries durable `pending` rows whose `next_attempt_at` is due. Succ
 `delivered` row and counter; exhaustion is an inspectable `failed` row plus
 `callback_delivery_failed_total`, not a webhook silently abandoned after an in-memory loop.
 
-The receiver computes HMAC-SHA256 over the exact raw body bytes prefixed by
-`<timestamp>.`, rejects timestamps outside a short window, and uses
-`hmac.compare_digest()` for the signature comparison. It also records
-`X-Webhook-Delivery` before applying the effect so a retry cannot repeat it. Registration rejects
-non-HTTPS URLs and the egress service repeats address checks after DNS resolution at connection
-time; application-only URL parsing does not stop DNS rebinding.
+The sender signs `<delivery_id>.<timestamp>.<raw_body>` with HMAC-SHA256. Delivery IDs are
+server-generated ASCII identifiers, stable across retries. A timestamp limits the age of this
+attempt; the signed delivery ID binds retry identity to the body. A changed timestamp needs a new
+signature, while a new signature does not turn the same delivery into new work.
 
 ```python
+import hashlib
+import hmac
+import json
+import re
+import time
+
 async def verify_callback(raw_body: bytes, headers, secret: bytes, replay_store) -> dict:
-    timestamp = headers["X-Webhook-Timestamp"]
-    delivery_id = headers["X-Webhook-Delivery"]
-    if abs(int(time.time()) - int(timestamp)) > 300:
-        raise ValueError("stale webhook")
-
-    supplied = headers["X-Webhook-Signature"].removeprefix("v1=")
-    expected = hmac.new(
-        secret,
-        timestamp.encode("ascii") + b"." + raw_body,
-        hashlib.sha256,
-    ).hexdigest()
-    if not hmac.compare_digest(supplied, expected):
-        raise ValueError("invalid webhook signature")
-
-    # SET NX with a five-minute TTL is one concrete implementation.
-    if not await replay_store.add_once(delivery_id, ttl_seconds=300):
-        raise ValueError("replayed webhook")
-    return json.loads(raw_body)
+    try:
+        timestamp = headers["X-Webhook-Timestamp"]
+        delivery_id = headers["X-Webhook-Delivery"]
+        signature = headers["X-Webhook-Signature"]
+        if (headers.get("X-Webhook-Version") != "v1"
+                or not re.fullmatch(r"[0-9]{1,12}", timestamp)
+                or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", delivery_id)
+                or not re.fullmatch(r"v1=[0-9a-f]{64}", signature)):
+            raise ValueError("malformed webhook")
+        if abs(int(time.time()) - int(timestamp)) > 300:
+            raise ValueError("stale webhook")
+        expected = hmac.new(
+            secret,
+            delivery_id.encode("ascii") + b"." + timestamp.encode("ascii")
+            + b"." + raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(signature[3:], expected):
+            raise ValueError("invalid webhook signature")
+        payload = json.loads(raw_body)
+        if not isinstance(payload, dict):
+            raise ValueError("object body required")
+    except (KeyError, TypeError, UnicodeError) as exc:
+        raise ValueError("malformed webhook") from exc
+    # Atomic durable insert of (registration_id, delivery_id, raw_body, pending).
+    # This store is scoped to the already authenticated registration.
+    # Same ID/body returns existing state; same ID/different body raises conflict.
+    await replay_store.admit(delivery_id, raw_body)
+    return payload
 ```
+
+Return a successful intake response only after `admit` commits. A separate worker claims pending
+inbox rows and commits its local effect plus completion together. An existing pending row must
+remain runnable after receiver restart; recording only a short-lived “seen” key would lose work
+if the process died before the effect. Retain delivery identity for the sender's entire supported
+retry/manual-replay horizon, which can be days; the five-minute signature window is unrelated.
+For remote effects, use the destination's idempotency key and reconcile ambiguous timeouts.
+The [webhook intake course](../../apis/webhooks/README.md) owns the full durable inbox protocol.
+
+Run the local verifier/inbox crash fixture from the repository root:
+
+```bash
+python3 architecture/long_running_tasks/examples/recovery_contracts.py
+```
+
+With `asyncpg` installed and local Docker available, execute the current submission/completion
+fences against an automatically removed PostgreSQL 17 container:
+
+```bash
+python3 architecture/long_running_tasks/examples/verify_delivery_transaction.py
+```
+
+The transaction probe rejects stale and expired claims, rolls back a result when delivery insertion
+fails, and reconnects to verify that the generation-bearing pending delivery survives. The first
+script extracts the verifier above and checks identity substitution, malformed signatures, replay after
+receiver restart and body conflicts using a disposable SQLite inbox. It does not verify a deployed
+webhook route, broker or remote side effect.
 
 ### Characteristics
 
@@ -627,13 +727,13 @@ async def wait_for_result_safe(redis_client: redis.Redis, job_id: str, timeout: 
 
 ## Combining Patterns
 
-**Production best practice:** Offer multiple delivery mechanisms and let the client choose.
+Start with the durable status endpoint. Add delivery mechanisms only for a demonstrated client requirement; every additional transport needs its own authorization and recovery checks.
 
 ```python
 @app.post("/jobs")
 async def create_job(
     payload: dict,
-    callback_url: Optional[str] = None,   # Webhook delivery
+    callback_id: str | None = None,   # Webhook delivery
     # Client can also:
     # - Connect to /ws/jobs/{id} for WebSocket
     # - GET /jobs/{id}/stream for SSE
@@ -647,3 +747,26 @@ A typical production API offers:
 1. **Short polling** as the universal fallback (always works)
 2. **WebSocket or SSE** for interactive clients that need progress
 3. **Webhook** for server-to-server integrations
+
+## Choose under a changed condition
+
+**An internal consumer starts after the Redis notification was published. What can it recover?**
+
+<details><summary>Reasoned answer</summary>
+
+Pub/Sub retains no message for the absent subscriber. Read durable status, subscribe, then recheck
+before waiting; use a bounded wait and re-read on reconnect. If the consumer is a browser without
+Redis access, the API performs this reconciliation and exposes authorized polling or SSE. A new
+transport does not replace the retained job row.
+
+</details>
+
+**Worker 2 committed `succeeded`, its push vanished, and worker 1 later calls back. What changes?**
+
+<details><summary>Reasoned answer</summary>
+
+Nothing changes in the durable result: the generation predicate rejects worker 1. Polling reads
+success immediately; SSE/WebSocket recover it on reconnect; a webhook sender retries its durable
+delivery. A transport failure changes notification latency, not who may commit the result.
+
+</details>

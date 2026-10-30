@@ -36,7 +36,7 @@ A framework may cover several rows, but the rows do not collapse into one. Celer
 "Only if configured for it" is the row that most often surprises people, so it is worth naming the three concrete cases:
 
 - **RabbitMQ** — durability is opt-in and needs all three of a durable (quorum) queue, messages published as persistent, and publisher confirms. Miss any one and a broker restart or a failed publish loses work silently.
-- **Redis-backed transports** — Redis has no native acknowledgement, so these emulate it with a *visibility timeout*: a claimed message becomes visible again after a fixed period. Work that outlives the timeout is redelivered while the first worker is still running it, and unclean shutdowns can drop it entirely.
+- **Redis list-based transports (for example Celery/Kombu)** — the transport implements an acknowledgement/visibility protocol around lists. Work that outlives its visibility timeout can be redelivered while the first worker still runs. **Redis Streams are different**: `XREADGROUP` records pending entries and `XACK` acknowledges them natively; recovery must claim abandoned pending entries. Neither protocol alone makes the business effect exactly once. See [Redis Streams](../../infrastructure/redis/02_pubsub_and_streams.md) and the [Redis command semantics](https://redis.io/docs/latest/develop/data-types/streams/) (checked 2026-10-30).
 - **Amazon SQS** — durable and replicated by default; the thing you configure is the visibility timeout, not the durability.
 
 Sources: [RabbitMQ quorum queues](https://www.rabbitmq.com/docs/quorum-queues), [Celery Redis broker notes](https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/redis.html) (checked 2026-08-03). [Queue and Worker Architectures](../execution/01_queue_and_worker_architectures.md) §4 works through the consequences.
@@ -121,5 +121,28 @@ The first four rows are the normal starting points; engines and orchestrators ar
 Do not introduce a queue merely to move a cheap, non-critical operation out of the request. Do not introduce a workflow engine for one independent idempotent task. Each extra runtime adds deployment, monitoring, and recovery work.
 
 ---
+
+## Recap and check yourself
+
+- A request returning does not preserve the work it started; a durable record must retain the obligation.
+- Business state, execution attempts and delivery acknowledgements answer different questions.
+- Choose concurrency separately from the mechanism that retains pending work.
+
+**The queue is empty. Can the UI report that the payment completed?**
+
+<details><summary>Answer</summary>
+
+No. Empty delivery state can mean consumed, expired or acknowledged. The authoritative payment record must establish the business outcome.
+
+</details>
+
+**A process worker replaces an async worker. Has durability improved?**
+
+<details><summary>Answer</summary>
+
+No. The execution resource changed, while the persistence/handoff boundary did not. Both need a recoverable obligation when process loss matters.
+
+</details>
+
 
 **Next**: [When a Task Becomes a Workflow](02_task_or_workflow.md)

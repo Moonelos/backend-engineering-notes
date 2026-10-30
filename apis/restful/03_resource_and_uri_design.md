@@ -173,6 +173,25 @@ The job representation should define terminal states, timestamps, progress seman
 
 ---
 
+The report run has identity because its state outlives the submitting request.
+
+```mermaid
+stateDiagram-v2
+ [*] --> queued: POST report-runs / run_123
+ queued --> running: worker claims
+ queued --> cancelled: accepted cancellation
+ running --> succeeded: result available
+ running --> failed: structured problem
+ running --> cancelled: worker confirms stop
+ succeeded --> [*]
+ failed --> [*]
+ cancelled --> [*]
+```
+
+A cancellation request is an intent. Expose cancelled only after the worker confirms it stopped; after succeeded, return the documented conflict or existing terminal result, and keep result deletion a separate policy. GET exposes a result link only once the result exists.
+
+---
+
 ## 7. Bulk Operations
 
 Bulk interfaces reduce round trips but complicate authorization, limits, atomicity, and error reporting.
@@ -229,5 +248,30 @@ Avoid returning writable internal fields such as `tenant_id`, `is_admin`, fraud 
 - Every object and property passes tenant-aware authorization.
 
 ---
+
+
+## Recap
+
+- Choose public identities from the domain rather than exposing storage tables.
+- A relationship with its own attributes and lifecycle deserves an address.
+- A long-running operation needs observable state; requesting cancellation does not prove it stopped.
+
+## Check yourself
+
+**Membership gains role, joined_at and independent revocation history. Should it stay an add-user action?**
+
+<details><summary>Reasoned answer</summary>
+
+Give it identity as /memberships/{id}; its own state and audit lifecycle now need a stable target.
+
+</details>
+
+**A cancellation arrives after run_123 succeeded. May GET immediately report cancelled?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Keep the completed outcome or return the documented conflict. Deleting a result is a separate operation from stopping execution.
+
+</details>
 
 **Next**: [Representations, Validation, and Errors](04_representations_validation_and_errors.md)

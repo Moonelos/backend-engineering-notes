@@ -141,31 +141,15 @@ WHERE b.tenant_id = cancelled.tenant_id
 RETURNING b.tenant_id, b.pending_units;
 ```
 
-Prove the mechanism with two real PostgreSQL connections and a barrier at the admission statement. In the repository's database integration harness, the test is:
+The complete [admission fixture](../examples/durable_job/test_admission.py) creates an isolated `admission_lab` schema, defines the four tables and constraints above, and wraps each statement in its own psycopg transaction. Start the [durable-job PostgreSQL lab](../foundations/03_minimal_durable_task.md#run-one-job-before-studying-the-schema), then run from its example directory:
 
-```python
-def test_only_the_budget_winner_creates_work_and_release_is_once(db):
-    db.seed_budget(tenant_id="A", pending_units=90, pending_limit=100)
-
-    # admit() runs the CTE above on its own connection; both calls request
-    # the final ten units after crossing the same barrier.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(admit, [job("job-1", 10), job("job-2", 10)]))
-
-    winners = [result for result in results if result is not None]
-    assert len(winners) == 1
-    assert db.budget("A").pending_units == 100
-    assert db.count("jobs", tenant_id="A") == 1
-    assert db.count("work_admissions", tenant_id="A") == 1
-    assert db.count("outbox", event_type="job.ready") == 1
-
-    winner_id = winners[0].job_id
-    assert cancel_and_release(winner_id).rowcount == 1
-    assert cancel_and_release(winner_id).rowcount == 0
-    assert db.budget("A").pending_units == 90
+```bash
+.venv/bin/python -m pytest -q test_admission.py
 ```
 
-The helpers are thin wrappers over the two SQL statements, not mocked repositories. If the losing connection creates any durable row, a downstream insert is not mechanically dependent on `reserved`. If the second cancellation changes the budget, the release lacks an idempotent owner.
+Two tests pass. The race test opens independent connections, synchronizes them at a `threading.Barrier`, and asks both to reserve the final 10 units from a 90/100 budget. PostgreSQL serializes the updates on the budget row. After the winner commits 100, the loser's predicate is rechecked and returns zero rows. Assertions inspect one job, one admission, one outbox row and a counter of 100. Cancelling the winning job twice changes the counter to 90 exactly once.
+
+The second test makes A's backlog 1000 entries and B's one entry. A small round-robin selector starts A, B, A, A; it demonstrates the choice rule below, not a distributed dispatcher. Multiple dispatchers need durable cursor ownership and job claims as well. Counting one winner proves atomic admission; it does not by itself prove fair execution.
 
 Completion, cancellation before execution, and terminal rejection release the reserved units through idempotent conditional updates. Reconciliation compares reservations with non-terminal work so a process crash cannot leak capacity permanently.
 

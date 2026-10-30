@@ -311,6 +311,53 @@ Mock things **at the edge of your system** — external APIs, AWS, the database 
 
 ---
 
+Each replacement cuts the path at a different point:
+
+```mermaid
+flowchart LR
+    T[Test assertion] --> P[Application policy]
+    P --> F[Fake provider port]
+    P --> A[Real provider adapter]
+    A --> M[Mock HTTP transport]
+    A --> N[Network and current provider]
+```
+
+A fake port skips adapter serialization and parsing. MockTransport retains that adapter code while
+replacing wire I/O. A bounded compatibility check reaches the current provider; keep its credential,
+cost and availability requirements outside the default hermetic profile.
+
 ## Next
 
 - [10 — Test Patterns](10_test_patterns.md) — parametrize, snapshots, and the realistic end-to-end example.
+
+## Recap and retrieval
+
+- Choose the interception layer according to the claim: fake port, HTTP transport or actual provider.
+- A transport fixture still exercises adapter parsing; a port fake skips it.
+- Hermetic success cannot show that an upstream contract remains current.
+
+**All fake weather cases pass after a provider removes temp. Which check is missing?**
+
+<details><summary>Reasoned answer</summary>
+
+A bounded compatibility check against the current provider fields consumed by the adapter. Keep deterministic fakes for failures and edge cases; they prove a separate boundary.
+
+</details>
+
+**A fake provider raises the expected domain error. Did the test verify HTTP status translation?**
+
+<details><summary>Reasoned answer</summary>
+
+No. To test the adapter translation, return the corresponding HTTP response through a transport fixture and assert the mapped error.
+
+</details>
+
+**Try it:** An adapter translates provider 429 into a retryable domain error. Fill in the transport response and assertion.
+
+Hint: Fake the HTTP transport below the adapter, not the port above it.
+
+<details><summary>Worked solution</summary>
+
+Return status 429 with the documented body/Retry-After field; call the real adapter and assert its retryable error and bounded retry hint. No provider network call is needed.
+
+</details>

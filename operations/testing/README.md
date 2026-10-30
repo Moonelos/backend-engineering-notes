@@ -41,6 +41,7 @@
 | [11](11_coverage_and_ci.md) | Coverage & CI | `pytest-cov`, branch coverage, `pytest-xdist`, GitHub Actions |
 | [12](12_common_mistakes.md) | Common Mistakes | The recurring pitfalls every pytest project hits |
 | [13](13_testing_llm_code.md) | Testing LLM Code | Prompt builders, model adapters, schemas, agent tools, evals |
+| [14](14_load_and_performance_testing.md) | Load and performance | Workload models, percentiles, dependency ceilings and regression gates |
 
 ---
 
@@ -103,8 +104,12 @@ async def client():
 
 @pytest.fixture(autouse=True)
 def reset_overrides():
-    yield
-    app.dependency_overrides.clear()
+    previous = app.dependency_overrides.copy()
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
 
 
 async def test_health(client):
@@ -133,3 +138,16 @@ If the app depends on startup/shutdown lifespan work, wrap the async client with
 ---
 
 **Start with [Part 1: Mental Model →](01_mental_model.md)**
+
+## Run the boundary regression fixtures
+
+From repository root, in a disposable test environment with pytest 9, FastAPI, SQLAlchemy and a
+supported TestClient backend installed:
+
+```bash
+python -m pytest -q operations/testing/examples/test_boundary_contracts.py
+```
+
+The four checks cover nested override restoration after failure, callable identity, password-bearing
+SQLAlchemy URL rendering without printing the password, and runtime-discovered pytest subtests.
+They do not provision the example application or certify its database/provider integrations.

@@ -49,6 +49,26 @@ Every repair preserves the original operation, job, message, and command keys. A
 
 ## 3. Expired-lease repair is bounded and token-aware
 
+A late response is the dangerous case: repair must revoke old authority before a replacement can finish.
+
+```mermaid
+sequenceDiagram
+    participant A as Worker A
+    participant D as Jobs database
+    participant R as Reconciler
+    participant B as Worker B
+    A->>D: Claim job-42 with token A
+    Note over A: Stops heartbeating
+    R->>D: Lock expired token A, reset to PENDING
+    B->>D: Claim job-42 with token B
+    A->>D: Late completion with token A
+    D-->>A: Zero rows updated
+    B->>D: Complete with token B and live lease
+    D-->>B: One row updated
+```
+
+The reconciler does not declare the provider effect absent. It changes local ownership. If A's external operation may have committed, B must reconcile that evidence under the stable business key before repeating it.
+
 Select a limited batch under row locks, then update only the token observed by that scan:
 
 ```sql
@@ -243,5 +263,36 @@ The first four behaviors are required before production rollout:
 Do not call the system production-ready until an operator can answer: Which work is stuck? Who owns it? Can the effect repeat? What evidence makes retry, cancellation, or redrive safe?
 
 ---
+
+## Recap and check yourself
+
+- Reconciliation finds obligations whose owners or delivery hints stopped progressing.
+- Repair creates a new ownership epoch, so stale workers cannot overwrite it.
+- DLQ inspection and business outcome recovery are distinct from blindly republishing messages.
+
+**An old worker returns after the reconciler assigns a new token. May it complete?**
+
+<details><summary>Answer</summary>
+
+No. Completion must match the current token and lease. Provider effect evidence is reconciled separately rather than granting the old worker authority.
+
+</details>
+
+**Queue depth is low but the oldest pending business job keeps ageing. Is scaling consumers enough?**
+
+<details><summary>Answer</summary>
+
+First inspect its publication, eligibility, ownership and budget state. The obligation may never be reaching consumers, or be permanently ineligible until repair.
+
+</details>
+
+**Try it:** Add the sequence A claims → lease expires → repair → B claims → A completes to a recovery test. Fill the stale-update row count.
+
+<details><summary>Hint and worked solution</summary>
+
+Reconciliation creates a new ownership epoch. Zero. If it is one, repair can be undone by an old process even though the reconciler itself appears healthy.
+
+</details>
+
 
 **Next**: [Durable Fan-Out and Join](../workflows/02_durable_fanout_and_join.md)

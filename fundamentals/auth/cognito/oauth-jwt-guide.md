@@ -1,479 +1,237 @@
-# OAuth & JWT with Cognito — Practical Guide
+# OAuth and JWT with Cognito — a working authorization boundary
 
-> **Who this is for**: Backend engineers integrating Cognito token issuance with an API resource
-> server.
+> **Who this is for:** Python API engineers who have read [JWT](../jwt.md), [OAuth](../oauth2.md),
+> and the [Cognito token profiles](tokens.md). Baseline checked 2026-10-30: PyJWT 2.15.1,
+> FastAPI 0.162.0, HTTPX 0.28.1 and boto3/botocore 1.43.122.
+>
+> **Outcome:** issue a machine token with `myapi/read`, validate the matching policy at `/data`,
+> and distinguish authentication failure from insufficient scope. User login is a separate branch.
 
-> **Key insight**: The issuer creates tokens, but each resource server still owns audience and scope
-> enforcement.
+## First result: exercise the API boundary locally
 
-> Theory is in [auth/jwt.md](../jwt.md) and [auth/oauth2.md](../oauth2.md). This guide shows how to apply those concepts specifically with AWS Cognito — boto3 setup, token flow, real code.
+The [complete access policy](examples/access_policy.py) includes a FastAPI app factory and a bounded,
+cached JWKS resolver. The [tests](examples/test_access_policy.py) generate an RSA key and signed
+Cognito-shaped fixtures, then call the real HTTP dependency in process. They require no AWS account,
+create no cloud resources, and never print credentials. From the repository root:
 
-## Quick path: request a service token
-
-Given an existing confidential app client, user-pool domain, and `myapi/read` scope, this request
-produces the first observable result before the setup reference below:
-
-```python
-import requests
-
-response = requests.post(
-    "https://myapp-auth.auth.us-east-1.amazoncognito.com/oauth2/token",
-    data={
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "myapi/read",
-    },
-    timeout=10,
-)
-response.raise_for_status()
-body = response.json()
-print(response.status_code, body["token_type"], body["expires_in"], bool(body["access_token"]))
-# 200 Bearer 3600 True
+```bash
+python3 -m venv /tmp/cognito-notes-venv
+/tmp/cognito-notes-venv/bin/python -m pip install 'PyJWT[crypto]==2.15.1' 'fastapi==0.162.0' 'httpx==0.28.1' 'pytest==9.2.0' 'boto3==1.43.122'
+/tmp/cognito-notes-venv/bin/python -m pytest -q fundamentals/auth/cognito/examples
+# 15 passed (the exact warning/timing line depends on the environment)
 ```
 
-Never print the token itself. A `400` response with `invalid_client` usually means the app client is
-public, the secret is wrong, or the client-credentials flow is not enabled. The following sections
-own those prerequisites. OpenID Connect (OIDC) is the identity layer built on OAuth; its built-in
-profile scopes are distinct from custom API authorization scopes.
+The successful fixture contains `token_use=access`, the configured `client_id`, and `scope=myapi/read`.
+It has no `aud`: that is Cognito's unbound M2M profile. ID tokens, another client, bad issuer,
+missing/expired `exp`, malformed scope, or a tampered signature produce 401. A valid access token
+without the required scope produces 403. The separate bound-user test requires the exact URL `aud`.
+The config tests check AWS request schemas with `Stubber`, not a live AWS integration.
 
----
+## Pattern A: machine-to-machine, from issuance to `/data`
 
-## Cognito Resource Servers — Defining Custom Scopes
+This continuation requires an existing disposable User Pool, an authorized administrative AWS
+profile, a unique domain prefix, and permission to create a resource server and app client. These
+are **cloud configuration excerpts**, not part of the local test command. Store secrets in your
+secret manager, and manage the resulting resources with your normal infrastructure lifecycle.
 
-A **Resource Server** in Cognito registers your API and defines the custom scopes it recognizes. Without it, you can only use the built-in OIDC scopes (`openid`, `email`, `profile`).
+A resource server registers valid scope names. It does not automatically add an audience claim:
 
 ```python
 import boto3
 
 cognito = boto3.client("cognito-idp", region_name="us-east-1")
-
+# pool_id comes from your deployed User Pool.
 cognito.create_resource_server(
-    UserPoolId=pool_id,
-    Identifier="myapi",           # becomes the scope prefix: myapi/read, myapi/write
-    Name="My Application API",
-    Scopes=[
-        {"ScopeName": "read",  "ScopeDescription": "Read access"},
-        {"ScopeName": "write", "ScopeDescription": "Read and write access"},
-        {"ScopeName": "admin", "ScopeDescription": "Full administrative access"},
-    ],
+    UserPoolId=pool_id, Identifier="myapi", Name="Example API",
+    Scopes=[{"ScopeName": "read", "ScopeDescription": "Read example data"}],
 )
-# Scopes are now available: "myapi/read", "myapi/write", "myapi/admin"
-```
-
-Custom scopes follow the format `<Identifier>/<ScopeName>`. The identifier is the resource server's unique ID (not a URL, just a string — though URLs are valid too).
-
----
-
-## Pattern A — Machine-to-Machine (Client Credentials)
-
-No user involved. A service authenticates with its own client_id + secret to call your API.
-
-See [oauth2.md → Client Credentials](../oauth2.md) for the flow diagram.
-
-### Step 1: Create an App Client for M2M
-
-```python
-client_resp = cognito.create_user_pool_client(
-    UserPoolId=pool_id,
-    ClientName="backend-service",
-    GenerateSecret=True,                              # required for client_credentials
+client = cognito.create_user_pool_client(
+    UserPoolId=pool_id, ClientName="report-service", GenerateSecret=True,
+    ExplicitAuthFlows=[],
     AllowedOAuthFlows=["client_credentials"],
-    AllowedOAuthScopes=["myapi/read", "myapi/write"], # custom scopes from resource server
+    AllowedOAuthScopes=["myapi/read"],
     AllowedOAuthFlowsUserPoolClient=True,
-    SupportedIdentityProviders=["COGNITO"],
-    ExplicitAuthFlows=["ALLOW_REFRESH_TOKEN_AUTH"],
-)
-client_id     = client_resp["UserPoolClient"]["ClientId"]
-client_secret = client_resp["UserPoolClient"]["ClientSecret"]
+    AccessTokenValidity=15, TokenValidityUnits={"AccessToken": "minutes"},
+)["UserPoolClient"]
+client_id, client_secret = client["ClientId"], client["ClientSecret"]
+cognito.create_user_pool_domain(UserPoolId=pool_id, Domain=unique_domain_prefix)
 ```
 
-**Requirements for client_credentials in Cognito:**
-- `GenerateSecret=True` — the secret is how the service proves its identity
-- A **User Pool Domain** must exist (the token endpoint is served there)
-- Resource Server with custom scopes must exist before adding scopes here
-
-### Step 2: Add a User Pool Domain (if not already)
-
-```python
-cognito.create_user_pool_domain(
-    Domain="myapp-auth",   # becomes: myapp-auth.auth.us-east-1.amazoncognito.com
-    UserPoolId=pool_id,
-)
-```
-
-### Step 3: Request a Token
+Use this dedicated confidential client only on a trusted backend. The client-credentials grant
+returns an access token, without an ID token or refresh token. It represents the service rather than
+a human. A public browser cannot protect this secret.
 
 ```python
 import requests
 
-REGION = "us-east-1"
-DOMAIN_PREFIX = "myapp-auth"
-
-token_url = f"https://{DOMAIN_PREFIX}.auth.{REGION}.amazoncognito.com/oauth2/token"
-
-resp = requests.post(
-    token_url,
-    headers={"Content-Type": "application/x-www-form-urlencoded"},
-    data={
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "myapi/read myapi/write",
-    },
+url = f"https://{unique_domain_prefix}.auth.us-east-1.amazoncognito.com/oauth2/token"
+response = requests.post(
+    url, auth=(client_id, client_secret),
+    data={"grant_type": "client_credentials", "scope": "myapi/read"}, timeout=10,
 )
-resp.raise_for_status()
-access_token = resp.json()["access_token"]
+response.raise_for_status()
+result = response.json()
+access_token = result["access_token"]
+print(response.status_code, result["token_type"], result["expires_in"])
+# 200 Bearer 900 for this configured client
 ```
 
-### Step 4: Call Your API
+Now deploy the **same profile** at the API. Copy [access_policy.py](examples/access_policy.py)
+beside the following app module. The client ID and issuer are deployed configuration, not values
+selected from an unverified token:
 
 ```python
-api_response = requests.get(
-    "https://your-api.example.com/data",
-    headers={"Authorization": f"Bearer {access_token}"},
+from access_policy import AccessPolicy, create_app, jwks_key_resolver
+
+ISSUER = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE"
+policy = AccessPolicy(ISSUER, configured_service_client_id, frozenset({"myapi/read"}))
+app = create_app(policy, jwks_key_resolver(ISSUER))
+```
+
+Call the deployed API:
+
+```python
+response = requests.get(
+    "https://api.example.com/data",
+    headers={"Authorization": f"Bearer {access_token}"}, timeout=10,
 )
+response.raise_for_status()
+assert response.json()["client"] == client_id
 ```
 
-### Key Facts About client_credentials Tokens
+The trace explains which boundary owns each decision:
 
-- `sub` in the token = the `client_id` (not a user UUID)
-- Only an `access_token` is returned — no id_token, no refresh_token
-- When the token expires, just POST to the token endpoint again with client_id + secret
-- No user pool users required — the app client IS the identity
-
----
-
-## Pattern B — User Authentication (USER_PASSWORD_AUTH)
-
-A human user authenticates. The token represents a specific person.
-
-See [oauth2.md → User-Based](../oauth2.md) for the flow diagram.
-
-### Step 1: Create a User Pool Client for User Auth
-
-```python
-client_resp = cognito.create_user_pool_client(
-    UserPoolId=pool_id,
-    ClientName="web-app",
-    GenerateSecret=False,                    # no secret for browser/mobile apps
-    ExplicitAuthFlows=[
-        "ALLOW_USER_PASSWORD_AUTH",          # plain password over HTTPS (server-side only)
-        "ALLOW_REFRESH_TOKEN_AUTH",
-    ],
-    AccessTokenValidity=60,
-    IdTokenValidity=60,
-    RefreshTokenValidity=30,
-    TokenValidityUnits={
-        "AccessToken": "minutes",
-        "IdToken": "minutes",
-        "RefreshToken": "days",
-    },
-)
-client_id = client_resp["UserPoolClient"]["ClientId"]
+```mermaid
+sequenceDiagram
+    participant Service as Report service
+    participant Cognito
+    participant API as GET /data
+    Service->>Cognito: client credentials and myapi/read
+    Cognito->>Cognito: Authenticate client and allow scope
+    Cognito-->>Service: Access token without aud
+    Service->>API: Bearer access token
+    API->>API: RS256 issuer exp iat access type client and myapi/read
+    API-->>Service: 200 with authorized data
+    Service->>API: ID token or another client token
+    API-->>Service: 401 before business logic
 ```
 
-For browser/mobile apps, use `ALLOW_USER_SRP_AUTH` instead of `ALLOW_USER_PASSWORD_AUTH`—Secure
-Remote Password (SRP) is a password-authentication protocol that proves knowledge without sending
-the password itself. For server-side scripts and tests, `USER_PASSWORD_AUTH` is fine.
+Do not set `resource_audience="myapi"` here. Custom-scope registration and OAuth resource binding
+are different mechanisms. [Cognito supports resource binding only for OAuth user grants](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-define-resource-servers.html).
 
-### Step 2: Create a User
+Cache the machine token until shortly before expiry using a monotonic deadline derived from the
+trusted token endpoint's `expires_in`, with jitter and one refresh in flight per client/scope set.
+Do not request a new token on every business call. Never reuse a cache entry across clients or scope
+sets. Retry transient issuance failures within a bounded deadline; an `invalid_client` or
+`invalid_scope` response requires configuration repair. Monitor issuance latency, 429s, cache hit
+rate, and 401/403 categories without logging the bearer or secret.
+
+### Current alternative: domainless M2M issuance
+
+As checked 2026-10-30, `GetClientToken` supports SDK-based M2M issuance without a User Pool domain.
+Create a **separate** confidential client with `ExplicitAuthFlows=['ALLOW_CLIENT_TOKEN_AUTH']` as
+its only explicit flow and allowed custom scopes. Then:
 
 ```python
-cognito.admin_create_user(
-    UserPoolId=pool_id,
-    Username="alice@example.com",
-    UserAttributes=[{"Name": "email", "Value": "alice@example.com"}],
-    TemporaryPassword="Temp1234!",
-    MessageAction="SUPPRESS",
-)
-cognito.admin_set_user_password(
-    UserPoolId=pool_id,
-    Username="alice@example.com",
-    Password="MyPerm1234!",
-    Permanent=True,
-)
+result = cognito.get_client_token(
+    ClientId=sdk_m2m_client_id, Secret=sdk_m2m_client_secret, Scopes=["myapi/read"],
+)["ClientAuthenticationResult"]
+access_token = result["AccessToken"]
+# Configure the API policy for sdk_m2m_client_id; do not silently accept every pool client.
 ```
 
-### Step 3: Authenticate
+This call authenticates with the app secret, not IAM credentials. Treat `Scopes` as explicit least
+privilege; omission requests the configured scope set. This is an alternative issuance transport,
+not an audience-binding feature. [GetClientToken API](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_GetClientToken.html).
+
+## Pattern B: user Authorization Code with PKCE
+
+Use Managed Login and a public app client with no secret for browser/mobile login. Configure the
+exact callback URL, `AllowedOAuthFlows=['code']`, and allowed scopes `openid` and `myapi/read`.
+A domain serves the authorize/token endpoints. The [generic OAuth lesson](../oauth2.md) owns the
+complete challenge/verifier and one-time session-state exchange; this branch changes its Cognito
+parameters:
 
 ```python
-auth_resp = cognito.initiate_auth(
-    ClientId=client_id,
-    AuthFlow="USER_PASSWORD_AUTH",
-    AuthParameters={
-        "USERNAME": "alice@example.com",
-        "PASSWORD": "MyPerm1234!",
-    },
-)
-result       = auth_resp["AuthenticationResult"]
-access_token  = result["AccessToken"]
-id_token      = result["IdToken"]
-refresh_token = result["RefreshToken"]
-```
+from urllib.parse import urlencode
 
-### Step 4: Use and Refresh Tokens
-
-```python
-# Call your API
-requests.get("https://your-api.example.com/me", headers={"Authorization": f"Bearer {access_token}"})
-
-# Refresh when access token expires
-refresh_resp = cognito.initiate_auth(
-    ClientId=client_id,
-    AuthFlow="REFRESH_TOKEN_AUTH",
-    AuthParameters={"REFRESH_TOKEN": refresh_token},
-)
-new_access_token = refresh_resp["AuthenticationResult"]["AccessToken"]
-new_id_token     = refresh_resp["AuthenticationResult"]["IdToken"]
-# Refresh token is NOT renewed — use the same one until it expires (30 days default)
-```
-
----
-
-## Validating Tokens in Your API (Cognito-Specific)
-
-Cognito's JSON Web Key Set (JWKS), the published set of issuer public keys, and issuer URLs follow a
-fixed pattern. Plug these into the generic validation from [jwt.md](../jwt.md).
-
-```python
-REGION  = "us-east-1"
-POOL_ID = "us-east-1_XXXXXXXX"
-
-JWKS_URL = f"https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}/.well-known/jwks.json"
-ISSUER   = f"https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}"
-```
-
-### Checking Scopes (M2M / client_credentials)
-
-```python
-def require_scope(required_scope: str, claims: dict) -> None:
-    scopes = claims.get("scope", "").split()
-    if required_scope not in scopes:
-        raise HTTPException(status_code=403, detail=f"Missing scope: {required_scope}")
-
-# Usage after the dependency below returns verified access-token claims
-require_scope("myapi/write", claims)
-```
-
-### Checking Groups (user auth)
-
-```python
-def require_group(required_group: str, claims: dict) -> None:
-    groups = claims.get("cognito:groups", [])
-    if required_group not in groups:
-        raise HTTPException(status_code=403, detail="Insufficient permissions")
-
-# Usage after the dependency below returns verified access-token claims
-require_group("admins", claims)
-```
-
-### FastAPI Dependency (Cognito)
-
-```python
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import jwt
-from jwt import PyJWKClient
-
-REGION  = "us-east-1"
-POOL_ID = "us-east-1_XXXXXXXX"
-
-jwks_client = PyJWKClient(
-    f"https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}/.well-known/jwks.json"
-)
-ISSUER    = f"https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}"
-CLIENT_ID = "your-client-id"
-RESOURCE_AUDIENCE = "myapi"  # set to None only when this API intentionally has no resource aud
-REQUIRED_SCOPES = {"myapi/read"}
-
-bearer_scheme = HTTPBearer()
-
-
-def get_current_access_token(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-) -> dict:
-    token = credentials.credentials
-    try:
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        claims = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["RS256"],
-            issuer=ISSUER,
-            options={
-                "verify_aud": False,  # access-token aud is resource binding, not client ID
-                "require": ["exp", "iat", "iss", "sub", "token_use", "client_id"],
-            },
-        )
-        if claims.get("token_use") != "access":
-            raise HTTPException(status_code=401, detail="Expected access token")
-        if claims.get("client_id") != CLIENT_ID:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid client")
-        if RESOURCE_AUDIENCE is not None and claims.get("aud") != RESOURCE_AUDIENCE:
-            raise HTTPException(status_code=401, detail="Invalid resource audience")
-        scopes = set(claims.get("scope", "").split())
-        if not REQUIRED_SCOPES <= scopes:
-            raise HTTPException(status_code=403, detail="Missing required scope")
-        return claims
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-```
-
-Identity handling uses a separate validator and is not wired into API authorization:
-
-```python
-def validate_id_token(token: str) -> dict:
-    signing_key = jwks_client.get_signing_key_from_jwt(token)
-    claims = jwt.decode(
-        token,
-        signing_key.key,
-        algorithms=["RS256"],
-        issuer=ISSUER,
-        audience=CLIENT_ID,
-        options={"require": ["exp", "iat", "iss", "aud", "sub", "token_use"]},
-    )
-    if claims.get("token_use") != "id":
-        raise jwt.InvalidTokenError("expected a Cognito ID token")
-    return claims
-```
-
-Do not make one dependency accept either profile.
-
----
-
-## Consuming Cognito Tokens at the Gateway (API Gateway / AgentCore JWT Authorizer)
-
-`CustomJWTAuthorizer` is an **API Gateway / AgentCore Gateway** construct—an edge authorization
-policy—not a Cognito feature. Cognito only issues the token. Configure it with Cognito's discovery
-URL and the client IDs it should trust:
-
-```python
-auth_config = {
-    "customJWTAuthorizer": {
-        "allowedClients": [client_id],
-        "discoveryUrl": f"https://cognito-idp.{REGION}.amazonaws.com/{POOL_ID}/.well-known/openid-configuration",
-    }
+parameters = {
+    "response_type": "code", "client_id": user_client_id,
+    "redirect_uri": "https://app.example.com/callback",
+    "scope": "openid myapi/read", "state": state,
+    "code_challenge": code_challenge, "code_challenge_method": "S256",
+    "resource": "https://api.example.com",
 }
+authorize_url = cognito_domain + "/oauth2/authorize?" + urlencode(parameters)
 ```
 
-The gateway (not Cognito):
-1. Fetches the discovery document to find `jwks_uri` and `issuer`
-2. Downloads and caches the Cognito public keys
-3. Validates every incoming JWT signature and claims
-4. Rejects tokens from clients not in `allowedClients`
+Here `resource` explicitly requests the URL audience. After checking one-time `state`, exchange the
+code with the original verifier and exact redirect URI. Configure a **separate user API policy**
+with that user client ID and `resource_audience="https://api.example.com"`. The access token must
+also contain `myapi/read`. Validate any OIDC ID token in the login handler, including its client
+audience and transaction nonce if requested; send only the access token to `/data`.
 
-The origin may rely on this decision only when callers cannot reach it except through the configured
-gateway, or when the gateway-to-origin hop has its own authenticated identity. Otherwise an attacker
-can bypass the authorizer and call the origin directly. Network routing is part of the trust boundary,
-not an optional deployment detail.
+`InitiateAuth(USER_PASSWORD_AUTH)` is a Cognito SDK login, not the OAuth password grant. Its normal
+access token has `aws.cognito.signin.user.admin`; it is not a shortcut for testing a custom-scope
+OAuth API. SDK flows also lack resource binding. Use a test browser/IdP harness for live user
+integration, and the local signed negative fixtures for deterministic API-policy checks. Password,
+MFA, sign-up and administration examples live in [User Pool configuration](user-pool.md).
 
----
+### Refresh without a nonexistent helper module
 
-## Production vs Testing — Where the Token Comes From
-
-### Production: Real Token Flow
-
-```
-Browser → Cognito Hosted UI (or Amplify SDK) → user logs in
-       → tokens returned to frontend
-       → frontend sends access_token to YOUR backend
-       → backend validates JWT
-       → backend calls downstream services with Bearer token
-```
-
-The frontend never calls downstream services directly. Your backend is the gatekeeper.
-
-```
-WRONG: Browser ──────────────────── Bearer token ──────────────▶ AgentCore
-RIGHT: Browser ── JWT ──▶ Your Backend ── Bearer token ──▶ AgentCore
-```
-
-### Testing: The Shortcut
-
-In scripts and notebooks, skip the browser flow:
+Schedule refresh from the token endpoint's `expires_in`; do not treat an unverified decoded JWT as
+authorization. For a rotating Cognito client, the SDK exchange is:
 
 ```python
-# Option 1: call Cognito directly (hardcoded credentials — test environments only)
-auth_resp = cognito.initiate_auth(
-    ClientId=client_id,
-    AuthFlow="USER_PASSWORD_AUTH",
-    AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass123!"},
-)
-bearer_token = auth_resp["AuthenticationResult"]["AccessToken"]
-
-# Option 2: for M2M, just use client credentials (valid in any environment)
-token_resp = requests.post(token_url, data={
-    "grant_type": "client_credentials",
-    "client_id": client_id,
-    "client_secret": client_secret,
-    "scope": "myapi/read",
-})
-bearer_token = token_resp.json()["access_token"]
-
-# Use directly — same JWT format, same validation
-response = requests.get(api_url, headers={"Authorization": f"Bearer {bearer_token}"})
+result = cognito.get_tokens_from_refresh_token(
+    ClientId=user_client_id, RefreshToken=stored_refresh_token,
+)["AuthenticationResult"]
+# Under the session's refresh lock, atomically persist result["RefreshToken"]
+# together with result["AccessToken"] and its expiry metadata.
 ```
 
-The token is the same serialized format either way, but the downstream trust decision remains the
-full contract: signature, issuer, expiry/freshness, `token_use`, app `client_id`, resource `aud` when
-configured, and required scopes. A valid signature alone does not make a token suitable for this API.
+This is a storage-integration excerpt, not a complete session store. The [token lifecycle lesson](tokens.md#refresh-token-rotation-opt-in-since-april-2025)
+owns the config-preserving update, legacy-flow removal, grace window, lost-response behavior, and
+revocation boundary. A public OAuth client can instead refresh at the token endpoint; resource-bound
+refresh retains the original audience. Do not return only the new access token and discard a rotated
+refresh token, or the next refresh will use an invalid predecessor.
 
----
+## Gateway and deployment boundary
 
-## Token Refresh Helper
+API Gateway REST Cognito authorizers and AgentCore Gateway custom JWT authorizers are different
+products with different configuration schemas. Use the [REST authorizer example](tokens.md#api-gateway-integration-skip-manual-validation)
+for REST API Gateway; configure explicit method scopes. For AgentCore, use its own discovery,
+allowed-client and scope policy. Do not copy one product's `customJWTAuthorizer` object to the other.
+The origin may rely on either only when direct bypass is blocked or the gateway-to-origin hop is
+authenticated. Do not forward the incoming bearer to an unrelated downstream audience: acquire a
+credential for that downstream service's policy.
 
-The generic `decode_jwt_payload` / `is_token_expired` / `seconds_until_expiry` utilities live in [auth/jwt.md §Python Utilities](../jwt.md#python-utilities) — use those. The Cognito-specific part is just the refresh call:
+Before release, prove the following in the target environment:
 
-```python
-import boto3
-from fundamentals.auth.jwt_utils import is_token_expired  # the generic helper from jwt.md
+- The real issuer produces the expected profile and the deployed API accepts it, while wrong
+  clients, audiences, scopes and token types fail as in the local fixture.
+- JWKS rotation and outage handling are bounded; origin routing prevents authorizer bypass.
+- Refresh/revocation behavior matches the required cutoff latency and session storage is atomic.
+- Secret rotation, token-cache partitioning, logs and metrics do not expose credentials.
 
+The local tests do not verify AWS provisioning, Managed Login callbacks, live JWKS rotation,
+gateway enforcement or regional failover. Those are explicit deployment rehearsals, not inferred
+from a passing unit test.
 
-def get_valid_access_token(
-    access_token: str,
-    refresh_token: str,
-    client_id: str,
-    region: str = "us-east-1",
-) -> str:
-    """Return a valid access token, refreshing via Cognito if it expires within 5 minutes."""
-    if not is_token_expired(access_token, buffer_seconds=300):
-        return access_token
+## Retention and transfer
 
-    cognito = boto3.client("cognito-idp", region_name=region)
-    resp = cognito.initiate_auth(
-        ClientId=client_id,
-        AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": refresh_token},
-    )
-    return resp["AuthenticationResult"]["AccessToken"]
-```
+**Recap:** begin with an issuance profile, configure the API for that exact profile, and test both
+acceptance and rejection. Machine credentials, OAuth user login, and SDK user login differ even
+when their access tokens all use JWT serialization.
 
-> **By default, Cognito does not rotate refresh tokens** — the same refresh token keeps working until it expires (30 days by default) or is explicitly revoked. Refresh token rotation is an opt-in app-client setting (`RefreshTokenRotation={'Feature': 'ENABLED'}`); each refresh call returns a *new* refresh token while invalidating the old one, with an optional grace period up to 60 seconds for client retries. Rotation requires `GetTokensFromRefreshToken` or the `/oauth2/token` endpoint rather than `REFRESH_TOKEN_AUTH`. Confirm current plan features in AWS documentation instead of assuming a Lite/Essentials/Plus gate that the app-client setting does not document.
+**Check yourself:** the local M2M fixture passes, but real login receives 401 after the issuer was
+migrated to the updated multi-Region format. What should change?
+<details><summary>Answer</summary>Deploy the explicitly trusted new issuer and its JWKS endpoint;
+plan overlap for old unexpired tokens if required. Do not accept arbitrary issuers from tokens or
+turn off issuer checks.</details>
 
----
-
-## Comparison: M2M vs User Auth
-
-| Aspect | M2M (client_credentials) | User Auth |
-|--------|--------------------------|-----------|
-| Who authenticates | Service/script | Human user |
-| Needs client secret | Yes | No (public clients) |
-| Needs Resource Server | Yes (custom scopes) | No (unless you add custom scopes) |
-| Needs User Pool Domain | Yes (token endpoint) | No (`initiate_auth` API) |
-| Tokens returned | AccessToken only | AccessToken + IdToken + RefreshToken |
-| Token `sub` | The client_id | The user's UUID |
-| Refresh | Re-request with client_id + secret | Use RefreshToken |
-| User accounts in pool | Not needed | Yes |
-
----
-
-## Related
-
-- [jwt.md](../jwt.md) — JWT structure, JWKS, validation algorithm, Python code
-- [oauth2.md](../oauth2.md) — OAuth 2.0 grant types, scopes, resource servers
-- [cognito.md](./cognito.md) — Cognito mental model (User Pools vs Identity Pools)
-- [user-pool.md](./user-pool.md) — User pool setup, app clients, auth flows, groups
-- [tokens.md](./tokens.md) — Cognito token claims, IdToken vs AccessToken, revocation
+**Try it:** add a write endpoint requiring `myapi/write`. Predict whether the read token should
+receive 401 or 403, then create a separate policy/test for that operation.
+<details><summary>Answer</summary>403: the existing token is authenticated but lacks write authority.
+Register/allow/request the additional scope only for authorized clients; do not reinterpret read as
+write or bypass the check for an otherwise valid signature.</details>

@@ -1,795 +1,281 @@
-# Part 9: Distributed Admission Control with Redis
+# Part 9: Admit provider attempts across a fleet
 
-<!-- length-justification: This is the canonical distributed-admission implementation; atomic Lua policy, FastAPI integration, reconciliation, operations, and failure policy remain together because they implement one shared decision boundary. -->
+> **Role:** implementation tutorial. Prerequisites: [local bounded admission](03_call_patterns.md), [failure domains](06_advanced_patterns.md), and basic Redis keys and transactions.
+>
+> **Outcome:** run two Redis clients racing for the last permit, wire atomic shared admission into the canonical caller, recover an ambiguous reply without charging twice, and understand the boundary between leased capacity and durable quota.
 
-> **Who this is for**: Engineers enforcing tenant, model, and fleet-wide limits across multiple
-> application processes.
+Four replicas each allow twenty provider requests. That is eighty possible active
+requests, even if the provider account supports only twenty. A process semaphore has
+no view of the other replicas. Shared admission must decide whether an attempt can
+start using one common authority and one atomic decision.
 
-> **Principle**: In a multi-pod system, your application is the brain and Redis is the shared memory. Every cross-pod limit reduces to "name a key, run a small Lua script, branch on the result". Fancy in-process libraries (`AsyncLimiter`, `aiolimiter`) protect a single process — useless when there are N pods.
+The running example is inventory request Q1 from verified tenant Alice. It fails with
+503 once, retries, then succeeds. Q1 is **one logical user operation** and **two provider
+attempts**. Keeping those identities separate prevents both quota bypass and double
+charging of a logical product action.
 
-> **Key insight**: Distributed admission requires one atomic shared decision plus an explicit policy
-> for shared-store failure.
+## 1. State the policy before selecting a data structure
 
-> **Prerequisite**: Read [infrastructure/redis/05_rate_limiting.md](../../../infrastructure/redis/05_rate_limiting.md) for the four core algorithms (fixed window, sliding log, sliding counter, token bucket). This file uses them as building blocks.
+The complete fixture implements these independent limits for one provider account:
 
----
+| Limit | Fixture default | Charged/released when |
+|---|---:|---|
+| Global active attempts | 20 | Acquire at admission; release after response close or expire lease |
+| Active attempts for authenticated user | 4 | Same attempt lifetime, separate user partition |
+| Provider starts in trailing 60 seconds | 100 | Charge once on successful admission; never refund ambiguous starts |
+| Pause flag | `paused=1` | Reject new admission; already-owned work completes under its deadline |
+| Durable user token budget | Separate PostgreSQL ledger | Reserve once for Q1; settle all attempts in Part 10 |
 
-## 1. Why "Redis + if statements" Is the Real Pattern
+A rate limit counts starts over time; concurrency counts current owners. A request can
+satisfy one and fail the other. The fixture conservatively counts an admitted start even
+if cancellation occurs before network dispatch; it never claims the provider definitely
+received that request. This sacrifices a little capacity to avoid refunding uncertain work.
 
-Parts 1–3 distinguish application admission from transport capacity. A local semaphore strictly
-caps attempts in one process, while HTTPX limits connections and the negotiated protocol determines
-how many request streams those connections can carry. Neither produces a fleet-wide promise.
-**Distributed admission control** adds that shared application decision: “should this request even
-start anywhere in the fleet?”
+The script checks the global count, user count, rolling start count and pause flag before
+adding any new lease. A failed check makes no new reservation. The check and mutation
+must be atomic: `GET count`, compare in Python, then `INCR` lets two clients both observe
+the last free slot and both enter.
 
-For that decision, in-process tools are the wrong abstraction:
-
-| Approach | Works across pods? | Flexible? | Debuggable? |
-|----------|-------------------|-----------|-------------|
-| `AsyncLimiter` (in-process) | ❌ Each pod has its own | ❌ Hard-coded windows | ✅ Trivial |
-| Service mesh (Envoy / Istio rate-limit) | ✅ | ⚠️ Limited dimensions | ❌ Opaque |
-| Managed (Upstash, Kong) | ✅ | ⚠️ Vendor-bound | ⚠️ |
-| **Redis + Lua + `if` in your app** | ✅ | ✅ Any dimension | ✅ Just keys |
-
-The "Redis + if" approach wins because:
-
-1. **Every pod sees the same state instantly** — Redis is the single source of truth.
-2. **You can model any dimension as a key** — per-user, per-tier, per-model, per-region, global, provider-side, kill switches. Same pattern, different keys.
-3. **Atomic Lua** lets you check N dimensions in one round-trip, with a single rejection reason.
-4. **Operational levers are first-class** — flipping `global:paused = 1` in Redis pauses all traffic instantly, no deploy.
-
-> **Mental model**: Your backend is the brain. Redis is the shared cerebellum. Every container in every region asks the same Redis the same question and gets the same answer.
-
----
-
-## 2. The Two Layers, Side by Side
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ TRANSPORT LAYER (Parts 1–3)                                 │
-│   - httpx connection limits                                 │
-│   - timeouts (connect/read/write/pool, asyncio.timeout)     │
-│   - in-process semaphore for *this pod's* socket usage      │
-│ Scope: this pod, this process, this socket pool             │
-└─────────────────────────────────────────────────────────────┘
-                              ↑
-                              │ this layer is downstream of admission
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│ ADMISSION CONTROL (this file, Part 9)                       │
-│   - per-user RPM, TPM, daily quotas                         │
-│   - per-tier / per-model fairness                           │
-│   - global vendor protection                                │
-│   - kill switches and overrides                             │
-│ Scope: cluster-wide, shared via Redis                       │
-└─────────────────────────────────────────────────────────────┘
-                              ↑
-                              │
-                  ┌───────────────────────┐
-                  │ Incoming HTTP request │
-                  └───────────────────────┘
+```mermaid
+sequenceDiagram
+  participant A as Replica A
+  participant R as Redis authority
+  participant B as Replica B
+  A->>R: admit Q1 attempt 0
+  B->>R: admit Q2 attempt 0
+  R->>R: prune expired leases; one slot remains
+  R->>R: A: add active lease + user lease + RPM start
+  R-->>A: granted
+  R->>R: B: global active count now at limit
+  R-->>B: denied; no start charged
 ```
 
-Both layers are needed. Admission control decides *whether* a request runs; the transport layer enforces what happens *if* it does. Skipping admission lets a single user starve everyone; skipping transport lets a single pod open infinite sockets and die.
+The actual two-client test asserts exactly one grant. It does not substitute an in-memory
+lock for the Redis race. [advanced_admission.py](examples/advanced_admission.py) contains
+the full script and the asynchronous `FleetAdmission.attempt` context manager.
 
----
+## 2. One atomic script, one server clock, one cluster slot
 
-## 3. The Redis Key Taxonomy
+Three sorted sets store global lease expiries, per-user lease expiries and start times.
+At admission, expired entries are removed using Redis server `TIME`. `ZCARD` after this
+pruning describes live leases. A raw `ZCARD` sampled later without pruning can include
+expired records; dashboards should count scores greater than server time or prune first.
 
-Pick the keys you'll actually use *before* writing code. Use a consistent prefix scheme so debugging is "scan keys by prefix and read the value".
+The script uses Redis 7+ effects replication: server time can drive writes because
+replication transmits the resulting effects. The old blanket rule that a script may not
+write after a nondeterministic command does not describe this baseline. Redis documents
+[effects replication](https://redis.io/docs/latest/develop/programmability/lua-api/)
+and [atomic script execution/cache lifetime](https://redis.io/docs/latest/develop/programmability/eval-intro/).
+Scripts should remain small because execution blocks other server work.
 
-### 3.1 Per-user limits (fairness)
+All script keys share a hash tag derived from the trusted account:
 
-| Key | Purpose | Algorithm |
-|-----|---------|-----------|
-| `user:{id}:rpm:{window}` | Requests per minute | Fixed window or sliding counter |
-| `user:{id}:rph:{window}` | Requests per hour | Fixed window |
-| `user:{id}:rpd:{window}` | Requests per day | Fixed window |
-| `user:{id}:tpm:{window}` | **Tokens** per minute (LLM-specific) | Token bucket or sliding counter |
-| `user:{id}:tpd:{window}` | Tokens per day | Fixed window with refund-on-error |
-| `user:{id}:inflight` | Concurrent in-flight requests | **Sorted set** of `{token → expiry_ts}` (crash-safe; see §5.4) |
-| `user:{id}:cost:{month}` | $ spent this month | Counter, accumulates floats |
-
-### 3.2 Per-tier limits (monetization)
-
-| Key | Purpose |
-|-----|---------|
-| `tier:free:rpm:{window}` | Shared pool for the entire free tier |
-| `tier:pro:rpm:{window}` | Shared pool for pro tier |
-| `tier:enterprise:rpm:{window}` | Shared pool for enterprise |
-
-A tier-wide limit prevents one tier (usually free) from starving paid users when traffic spikes. Almost always combined with per-user limits.
-
-### 3.3 Per-model limits (cost & vendor capacity)
-
-| Key | Purpose |
-|-----|---------|
-| `user:{id}:model:{model}:rpm:{window}` | Limit expensive models per user |
-| `user:{id}:model:{model}:tpd:{window}` | Daily token cap on a specific model |
-| `model:{model}:inflight` | Global concurrency cap for one model |
-| `model:{model}:rpm:{window}` | Global RPM for one model |
-
-A frontier model can cost an order of magnitude more per token than a small/cheap one (exact ratios shift every release — check current pricing). You probably don't want one quota across both — split by model and let users burn through cheap ones freely.
-
-### 3.4 Global / infrastructure limits
-
-| Key | Purpose |
-|-----|---------|
-| `global:inflight` | Total concurrent requests system-wide (your infra cap) |
-| `global:rpm:{window}` | Total request rate (your infra cap) |
-| `global:tpm:{window}` | Total token rate |
-| `provider:{name}:rpm:{window}` | Track against the provider's stated RPM (OpenAI, Anthropic, …) |
-| `provider:{name}:tpm:{window}` | Same, but for TPM (more important for LLMs) |
-| `provider:{name}:inflight` | Concurrent calls to a specific provider |
-
-**Provider keys exist to respect *their* contract**, not to protect your users. They are a property of the upstream relationship.
-
-### 3.5 Control flags (kill switches)
-
-| Key | Purpose |
-|-----|---------|
-| `global:paused` | `"1"` = stop all traffic (provider outage, maintenance) |
-| `user:{id}:banned` | `"1"` = block this user |
-| `model:{model}:paused` | `"1"` = disable a specific model |
-| `tier:free:paused` | `"1"` = pause an entire tier |
-| `feature:{name}:enabled` | Feature flag integrated into admission |
-
-These are not rate limits — they're **boolean state**. Operations team flips them via `redis-cli SET global:paused 1` and traffic stops within milliseconds, no deploy.
-
-### 3.6 Overrides & temporary bursts
-
-| Key | Purpose |
-|-----|---------|
-| `user:{id}:rpm:override` | Boost a user's limit temporarily (TTL = duration) |
-| `user:{id}:bonus_tokens:{day}` | Extra quota (promo, apology credit) |
-| `user:{id}:trial_ends` | Trial expiration timestamp |
-
-Customer-support tooling writes to these. The admission script reads `:override` first; falls back to the tier default if absent.
-
-### 3.7 Observability (read-only — not used for limiting)
-
-| Key | Purpose |
-|-----|---------|
-| `user:{id}:last_request` | Timestamp of last activity |
-| `user:{id}:error_count:{window}` | User-caused errors |
-| `user:{id}:429_count:{day}` | How often they hit the wall (signal for outreach) |
-| `stats:rpm:{window}` | Time-series for dashboards |
-
----
-
-## 4. Recommended Minimum Set
-
-If you're starting fresh, do **not** implement all of section 3 on day one. These six keys cover ~90% of real needs:
-
-```
-1. user:{id}:rpm:{window}          → per-user fairness (requests)
-2. user:{id}:tpd:{window}          → per-user fairness (cost)
-3. user:{id}:inflight              → per-user concurrency
-4. global:inflight                 → infra protection
-5. provider:{name}:rpm:{window}    → respect provider's contract
-6. global:paused                   → emergency kill switch
+```text
+admission:{account-digest}:active
+admission:{account-digest}:user:user-digest
+admission:{account-digest}:rpm
+admission:{account-digest}:attempt:operation-attempt-digest
+admission:{account-digest}:flags
 ```
 
-Add tier, model, and override keys as the product grows. Premature dimension proliferation is a real cost — every key is something you need to monitor, debug, and reason about.
+The braces force one Redis Cluster slot; account/user inputs are hashed so caller text
+cannot inject a new tag. Every accessed key is passed via `KEYS`, rather than constructed
+inside Lua. This conforms to Redis's [cluster multi-key constraints](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/).
+The lab runs standalone Redis. The same-slot layout prepares the script for Cluster,
+but the lab does not test a Cluster rollout, resharding or failover.
 
----
+One hot provider account still occupies one authority shard. Sharding a genuinely global
+limit across unrelated slots without an allocation protocol changes its guarantee. At
+higher scale, allocate conservative per-shard budgets or use a dedicated admission
+service and document its consistency/failure contract.
 
-## 5. The Atomic Admission Controller
+## 3. A lost reply is not a failed mutation
 
-The whole point of doing this in Redis is **one round-trip per request** that checks every dimension and returns a structured rejection reason. Anything else either races or is too slow.
+Suppose Redis commits Q1/attempt0, but the client times out before seeing the reply.
+Retrying with a new UUID can reserve twice and consume two starts. The fixture stores
+an attempt record indexed by `(trusted user, operation_id, attempt_no)` and a separate
+random **owner token** generated once for that context's acquisition/recovery.
 
-### 5.1 The Lua script
+Retrying the admission command uses the same attempt identity and owner token. If the
+stored grant still has enough lease time for the complete hard attempt bound, Redis
+returns `recovered` without changing counters. A different process presenting the same
+attempt identity has a different owner token and is denied: replaying a grant must not
+let two processes both dispatch it. A new owner needs higher-level recovery of the
+operation, not a second execution based only on finding a granted record.
 
-```lua
--- KEYS:
---   1 = global_paused      (string flag)
---   2 = user_banned        (string flag)
---   3 = global_rpm         (counter, windowed)
---   4 = user_rpm           (counter, windowed)
---   5 = user_inflight      (SORTED SET: member=token, score=expiry_ts)
---   6 = provider_rpm       (counter, windowed)
---
--- ARGV:
---   1 = global_rpm_limit
---   2 = user_rpm_limit
---   3 = inflight_limit
---   4 = provider_rpm_limit
---   5 = window_seconds
---   6 = now_ts              (caller's clock, seconds — pass it in; redis.call
---                            ("TIME") is non-deterministic and disallowed in
---                            scripts that also write)
---   7 = inflight_token      (unique per request, e.g. a UUID)
---   8 = inflight_lease_secs (max time a slot may be held before it's reaped)
---
--- Returns: { ok, reason, retry_after_seconds }
---   ok           = 1 if allowed, 0 if denied
---   reason       = string identifier of the limit hit
---   retry_after  = hint for client back-off (TTL on the offending key)
+The release script removes only the matching token and marks the attempt released.
+It also writes a released tombstone when acquisition is uncertain and no record is yet
+visible. That prevents a delayed acquisition command from resurrecting a cancelled
+attempt. An old token never removes a replacement lease's member.
 
-if redis.call("GET", KEYS[1]) == "1" then
-  return {0, "paused", 30}
-end
-if redis.call("GET", KEYS[2]) == "1" then
-  return {0, "banned", 0}
-end
+Records remain for 24 hours in this laboratory. That is the maximum deduplication
+horizon, not durable business identity: do not reuse an attempt identity after retention,
+and do not retry an old operation blindly after a process restart. A long-lived operation
+needs durable state and retention matching its reconciliation horizon. Parts 10 and 11
+own those records.
 
-local window = tonumber(ARGV[5])
+## 4. Lease expiry restores liveness, not remote cancellation
 
-local g = tonumber(redis.call("GET", KEYS[3]) or "0")
-if g >= tonumber(ARGV[1]) then
-  return {0, "global_rpm", redis.call("TTL", KEYS[3])}
-end
+The caller's hard attempt deadline is two seconds; the shared lease lasts five seconds.
+The margin covers transport teardown and event-loop scheduling. Recovery refuses a
+stored grant with less than two seconds remaining. There is no lease renewal in this
+finite-attempt fixture; streaming needs a different owner with a bounded total lifetime
+or carefully supervised renewal and cancellation.
 
-local u = tonumber(redis.call("GET", KEYS[4]) or "0")
-if u >= tonumber(ARGV[2]) then
-  return {0, "user_rpm", redis.call("TTL", KEYS[4])}
-end
+When a process dies, expiry eventually frees capacity. A paused process or a provider
+which continues after client cancellation can still be executing after the lease expires.
+Redis cannot revoke a remote HTTP request. Therefore this is a bound on **valid leased
+application owners**, not a mathematical guarantee that the provider has at most twenty
+physical computations during crashes/network partitions. Strict provider enforcement
+requires a provider-side limit or a fencing/coordinator contract the provider honors.
 
-local p = tonumber(redis.call("GET", KEYS[6]) or "0")
-if p >= tonumber(ARGV[4]) then
-  return {0, "provider_rpm", redis.call("TTL", KEYS[6])}
-end
+The expiry/replacement ordering is independent of whether the original process resumes.
 
--- inflight as a leased sorted set (crash-safe):
---   1. reap expired leases (workers that died holding a slot)
---   2. count live members
---   3. if room, add this token with an expiry score
-local now   = tonumber(ARGV[6])
-local lease = tonumber(ARGV[8])
-redis.call("ZREMRANGEBYSCORE", KEYS[5], "-inf", now)   -- evict dead leases
-local i = redis.call("ZCARD", KEYS[5])
-if i >= tonumber(ARGV[3]) then
-  return {0, "user_inflight", 1}
-end
-
--- Redis executes the script atomically, so after every check passes these
--- increments commit together; a rejection above leaves every counter unchanged.
-local new_g = redis.call("INCR", KEYS[3])
-if new_g == 1 then redis.call("EXPIRE", KEYS[3], window) end
-local new_u = redis.call("INCR", KEYS[4])
-if new_u == 1 then redis.call("EXPIRE", KEYS[4], window) end
-local new_p = redis.call("INCR", KEYS[6])
-if new_p == 1 then redis.call("EXPIRE", KEYS[6], window) end
-redis.call("ZADD", KEYS[5], now + lease, ARGV[7])
--- Safety net: if every member somehow leaves, the key still self-expires.
-redis.call("EXPIRE", KEYS[5], lease + window)
-
-return {1, "ok", 0}
+```mermaid
+sequenceDiagram
+  participant A as Owner A token A
+  participant R as Redis authority
+  participant B as Owner B token B
+  A->>R: reserve token A, expires at 120
+  Note over A,R: A disappears; remote work may continue
+  B->>R: at 121 prune expired A; reserve token B
+  A->>R: late release token A
+  R-->>A: token B remains owned by B
 ```
 
-**Why this order matters:**
-- Flags first — cheapest checks, no `INCR` needed.
-- Counters in increasing scope — global before user before inflight — so a global outage rejects fast and doesn't pollute per-user counters with rejected requests.
-- `inflight` last because it's the only stateful slot that must survive a crash.
+Reclamation restores available accounting while unique token removal protects the new owner.
 
-**Why a sorted set, not `INCR`/`DECR` (the bug most tutorials ship):**
-A plain `INCR` on entry and `DECR` in a `finally` looks fine until a pod is OOM-killed, the node reboots, or the process is `SIGKILL`ed mid-request. The `finally` never runs, the counter is never decremented, and that phantom slot is held **forever** — the user's effective concurrency limit silently ratchets down to zero. There is no TTL to save you because a bare counter has no per-request granularity to expire.
+Late release is safe because members are unique tokens. If A expires and B enters,
+A's `ZREM token-A` cannot remove token-B. The fixture tests that state explicitly. A
+negative counter implementation with generic `DECR` would not have the same property.
 
-The leased sorted set fixes this: each admitted request gets a unique `token` scored with an **expiry timestamp** (`now + lease`). Every admission first calls `ZREMRANGEBYSCORE … -inf now`, which reaps any token whose lease has elapsed. A worker that dies holding a slot is automatically reclaimed the next time *anyone* checks that user — no separate reaper process required. Set `lease` comfortably above your call timeout (e.g. request timeout + retry budget) so live requests are never evicted out from under themselves.
+## 5. Wire admission into the accepted caller
 
-### 5.2 The Python wrapper
-
-```python
-import time
-import uuid
-import redis.asyncio as redis
-from dataclasses import dataclass
-from typing import Optional
-
-ADMISSION_LUA = """<script from 5.1>"""
-
-
-@dataclass
-class AdmissionResult:
-    ok: bool
-    reason: str
-    retry_after: int  # seconds; 0 = no hint
-    token: Optional[str] = None  # inflight lease token; pass to release_inflight()
-
-
-class AdmissionController:
-    """
-    One Redis round-trip per request. Atomic across all checked dimensions.
-    """
-
-    def __init__(
-        self,
-        r: redis.Redis,
-        provider: str = "openai",
-        inflight_lease_seconds: int = 120,
-    ):
-        self.r = r
-        self.provider = provider
-        # Lease must exceed the worst-case time a slot is held (call timeout +
-        # retries). Too short → live requests get reaped; too long → a crashed
-        # worker's slot lingers for `lease` seconds before reclamation.
-        self.inflight_lease_seconds = inflight_lease_seconds
-        self._sha: Optional[str] = None
-
-    async def _ensure_loaded(self) -> str:
-        if self._sha is None:
-            self._sha = await self.r.script_load(ADMISSION_LUA)
-        return self._sha
-
-    async def check(
-        self,
-        user_id: str,
-        global_rpm_limit: int,
-        user_rpm_limit: int,
-        inflight_limit: int,
-        provider_rpm_limit: int,
-        window_seconds: int = 60,
-    ) -> AdmissionResult:
-        now = time.time()
-        window = int(now // window_seconds)
-        token = uuid.uuid4().hex
-        sha = await self._ensure_loaded()
-
-        result = await self.r.evalsha(
-            sha,
-            6,
-            "global:paused",
-            f"user:{user_id}:banned",
-            f"global:rpm:{window}",
-            f"user:{user_id}:rpm:{window}",
-            f"user:{user_id}:inflight",
-            f"provider:{self.provider}:rpm:{window}",
-            global_rpm_limit,
-            user_rpm_limit,
-            inflight_limit,
-            provider_rpm_limit,
-            window_seconds,
-            now,                          # ARGV[6] now_ts
-            token,                        # ARGV[7] inflight_token
-            self.inflight_lease_seconds,  # ARGV[8] inflight_lease_secs
-        )
-        ok, reason, retry_after = result
-        ok = bool(ok)
-        return AdmissionResult(
-            ok=ok,
-            reason=reason.decode() if isinstance(reason, bytes) else reason,
-            retry_after=int(retry_after),
-            token=token if ok else None,
-        )
-
-    async def release_inflight(self, user_id: str, token: str) -> None:
-        """
-        Always call in a `finally` block after the request completes.
-        Idempotent: ZREM of an already-reaped token is a harmless no-op, so a
-        late release after the lease expired can't double-free someone else's
-        slot. Crash safety does not depend on this call running — the lease
-        does — but releasing promptly frees the slot before the lease elapses.
-        """
-        await self.r.zrem(f"user:{user_id}:inflight", token)
-```
-
-### 5.3 The FastAPI endpoint
-
-```python
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, Response
-
-admission: AdmissionController = None  # initialized at startup
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global admission
-    r = redis.from_url("redis://redis:6379", decode_responses=False)
-    admission = AdmissionController(r, provider="openai")
-    yield
-    await r.aclose()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-@asynccontextmanager
-async def reserve_admission(user_id: str, limits: dict):
-    """
-    Context manager: reserve a slot, guarantee release.
-    """
-    result = await admission.check(user_id=user_id, **limits)
-    if not result.ok:
-        raise HTTPException(
-            status_code=429,
-            detail={"reason": result.reason},
-            headers={"Retry-After": str(result.retry_after)},
-        )
-    try:
-        yield
-    finally:
-        # Release this request's lease token. If the worker dies before this
-        # runs, the lease expires and the slot is reclaimed automatically.
-        await admission.release_inflight(user_id, result.token)
-
-
-@app.post("/chat")
-async def chat(request: ChatRequest, user=Depends(auth)):
-    limits = await load_limits_for(user)  # tier-based, often cached locally
-
-    async with reserve_admission(user.id, limits):
-        # Inside this block: this request is *admitted*.
-        # Now do the actual transport-layer work (Parts 1–3).
-        return await call_llm(request)
-```
-
-That's it. No `AsyncLimiter`. No service mesh. Six keys, one Lua script, one context manager.
-
-### 5.4 Why `inflight` is leased, not a plain counter
-
-The concurrency slot is the one piece of admission state that **outlives the Redis call** — it's held for the whole request, then released. That makes it the only dimension that can leak.
-
-The tempting implementation is `INCR` on admit, `DECR` in a `finally`:
-
-```python
-# ❌ BROKEN under crashes — do not ship this
-await r.incr(f"user:{user_id}:inflight")
-try:
-    ...
-finally:
-    await r.decr(f"user:{user_id}:inflight")   # never runs if the pod is killed
-```
-
-It passes every test on your laptop and leaks in production. When a pod is OOM-killed, evicted, or `SIGKILL`ed mid-request, the `finally` never executes. The counter is stuck one too high *forever* — there is no TTL that can help, because a single integer has no per-request granularity to expire. After enough crashes the user's `inflight` count reaches its limit and they are permanently rejected with `user_inflight`, even with zero real traffic. Debugging it means manually `DECR`-ing a number nobody can explain.
-
-The fix (used in §5.1) is a **leased sorted set**: one member per in-flight request, scored with an expiry timestamp.
-
-- **Admit**: `ZREMRANGEBYSCORE key -inf now` (reap dead leases) → `ZCARD` (count live) → `ZADD key now+lease token`.
-- **Release**: `ZREM key token` — idempotent; a no-op if the lease already expired.
-- **Crash safety**: a dead worker's token simply ages past `now` and is reaped by the *next* admission check for that user. No reaper process, no DECR archaeology. The lease, not the `finally`, is what guarantees the slot comes back.
-
-Choose `lease` ≥ (call timeout + retry budget) so a slow-but-alive request is never evicted out from under itself, but small enough that a crashed slot returns quickly. This is the same crash-safe pattern as a distributed lock with a TTL — concurrency limiting *is* a counting lock.
-
----
-
-## 6. Retries and Quota Accounting (Critical)
-
-This is the part most tutorials skip. Naively retrying inside the admission envelope causes either **double-counting** or **wrong quota state** — and the bug is silent until your largest customer's quota randomly says they're over when they're not.
-
-### 6.1 Two perspectives on "1 request"
-
-When an LLM call fails and retries:
-
-```
-User pressed "send" once
-  ↓
-Your backend tries: attempt 1 → 500 from provider
-                    attempt 2 → success
-```
-
-From two perspectives, this is two different things:
-
-| Perspective | What counts as one event |
-|-------------|--------------------------|
-| **The user's quota** | 1 request (they asked once) |
-| **The provider's quota** | 2 requests (you called the API twice) |
-
-If you increment `user:{id}:rpm` once per attempt, you're punishing the user for *your* retry policy. If you increment `provider:openai:rpm` only once, you'll silently exceed the provider's rate limit.
-
-**Conclusion**: user-side and provider-side counters are different keys, incremented at different points.
-
-### 6.2 The Reserve → Retry → Reconcile pattern
-
-For LLM token quotas this becomes especially tricky because:
-
-- You only know the *real* token cost **after** the response.
-- You must *estimate* it up front to admit the request.
-- A retry might consume tokens on the failed attempt (some providers bill for partial output before timing out).
-
-The pattern:
-
-```
-1. RESERVE  — debit estimated cost up front
-              (under one user quota, in the admission script)
-2. RETRY    — internal retries against the provider
-              (each attempt: increment provider:rpm/tpm)
-3. RECONCILE — once per logical request (success OR final failure):
-              compute (estimated - actual) and refund/charge the difference
-              against the user quota
-```
-
-Code:
-
-```python
-@app.post("/chat")
-async def chat(request: ChatRequest, user=Depends(auth)):
-    limits = await load_limits_for(user)
-    estimated_tokens = estimate(request)  # e.g. max_tokens or model-based heuristic
-
-    # 1. ADMIT (request-count and inflight checked atomically)
-    async with reserve_admission(user.id, limits):
-
-        # 2. RESERVE the estimated tokens upfront so concurrent
-        #    requests see the commitment. This is a separate INCRBY.
-        await redis.incrby(f"user:{user.id}:tpd:{today()}", estimated_tokens)
-        actual_tokens = 0
-        succeeded = False
-
-        try:
-            # 3. RETRY internally. Each attempt is one provider call —
-            #    increment provider counter per attempt, NOT per logical request.
-            response = await call_llm_with_retry(
-                request,
-                on_attempt=lambda: redis.incr(f"provider:openai:rpm:{window()}"),
-            )
-            actual_tokens = response.usage.total_tokens
-            succeeded = True
-            return response
-
-        finally:
-            # 4. RECONCILE — exactly once.
-            # If we reserved more than used, refund the difference.
-            # If less (rare — estimate too low), we already charged the right keys.
-            # If usage is unknown after failure, keep the reservation: the provider
-            # may already have billed tokens before the response was lost.
-            if not succeeded:
-                await record_unknown_usage(user.id, estimated_tokens)
-            else:
-                diff = estimated_tokens - actual_tokens
-                if diff != 0:
-                    await redis.decrby(f"user:{user.id}:tpd:{today()}", diff)
-```
-
-### 6.3 Common mistakes
-
-❌ **Incrementing user RPM inside the retry loop**
-→ User's "1 request" charged 3× because of *your* retries. Confusing 429 errors.
-
-❌ **Decrementing inflight before retries are done**
-→ Another concurrent request slips into the slot. The user's effective concurrency is higher than configured.
-
-❌ **Updating actual token count on each attempt**
-→ Each retry double-deducts from the daily quota.
-
-❌ **Not refunding on terminal failure**
-→ A user's quota is consumed even though they got a 500 back. Will eventually mean their daily budget shows used = 800 when actual successful tokens = 200.
-
-❌ **Estimating tokens as zero ("we'll just deduct after")**
-→ Concurrent requests all see the user under quota, all get admitted, all consume the response budget at once. The user's daily limit is exceeded by N×.
-
-### 6.4 What about "the failed attempt did consume tokens"?
-
-Some LLM providers return usage data even on errors (e.g. you got partial output before a network timeout). If you can detect this, charge it on the way out:
-
-```python
-try:
-    response = await call_llm(request)
-except LLMError as e:
-    # Some providers attach usage to errors
-    if hasattr(e, "usage") and e.usage:
-        # Charge the partial cost — separate from the reservation
-        await redis.incrby(
-            f"user:{user.id}:tpd:{today()}",
-            e.usage.total_tokens,
-        )
-    raise
-```
-
-This goes *inside* the per-attempt loop, *outside* the reservation logic. The reservation is your "expected ceiling"; this is "actual partial cost incurred even though we failed".
-
-### 6.5 The mental model
-
-> **User-side quota = 1 reservation per logical request, reconciled exactly once.**
-> **Provider-side quota = 1 increment per network attempt.**
-> **Inflight slot = held for the entire reservation, including retries.**
-
-The three counters move on different schedules. Conflating them is the source of every "why does this user's quota look weird" Slack thread.
-
----
-
-## 7. Returning Useful 429 Responses
-
-A bare `HTTPException(429)` is hostile. Clients have no idea when to retry, what they hit, or whether to back off exponentially.
-
-```python
-async with reserve_admission(user.id, limits) as admission:
-    ...
-
-# Inside reserve_admission, on rejection:
-raise HTTPException(
-    status_code=429,
-    detail={
-        "error": "rate_limit_exceeded",
-        "reason": result.reason,         # "user_rpm" / "provider_rpm" / etc.
-        "retry_after_seconds": result.retry_after,
-    },
-    headers={
-        "Retry-After": str(result.retry_after),
-        "X-RateLimit-Reason": result.reason,
-        "X-RateLimit-Reset": str(int(time.time()) + result.retry_after),
-    },
-)
-```
-
-`Retry-After` is a [standard HTTP header](https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3). Real client SDKs (OpenAI's, Anthropic's, requests-with-tenacity) respect it automatically. Returning it for free turns a hostile 429 into a polite back-off signal.
-
----
-
-## 8. Server-Side Retries vs Client-Side Back-off
-
-Two completely different retry scenarios. Don't conflate them.
-
-### 8.1 Server-side retry — *transient provider failure*
-
-Your backend retries an LLM call after a 500 or timeout. The user knows nothing.
-
-Use `tenacity`:
-
-```python
-from tenacity import (
-    retry, stop_after_attempt, wait_exponential, retry_if_exception_type,
-)
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type((TimeoutError, httpx.ConnectError)),
-)
-async def call_llm_with_retry(request):
-    return await call_llm(request)
-```
-
-**Critical**: this happens *inside* the admission reservation (section 6). The user's inflight slot is held for the whole envelope. Don't release and re-acquire — another request will slip in.
-
-### 8.2 Client-side back-off — *user is over their quota*
-
-You returned a 429 with `Retry-After: 30`. The client (or its SDK) waits, then retries. Nothing for your backend to do — set the header correctly and move on.
-
-### 8.3 Queue-and-retry — *hide 429s from users*
-
-Sometimes you want to make rejection invisible: instead of 429, accept the request and process asynchronously when capacity exists.
-
-```python
-async with reserve_admission(user.id, limits, on_reject="queue") as r:
-    if r.queued:
-        await sqs.send_message(
-            QueueUrl=queue,
-            MessageBody=json.dumps(request.dict()),
-            DelaySeconds=min(r.retry_after, 900),  # SQS max delay
-        )
-        return {"status": "queued", "job_id": job_id}
-    # else: admitted, process synchronously
-    return await call_llm(request)
-```
-
-A worker pool polls SQS, runs the same admission check, processes if allowed, re-queues with delay if not. This is the **admission control loop** at scale. Use it when:
-- Your users tolerate eventual completion (batch jobs, agents, background work)
-- You want amortized fairness over time, not strict real-time rejection
-- You can afford the operational complexity of an async pipeline
-
-Don't use it for synchronous user-facing chat. The user is sitting there waiting.
-
----
-
-## 9. Operational Levers
-
-These are the moments you'll be glad everything is in Redis.
-
-### 9.1 Pause everything
+Run the complete integration, including its fake 503 then 200 provider:
 
 ```bash
-redis-cli SET global:paused 1
-# ... do whatever needs doing ...
-redis-cli DEL global:paused
+cd examples
+python3.14 -m venv .venv
+.venv/bin/pip install -r advanced_requirements.txt
+docker compose -p advanced-notes-repair -f advanced_compose.yaml up -d --wait
+.venv/bin/python advanced_admission_demo.py
+.venv/bin/python -m pytest -q advanced_test_redis.py
 ```
 
-Every pod's next admission check returns `paused`. No deploy, no restart.
-
-### 9.2 Ban a user
-
-```bash
-redis-cli SET user:abc123:banned 1
-```
-
-### 9.3 Boost a user temporarily
-
-```bash
-# 1000 RPM for the next hour (replaces tier default for this user)
-redis-cli SET user:abc123:rpm:override 1000 EX 3600
-```
-
-In your admission script, check `:override` first, fall back to tier default. Customer success can issue these directly.
-
-### 9.4 Disable a model
-
-```bash
-redis-cli SET model:gpt-4-turbo:paused 1
-```
-
-Useful when a specific model is having issues but others are fine.
-
-### 9.5 Inspect a user's current state
-
-```bash
-redis-cli --scan --pattern "user:abc123:*" --count 100
-redis-cli MGET user:abc123:rpm:27891240 user:abc123:tpd:20260417
-# inflight is a sorted set, not a string — inspect it with ZCARD / ZRANGE:
-redis-cli ZCARD user:abc123:inflight                       # live slot count
-redis-cli ZRANGE user:abc123:inflight 0 -1 WITHSCORES      # tokens + expiry_ts
-```
-
-`SCAN` is cursor-based and avoids the single O(N) blocking operation performed by `KEYS`. For a
-high-volume system, maintain an explicit per-user index of diagnostic keys so operators do not
-need a keyspace scan at all. Compare that with an in-process `AsyncLimiter`, whose state exists
-only inside one Python process.
-
----
-
-## 10. Where AsyncLimiter Still Has a Role
-
-This whole file argues against in-process libraries for **distributed admission**. They are still useful for:
-
-- **Local burst smoothing** within a single pod, when you don't have Redis (e.g. unit tests, scripts)
-- **Calling APIs from a CLI tool** where there's only one process
-- **Smoothing internal tasks** that don't need cluster-wide coordination
-
-If your service runs as more than one process, in-process limiters cannot enforce vendor or per-user limits. Use them as a *third* line of defence behind Redis admission, not as the primary control.
+Expected demo output includes `provider_attempts=2`, `rpm_entries=2`, `active=0` and
+`{'ok': True}`. [The full executable](examples/advanced_admission_demo.py) supplies
+finite Redis connect/socket timeouts, disables hidden client retry loops, and constructs:
 
 ```python
-# Belt and braces: Redis is authoritative, AsyncLimiter smooths within this pod
-async with reserve_admission(user_id, limits):
-    async with local_burst_smoother:  # AsyncLimiter, optional
-        return await call_llm(request)
+# Excerpt; redis/client lifespan and imports are supplied in advanced_admission_demo.py.
+fleet = FleetAdmission(redis, account='provider-account', user='verified-tenant',
+                       attempt_ms=2000, lease_ms=5000)
+caller = BoundedCaller(client, attempt_timeout=2,
+                       attempt_admission=fleet.attempt)
+result = await caller.request_json('GET', '/inventory',
+                                  operation_id='inventory-q1', max_attempts=2)
 ```
 
----
+The core enters local/shared admission under its admission deadline, then exits that
+timer before provider execution. The external context remains owned through response
+close. Rejection raises `AdmissionTimeout`, which the core does not retry. A retryable
+provider failure enters the hook again with the same operation ID and a new attempt
+number. Do not add a second retry wrapper around the caller or invent an `on_reject`
+argument: it would obscure attempt counts and total deadlines.
 
-## 11. Where API Gateway Helps (and Where It Doesn't)
+The fixture recovers one ambiguous Redis command with the same identity, then fails
+closed. Its `finally` attempts release even if cancellation happened before `yield`.
+Finite Redis socket timeouts bound cleanup; if Redis remains unavailable, the lease
+expires and the host must emit a cleanup-failure metric. User quota is not refunded.
 
-API Gateway native throttling (AWS API Gateway, Cloudflare, Kong, …) sits in front of your pods. It's perfect for:
+## 6. Outage, cache loss and operator controls
 
-| Use case | Why gateway is right |
-|----------|----------------------|
-| Raw flood / DDoS protection | Rejects before traffic hits your pods |
-| Per-IP request count | No app context needed |
-| Total RPS ceiling for the cluster | Single coarse number |
-| Per-API-key limits | Most gateways do this natively |
+`register_script` reloads on `NOSCRIPT`; the test flushes the script cache and then
+releases a lease. A cache miss is recoverable deployment state, not evidence that the
+underlying reservation disappeared. An unavailable Redis connection instead prevents
+provider dispatch. The outage test points at an unavailable local port and asserts zero
+provider calls and zero local active owners.
 
-Where it's not enough:
+A pause is real policy: operators set `paused=1` in the account's flags hash, and the
+admission script reads it before granting. Protect this mutation with an operational
+identity; end users must not select the account key or change its limits. Expose a
+controlled pause/resume command in your deployment tooling and audit the change.
 
-| Use case | Why gateway can't do it |
-|----------|------------------------|
-| Per-**user** limits when users share an API key (your frontend → your backend) | Gateway doesn't know the user |
-| Token-based quotas | Token cost is in the response body — gateway never sees it |
-| Tier-based limits with DB lookups | Gateway shouldn't talk to your DB |
-| Reconciliation after retries | Stateful, app-level concern |
+Redis asynchronous replication/failover can lose acknowledged writes. If admission state
+is lost, the replacement authority can admit work while previous owners still run. The
+lab does not promise a strict cap through that event. For an operation requiring stronger
+safety, pause admission externally on authority replacement, wait the maximum old lease/
+attempt horizon before resuming, or use a store/coordinator with the required consistency.
+Durable financial quotas belong in a durable transaction boundary, not in an evictable
+Redis counter. Never treat fail-open as a free availability improvement: specify a
+conservative fallback allocation or reject.
 
-### Pattern: Lambda Authorizer + Redis at the edge
+## 7. Observe the decisions and retain the obligation
 
-If you're on AWS API Gateway and want **per-user request count limits** rejected before traffic hits your container fleet:
+Measure grants/denials by bounded reason, admission latency, Redis errors, recovered
+ambiguous replies, release failures, live leases, expired leases pruned and RPM starts.
+Alert on active leases near capacity and on a rising gap between admissions and actual
+provider sends. A high gap may indicate cancellations or dispatch failures; it does not
+automatically justify refunding uncertain starts.
 
-```
-Request
-  → API Gateway (native throttle: total cluster RPS / DDoS)
-    → Lambda Authorizer (user_id from JWT, INCR Redis key, allow/deny)
-      → ECS / Lambda container (admission control + token quotas + LLM call)
-```
+For production, verify:
 
-The Lambda Authorizer does **only** request-count limiting (cheap, no response context). Token quotas, reconciliation, and inflight tracking still live in your app because they need post-response data.
+- Every script key is in one intended slot and every application replica uses the same
+  account partition and policy version.
+- Logical operation IDs survive retries; owner tokens survive only one context's command
+  recovery. Competing owners cannot both reuse a grant.
+- Attempt deadlines fit within leases with measured cleanup margin; response close
+  precedes release; failed cleanup is observable.
+- Operator pause, missing script, unavailable Redis, stale release and ambiguous reply
+  each have an exercised recovery path. Failover limitations are accepted explicitly.
+- Durable quota windows and unresolved usage remain in Part 10's ledger; local date/time
+  at completion never selects a replacement quota bucket.
 
-Set `authorizer_result_ttl_in_seconds = 0` so each request gets a fresh check — caching defeats the point.
+If starts spike during Redis latency, inspect command retry identity before increasing
+RPM. If concurrency appears permanently high, distinguish expired stored members from
+live owners. If a midnight completion changes today's budget, fix reservation identity
+and original-window settlement rather than adding more Redis counters.
 
----
+## Recap
 
-## 12. Summary
+Fleet admission atomically decides one provider attempt using shared policy and server
+time. Stable attempt identity plus an owner token recovers ambiguous replies without
+duplicate dispatch. Leases restore liveness; durable user quota and external effects
+require their own persistent contracts.
 
-| Concern | Mechanism | Where |
-|---------|-----------|-------|
-| Raw flood / DDoS | Gateway native throttle | Edge |
-| Per-IP limits | Gateway native throttle | Edge |
-| Per-user request count | Redis (sliding counter) + Lambda Authorizer or app | Edge or app |
-| Per-user token quota | Redis (reservation + reconciliation) | App |
-| Per-user concurrency | Redis (`inflight` leased sorted set — crash-safe) | App |
-| Tier / model fairness | Redis (per-tier, per-model keys) | App |
-| Provider rate-limit compliance | Redis (`provider:*` counters, per attempt) | App |
-| Kill switches / overrides | Redis flags | App, settable from CLI |
-| Pod-level transport limits | `httpx` connection pool, semaphore | App (per-pod) |
+## Check yourself
 
-### The two sentences
+<details><summary>Redis committed admission but the reply was lost. Is a new UUID harmless?</summary>
+No. It can charge another start and reserve another slot. Recover the same attempt and
+owner record, require sufficient lease time, and deny a different owner from dispatching
+the same granted attempt.
+</details>
 
-> **Use Redis + Lua + `if` statements as your distributed admission controller.** Reserve quota up front, reconcile once at the end; user counters move per logical request, provider counters move per network attempt; flags in Redis are your runtime levers.
+<details><summary>Q1 retries once. How many user reservations and provider starts are there?</summary>
+One logical user reservation covers Q1's full enforced attempt budget. Two admitted
+provider attempts consume two provider starts and each owns/relinquishes a concurrency
+lease. Settlement uses Q1's original durable quota window.
+</details>
 
----
+## Try it
 
-**Next**: [Part 10: LLM Token Economics](10_llm_token_economics.md) — deep dive on the reserve/reconcile pattern for LLM-specific token quotas, including estimation strategies and partial-token error handling.
+Set global capacity to two and per-user capacity to one. Race two Alice operations and
+one Bob operation through independent clients. Predict which constraint can reject each
+request, then assert no partial reservation remains on denial. Next lose the successful
+admission reply, repeat with the same owner, and verify the RPM set grows by exactly one.
+
+Scaffold: create Alice and Bob `FleetAdmission` objects with the same account,
+`global_limit=2`, `user_limit=1`, and different trusted user IDs. Race two Alice
+acquisitions and one Bob acquisition; fill in the expected total grants and user-denial count.
+
+Hint: Redis serializes the whole check-and-add. Alice cannot hold two permits even when
+the account still has room.
+
+<details><summary>Reasoned solution</summary>
+Two grants are possible: one Alice and one Bob. The other Alice call is rejected by user
+concurrency or global concurrency depending on script ordering, with no partial lease or
+RPM charge. Replaying a successful admission with its same owner returns recovered and
+adds zero RPM entries; a new owner cannot dispatch that same attempt.
+</details>
+
+**Next:** [Durable token economics](10_llm_token_economics.md). **Back:** [learning map](README.md).

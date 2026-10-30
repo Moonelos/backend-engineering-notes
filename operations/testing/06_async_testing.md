@@ -95,16 +95,62 @@ async def engine():
     await engine.dispose()
 ```
 
-Use this when an async fixture (DB engine, test container) must survive across tests. Keep ordinary per-test clients and DB sessions function-scoped. If most async fixtures in the suite really should share a session loop, `asyncio_default_fixture_loop_scope = "session"` is also available in `pyproject.toml`, but make that an intentional suite-wide choice. See [08 — Database Testing](08_database_testing.md) for concrete patterns.
+Cache lifetime and loop ownership are separate. A session-cached engine may contain asyncpg
+connections created on its session loop. Function-cached sessions can share that loop, but cannot
+use those connections from new function loops. Align *every dependent fixture and test*:
+
+```python
+import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+@pytest_asyncio.fixture(scope="function", loop_scope="session")
+async def db_session(engine):
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        factory = async_sessionmaker(bind=connection, join_transaction_mode="create_savepoint")
+        try:
+            async with factory() as session:
+                yield session
+        finally:
+            await transaction.rollback()
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_query(db_session):
+    from sqlalchemy import text
+    assert await db_session.scalar(text("SELECT 1")) == 1
+```
+
+Any async client or application lifespan fixture that uses this session also declares
+`loop_scope="session"`. The session object is new per test, so its mutable state resets; the loop
+remains the engine's owner. Alternatively create and dispose the engine within each function loop,
+or deliberately use SQLAlchemy `NullPool` where no connection crosses loops. A wider fixture cache
+by itself does not solve loop affinity. [SQLAlchemy multiple loops](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-multiple-asyncio-event-loops), checked 2026-10-30.
 
 ---
+
+These two lifetimes are intentionally different:
+
+```mermaid
+flowchart TD
+    L[One session event loop] --> E[Session-cached engine and pool]
+    L --> A[Function-cached session for test A]
+    L --> B[Function-cached session for test B]
+    A --> E
+    B --> E
+    A --> RA[Rollback and close after A]
+    B --> RB[Rollback and close after B]
+```
+
+A and B get different sessions and transactions, while both borrow connections on the engine's
+loop. Fixture reuse and loop reuse solve different problems and should be configured separately.
 
 ## Common Pitfall: Mixing Sync and Async
 
 ```python
 # ❌ Wrong — sync test calling async fixture
-def test_something(client):  # client is a coroutine, not a client
-    response = client.get("/users")  # TypeError
+def test_something(client):  # client is an AsyncClient whose methods must be awaited
+    response = client.get("/users")  # coroutine object; no request executed
 
 # ✅ Correct — async test with async fixture
 async def test_something(client):
@@ -123,7 +169,7 @@ async def test_async_endpoint():
     assert result == expected
 ```
 
-> **Symptom to watch for:** your test passes but you see a `RuntimeWarning: coroutine ... was never awaited` in pytest output. That warning means the test body never actually ran — it created a coroutine and threw it away. Treat any `coroutine was never awaited` warning as a test bug.
+> **Symptom to watch for:** your test passes but you see a `RuntimeWarning: coroutine ... was never awaited` in pytest output. In the sync example above the test body *did* run: it created an application coroutine without awaiting it, so that coroutine’s body did not run. Find the unawaited call; the warning alone does not prove pytest skipped the test. Treat any `coroutine was never awaited` warning as a test bug.
 
 ---
 
@@ -215,3 +261,35 @@ Re-run with `pytest-randomly` using several seeds to see if order matters. If so
 ## Next
 
 - [07 — Fixtures](07_fixtures.md) — shared state across tests, factory patterns, scope selection.
+
+## Recap and retrieval
+
+- Calling async code creates a coroutine; awaiting it executes its body.
+- Fixture cache lifetime and event-loop ownership are independent choices.
+- A pooled connection must stay on its creating loop, and spawned tasks must be awaited or cancelled and joined.
+
+**A session engine warms an asyncpg pool, then a function-loop test borrows it. Is session caching sufficient?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Run dependent tests and fixtures on the session loop, or create/dispose an engine per function loop. Cache scope does not transfer connection ownership.
+
+</details>
+
+**An unawaited-coroutine warning appears in a sync test. Did the test body run?**
+
+<details><summary>Reasoned answer</summary>
+
+It may have run and created the unexecuted application coroutine. Diagnose the specific call rather than assuming pytest skipped the test.
+
+</details>
+
+**Try it:** Keep a session-cached engine but create a new session per test. Fill in fixture and test loop scopes.
+
+Hint: Object lifetime and loop lifetime are distinct.
+
+<details><summary>Worked solution</summary>
+
+Use function cache plus session loop for the session/client fixtures, session cache plus session loop for the engine, and session-loop marks for dependent tests.
+
+</details>

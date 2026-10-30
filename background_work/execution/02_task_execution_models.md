@@ -252,13 +252,14 @@ async def main() -> None:
         timeout=timeout,
         transport=transport,
     ) as client:
-        consumers = [
-            asyncio.create_task(worker(queue, client))
-            for _ in range(PER_POD_CONCURRENCY)
-        ]
-        await produce(queue, count=1_000)
-        await queue.join()
-        counts = await asyncio.gather(*consumers)
+        async with asyncio.TaskGroup() as group:
+            consumers = [
+                group.create_task(worker(queue, client))
+                for _ in range(PER_POD_CONCURRENCY)
+            ]
+            group.create_task(produce(queue, count=1_000))
+        # All workers consumed their sentinels before normal group exit.
+        counts = [task.result() for task in consumers]
 
     assert sum(counts) == 1_000
     print("processed", sum(counts))
@@ -268,7 +269,19 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-At most 40 requests and 80 waiting payloads exist locally. The program prints `processed 1000`; if a sentinel is omitted or `task_done()` is skipped, `queue.join()` hangs, which is the failure signal.
+At most 40 requests and 80 waiting payloads exist locally. The program prints `processed 1000`. `TaskGroup` supervises both producer and consumers: if one HTTP call raises, it cancels siblings and the producer blocked on `put`, waits for their cleanup, and raises an `ExceptionGroup`. Independent `create_task` workers would otherwise die while the producer remained blocked on a full queue. The `finally` block balances every successful `get`, including sentinels.
+
+The buffer limits waiting payloads while fixed workers limit active calls. Neither limit grows with the input length.
+
+```mermaid
+flowchart LR
+    P[Producer: 1000 IDs] -->|await put| Q[Queue: at most 80 waiting]
+    Q --> W[40 supervised workers]
+    W -->|at most 40 calls| H[HTTP provider]
+    H -->|failure| T[TaskGroup cancels siblings and producer]
+```
+
+Change `mock_provider` to return `httpx.Response(503)` for item `7`. Run the program with an outer five-second test deadline: it must raise `ExceptionGroup` promptly and leave no producer or worker tasks alive. A missing sentinel still prevents normal completion; supervision propagates failures but cannot infer an omitted termination signal.
 
 `PER_POD_CONCURRENCY=40` is local. Ten pods can create 400 requests. A provider limit of 100 concurrent requests therefore needs a distributed limiter, partitioned token bucket, queue-level dispatch limit, or conservative per-pod budget tied to maximum replicas.
 
@@ -352,5 +365,28 @@ Overlap policy belongs in the job contract: skip, coalesce, serialize, or permit
 The framework-neutral contract—including timezones, DST, misfires, catch-up, and one durable firing across replicas—is in [Scheduling and Periodic Work](03_scheduling_and_periodic_work.md). Use APScheduler for timing inside a controlled scheduler process; use Celery Beat or a platform scheduler when already operating that ecosystem; use durable timers in the workflow engine when the timer is part of workflow state.
 
 ---
+
+## Recap and check yourself
+
+- Execution pools match blocking, CPU and I/O behavior rather than queue brand.
+- A bounded input queue and fixed workers cap waiting payloads and active requests separately.
+- TaskGroup propagates worker failure to the producer; local capacity still multiplies by replicas.
+
+**Ten pods allow 40 calls each while the provider permits 100. Is every pod being locally correct enough?**
+
+<details><summary>Answer</summary>
+
+No. The total can reach 400. Use shared admission or per-pod budgets tied to maximum replicas, and verify global concurrency and queue age.
+
+</details>
+
+**One consumer raises while the producer waits on a full queue. Why must both belong to TaskGroup?**
+
+<details><summary>Answer</summary>
+
+Without supervision, the failed worker reduces capacity while the producer can wait forever. TaskGroup cancels siblings and the blocked producer and surfaces the failure.
+
+</details>
+
 
 **Next**: [Scheduling and Periodic Work](03_scheduling_and_periodic_work.md)

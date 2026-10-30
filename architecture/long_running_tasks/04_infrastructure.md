@@ -30,39 +30,28 @@ The Swiss Army knife. Redis can serve as the queue, the result store, the heartb
 
 ### As a Task Queue (Redis Lists + BLMOVE)
 
+`BLMOVE` only makes the list move atomic. It cannot simultaneously install a separately
+written lease. Treat the list as a delivery hint over an authoritative job row, or use the
+[Redis Streams pending-entry protocol](../../infrastructure/redis/02_pubsub_and_streams.md).
+This bounded operation shows the timeout branch and the durable claim handoff:
+
 ```python
-import redis.asyncio as redis
-from datetime import UTC, datetime, timedelta
-import secrets
-
-# Producer (orchestrator): enqueue task
-await r.lpush("tasks", json.dumps({"job_id": "abc", "payload": {...}}))
-
-# Consumer (worker): blocking pop with reliability
-# BLMOVE atomically pops from "tasks" (RIGHT) and pushes to "processing" (LEFT).
-# BRPOPLPUSH is the older equivalent, deprecated since Redis 6.2.0.
 raw = await r.blmove("tasks", "processing", timeout=30, src="RIGHT", dest="LEFT")
-task = json.loads(raw)
-
-# A processing-list entry alone has no owner or expiry. Record a generation
-# lease so a sweeper can distinguish active work from an abandoned claim.
-claim_key = f"claim:{task['job_id']}"
-owner = secrets.token_hex(16)
-generation = await r.hincrby(claim_key, "generation", 1)
-lease_expires = datetime.now(UTC) + timedelta(seconds=90)
-await r.hset(claim_key, mapping={
-    "owner": owner,
-    "generation": generation,
-    "lease_expires_at": lease_expires.isoformat(),
-})
-
-# After processing, remove from "processing"
-await r.lrem("processing", 1, raw)
+if raw is not None:
+    task = json.loads(raw)
+    claim = await jobs.claim_if_pending_or_expired(task["job_id"])
+    if claim is not None:
+        await process_under_generation(claim)
+    await r.lrem("processing", 1, raw)
 ```
 
-The `processing` list acts as an in-flight buffer. A sweeper requeues only when the recorded lease
-has expired and a compare-and-set still matches its owner and generation. The replacement gets a
-new generation, which downstream conditional writes use to fence the old worker.
+The `jobs` adapter implements the [canonical fenced claim](../../background_work/foundations/03_minimal_durable_task.md).
+A crash between `BLMOVE` and `claim` leaves an ownerless hint in `processing`; a reconciler scans
+both pending/expired job rows and this list. It re-enqueues a hint only after consulting durable
+state, and uses conditional updates for job ownership. Duplicate hints are harmless because a live
+claim or completed job cannot be claimed again. A lost list entry cannot erase an accepted job.
+If Redis alone must own the job, use an atomic Lua claim/expiry index and a tested recovery protocol;
+a sequence of `HINCRBY` then `HSET` does not provide that guarantee.
 
 ### As a Result Store
 
@@ -96,7 +85,7 @@ keyspace notifications for correctness because they can be disabled or missed.
 
 ```python
 # Orchestrator: publish result when worker completes
-await r.publish(f"job:{job_id}", json.dumps({"status": "done", "result": result}))
+await r.publish(f"job:{job_id}", json.dumps({"state": "succeeded", "result": result}))
 
 # Client: subscribe and wait
 pubsub = r.pubsub()
@@ -197,7 +186,7 @@ example placeholder.
 | Feature | Detail |
 |---------|--------|
 | **Acknowledgements** | Manual ack/nack — message stays in queue until explicitly acknowledged |
-| **Dead Letter Exchange** | Failed messages are routed to a DLX after N retries |
+| **Dead Letter Exchange** | Routing requires a configured DLX and a qualifying rejection, expiry, length or queue-specific delivery-limit policy |
 | **Priority Queues** | Messages can have priority levels |
 | **TTL** | Per-message and per-queue TTL |
 | **Routing** | Topic exchanges, fanout exchanges, header-based routing |
@@ -206,13 +195,13 @@ example placeholder.
 
 **Pick RabbitMQ when:** You need complex routing (one message to multiple queues based on rules), message priority, or you're in an on-premise environment without cloud-managed queues.
 
-**Avoid RabbitMQ when:** You need event replay/rewind (RabbitMQ deletes messages after consumption), you need massive throughput (millions/s — Kafka territory), or you want zero operational overhead (use SQS).
+Classic and quorum queues remove acknowledged messages; [RabbitMQ Streams](https://www.rabbitmq.com/docs/streams) retain records for replay. Choose the data structure before comparing replay requirements. Delivery limits and dead lettering are [queue-specific policies](https://www.rabbitmq.com/docs/quorum-queues), not a universal automatic retry count. Benchmark routing, retention and recovery on the chosen queue type; throughput rankings by product name hide those choices. Sources checked 2026-10-30.
 
 ---
 
 ## 3. Amazon SQS
 
-Fully managed queue service. Zero operational overhead — no servers, no patching, no capacity planning.
+Managed queue service: AWS operates the brokers; you still own permissions, quotas, visibility, retry/DLQ policy, retention and cost.
 
 ### Standard Queue (At-Least-Once, Best-Effort Ordering)
 
@@ -237,7 +226,7 @@ for msg in response.get("Messages", []):
 sqs.send_message(
     QueueUrl=FIFO_QUEUE_URL,
     MessageBody=json.dumps(task),
-    MessageGroupId=str(hash(job_id) % NUM_GROUPS),  # Concurrency control
+    MessageGroupId=task["account_id"],  # Stable domain ID across producers
     MessageDeduplicationId=job_id,  # Prevent duplicate enqueue
 )
 ```
@@ -245,7 +234,11 @@ sqs.send_message(
 FIFO queues guarantee:
 - **Exactly-once processing** (AWS's term): `MessageDeduplicationId` drops duplicate *sends* within a 5-minute window. This is enqueue-side dedup, not exactly-once *delivery* — a consumer can still receive the same message more than once (crash after receive but before delete → visibility timeout expires → redelivery), so your handler must still be idempotent
 - **Ordered delivery** within a message group
-- **One in-flight message per group** — natural concurrency limiter
+- **Ordered batches within each group** — one receive can contain several messages from the same group; further receives for that group wait for deletion or visibility expiry. Process that batch in group order rather than starting all its effects concurrently
+
+Use a stable domain group such as `account:42`; Python’s randomized `hash()` can map the same
+entity differently in separate producer processes. More groups permit parallel work only when the
+business entities can safely execute independently. [SQS FIFO delivery](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-understanding-logic.html), checked 2026-10-30.
 
 ### Lambda Event Source Mapping (ESM)
 
@@ -301,38 +294,49 @@ Distributed event log. Messages are persisted to disk and can be replayed. Built
 ```python
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
-# Producer
-producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
-await producer.send_and_wait("tasks", json.dumps(task).encode())
+async def publish(task):
+    producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
+    await producer.start()
+    try:
+        await producer.send_and_wait("tasks", json.dumps(task).encode())
+    finally:
+        await producer.stop()
 
-# Consumer (in a consumer group)
-consumer = AIOKafkaConsumer(
-    "tasks",
-    bootstrap_servers="kafka:9092",
-    group_id="workers",
-    enable_auto_commit=False,
-)
-async for msg in consumer:
-    task = json.loads(msg.value)
-    await process(task)
-    await consumer.commit()
+async def consume():
+    consumer = AIOKafkaConsumer(
+        "tasks", bootstrap_servers="kafka:9092", group_id="workers",
+        enable_auto_commit=False,
+    )
+    await consumer.start()
+    try:
+        async for message in consumer:
+            await process(json.loads(message.value))
+            await consumer.commit()  # sequential loop; effect committed first
+    finally:
+        await consumer.stop()
 ```
+
+These functions require a provisioned topic, reachable broker and idempotent `process` adapter.
+The [Kafka course](../../infrastructure/kafka/README.md) supplies the complete lab and the
+partition/rebalance rules required before adding parallel handling.
+
 
 ### Key Differentiators
 
-| Feature | Kafka | SQS / RabbitMQ |
-|---------|-------|----------------|
-| **Message retention** | Days–weeks (configurable) | Deleted after consumption |
-| **Replay** | Seek to any offset | Not possible |
-| **Throughput** | Millions/second | Thousands/second |
-| **Ordering** | Per-partition (guaranteed) | Per-group (FIFO) or best-effort |
-| **Consumer groups** | Native, with rebalancing | Manual or limited |
+| Requirement | Kafka retained log | Destructive work queue |
+|---|---|---|
+| Replay after successful handling | Seek retained offsets, subject to retention | Store a separate history or select a stream product |
+| Independent readers | Separate consumer groups maintain progress | Route copies to separate queues when needed |
+| Ordered effects | Partition order plus serial/fenced application handling | Group/queue ordering plus matching handler discipline |
+| Capacity | Measure partitions, batch size, replication and disk/network limits | Measure queue type, message size, consumers and quotas |
 
-### When to Use Kafka
+### When to use Kafka
 
-**Pick Kafka when:** You need event replay (audit, debugging), very high throughput, or you want a durable event log that multiple services consume independently.
+Choose a retained log when job `abc` must feed independent audit and search consumers that can
+replay without resubmitting business work. For one worker pool that deletes accepted tasks, measure
+the existing database/queue first. Neither a universal jobs-per-second cutoff nor a vendor name
+establishes the needed recovery guarantee.
 
-**Avoid Kafka when:** You want simplicity (Kafka is operationally complex), your volume is low (< 1K messages/s — overkill), or you need request-reply semantics (Kafka is one-directional).
 
 ---
 
@@ -455,7 +459,9 @@ output = result.get()
 
 ## 7. Temporal
 
-Open-source durable execution platform. Workflows survive process crashes, restarts, and deployments. Stronger guarantees than Step Functions.
+Durable workflow platform. Workflow history supports replay after worker restarts; activities
+still require bounded timeouts and idempotent effects. Recovery depends on service/history
+durability and the documented deployment contract, not a blanket ranking against Step Functions.
 
 ### Workflow Definition
 
@@ -475,14 +481,17 @@ class InferenceWorkflow:
             process_inference,
             args=[job_id, payload],
             start_to_close_timeout=timedelta(minutes=30),
-            heartbeat_timeout=timedelta(seconds=60),
         )
         return result
 ```
 
+This excerpt uses a 30-minute start-to-close deadline and no heartbeat timeout. If early worker-loss
+detection is required, add periodic `activity.heartbeat()` while doing bounded chunks and a
+heartbeat timeout longer than the maximum chunk; declaring the timeout alone does not send renewal.
+
 ### When to Use Temporal
 
-**Pick Temporal when:** You need durable execution (workflow survives any infrastructure failure), complex multi-step workflows, or you want the strongest possible delivery guarantees.
+**Pick Temporal when:** You need recorded workflow progress, recoverable timers or multi-step coordination whose replay/versioning rules your team can operate.
 
 **Avoid Temporal when:** Your workflows are simple (queue + worker), you don't want to run the Temporal server, or you're fully committed to a cloud provider's native tools.
 
@@ -528,7 +537,7 @@ import asyncpg
 await conn.execute(
     "SELECT pg_notify($1, $2)",
     "job_updates",
-    json.dumps({"job_id": job_id, "status": "done"}),
+    json.dumps({"job_id": job_id, "state": "succeeded"}),
 )
 
 # Client: dedicate one persistent pool connection to LISTEN. Returning this
@@ -545,7 +554,7 @@ assert await listener_conn.fetchval(
 
 ### When to Use PostgreSQL as Queue
 
-**Pick PostgreSQL when:** Your volume is low (< 100 jobs/second), you already have PostgreSQL, and you want to avoid adding infrastructure.
+**Pick PostgreSQL when:** Its measured claim rate, table maintenance and connection budget meet the workload and the authoritative data already lives there. Include lease/generation recovery from the canonical job schema; the small `SKIP LOCKED` statement above demonstrates selection only.
 
 **Avoid PostgreSQL when:** Your volume is high (database becomes a bottleneck), you need long message retention, or you need consumer groups.
 
@@ -606,3 +615,17 @@ A production system for batched LLM inference using the patterns from this guide
 6. Orchestrator receives pub/sub notification, pushes to connected WebSocket/SSE clients
 7. Polling clients hit `GET /jobs/{id}` → orchestrator reads from Redis
 8. Webhook clients receive a POST to their callback URL
+
+## Decide from a recovery requirement
+
+**Job `abc` fits PostgreSQL capacity, but a disconnected consumer cannot miss completion. Must you
+add Kafka?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Commit a durable result, then notify as a hint; the consumer subscribes and re-reads the row
+when connecting or after a bounded wait. That solves missed live notifications. A later requirement
+for multiple independently replaying consumers may justify a retained log. Measure that requirement
+separately from the worker queue and preserve application effect deduplication either way.
+
+</details>

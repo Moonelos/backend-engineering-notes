@@ -27,6 +27,30 @@ pool. The controls compose; neither makes the other advisory.
 
 ---
 
+### Replay the same workload as arrivals change
+
+```mermaid
+flowchart LR
+ Q[Bounded waiting requests] --> G[40 admitted attempts]
+ G --> P[Up to 20 HTTP1 pool waiters]
+ P --> C[20 HTTP connections]
+ C --> V[Provider]
+ C -. HTTP2 multiplexed streams .-> V
+```
+
+With 40 admitted HTTP/1.1 attempts and 20 occupied connections, up to 20 admitted attempts
+wait inside the transport pool. With 1,000 arrivals and an ordinary semaphore, another
+960 tasks may wait *before* admission. A five-second wait timeout shortens their lifetime
+but does not reduce that instantaneous allocation. Add a bounded ingress/queue or reject
+new waiters once its separate cap is reached. The [tested gate](examples/bounded_calls.py)
+tracks active owners and waiters separately.
+
+Now negotiate HTTP/2. Twenty connections can carry more than 20 streams if the peers allow
+it, while the 40-attempt gate remains strict. Removing the gate because the pool is bounded
+changes the protected resource. Finally introduce retries: each retry re-enters the same
+gate and rate decision, so it consumes capacity that otherwise serves new requests. A
+separate retry budget bounds that extra demand.
+
 ## 2. The Four Independent Dimensions
 
 You must manage **four orthogonal concerns**:
@@ -135,13 +159,15 @@ Rate limiters:
 - Do **not** control how many are in-flight
 - Provide statistical, not hard, concurrency bounds
 
-With rate = R and timeout = T:
+For stable admitted traffic use measured average service time, not the configured timeout:
 
-```
-expected concurrency ≈ R × T
+```text
+10 admitted starts/second × 2 seconds average duration = 20 average active attempts
 ```
 
-**But**: Latency variance, retries, and cancellation delays can exceed this bound.
+A 30-second deadline does not imply 300 active attempts. Conversely a permitted burst can
+instantaneously fill all 40 slots even when the average is 20. Rate and duration estimate
+demand; the explicit admission gate enforces the maximum.
 
 Rate limiting is necessary for vendor quota compliance, but insufficient for concurrency control.
 
@@ -222,16 +248,11 @@ Use the controls whose failure they actually address:
 
 ## 9. When a Semaphore May Be Omitted
 
-A semaphore may be removed **only if**:
-
-- Client connection limits are strict
-- Client timeouts are enforced
-- Latency variance is low
-- Retries are rare and bounded
-- Temporary concurrency overshoot is acceptable
-- Decision is based on production metrics
-
-This is an **optimization**, not a baseline.
+Remove a semaphore only when another owner bounds the same application work and its
+waiters. For example, a fixed worker pool reading a bounded queue may already enforce
+20 active operations and 40 waiting entries. A socket pool alone does not: with HTTP/2
+it can serve many streams, and with HTTP/1.1 arbitrarily many coroutines can wait outside it.
+Name the replacement owner and test its overload boundary before removing a duplicate gate.
 
 ---
 
@@ -250,33 +271,18 @@ It **IS**:
 
 ---
 
-### Practical Rule
+### Derive the deadline from the product and observed distribution
 
-Choose `call_timeout` based on:
+Continue the 40-attempt/20-connection case. Suppose the provider's p95 is 18 seconds and
+p99 is 25 seconds. A 30-second attempt budget would allow most observed calls, but a
+10-second product deadline cannot offer it. Decide whether the product should reject,
+return a durable job ID, or accept a shorter success window; selecting p99 alone cannot
+resolve that requirement conflict.
 
-1. Acceptable user-facing latency
-2. SLA or SLO targets
-3. Worst-case vendor behavior you'll tolerate
-
-| Approach | When to use |
-|----------|-------------|
-| Slightly above **p95** | Balanced reliability |
-| Around **p99** | High reliability requirements |
-| Strict SLA budget | Hard latency guarantees |
-
-**Example**:
-
-```
-Vendor p95 latency ≈ 18s
-Vendor p99 latency ≈ 25s
-
-Chosen call_timeout = 30s
-```
-
-This means:
-- You accept that some calls will timeout
-- You cap how much latency contributes to concurrency
-- Calls exceeding 30s are failed, not queued
+If the product allows 75 seconds, two 30-second attempts leave at most 15 seconds for
+admission, transport setup, backoff and cleanup. Three full attempts cannot fit. Measure
+attempt duration, failure rate and abandoned remote work, then choose a budget. Increasing
+the timeout may improve completion while retaining capacity longer and increasing queueing.
 
 ---
 
@@ -344,6 +350,27 @@ connections_in_client_pool ≤ max_connections
 ```
 
 ---
+
+## Check yourself
+
+**With 1,000 simultaneous callers, 40 permits and 20 HTTP/1.1 connections, how many tasks
+can wait outside the semaphore immediately?**
+
+<details><summary>Reasoned answer</summary>
+
+Up to 960. Another 20 admitted attempts can wait for connections. A timeout limits waiting
+time, not the number of waiting tasks; a separate waiter cap is necessary.
+
+</details>
+
+**If the average duration doubles from two to four seconds at 10 starts/s, what changes?**
+
+<details><summary>Reasoned answer</summary>
+
+Steady demand rises from 20 to 40 active attempts. The enforced ceiling stays 40; further
+demand queues or rejects. Increasing sockets cannot create provider capacity.
+
+</details>
 
 ## Key Principles
 

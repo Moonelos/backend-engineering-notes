@@ -175,3 +175,13 @@ did not establish meaningful ownership.
 ---
 
 **Next**: [Part 12 — Trace One Investigation Across Services](12_trace_an_investigation_across_services.md), or return to the [Hexagonal Architecture index](README.md) for another reading path.
+
+## Decision exercise
+
+**A shared-library consumer deploys independently. Must the old public import disappear in the same library release?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The atomic same-repository migration rule does not apply. Keep an additive supported API with a named removal condition, test both paths, and remove the old path only after consumer migration evidence.
+
+</details>

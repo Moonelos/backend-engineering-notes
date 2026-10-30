@@ -42,6 +42,32 @@ pip install moto                # AWS mocking — see 09_mocking_external.md
 
 ---
 
+## Version the test stack and its migration checks
+
+The async examples here use HTTPX 0.28.1 APIs. Resolve FastAPI, Starlette, HTTPX and test plugins
+as one lock, then record their versions with `python -m pip freeze`; the first installation command
+is dependency intent, not a reproducible lock. New Starlette supports HTTPX2 and deprecates its
+plain-HTTPX TestClient backend. A migration should verify lifespan, cookies, transport mocks and
+stream cancellation before changing imports throughout the suite. Keep the old imports only in
+a deliberately pinned compatibility profile. [Starlette TestClient](https://starlette.dev/testclient/)
+and [release notes](https://starlette.dev/release-notes/), checked 2026-10-30.
+
+**GA — pytest 9:** Native TOML is an alternative to `ini_options`; do not combine two competing
+configuration files. The equivalent core selection in `pytest.toml` is:
+
+```toml
+[pytest]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["--strict-markers", "-m", "not integration and not e2e and not live"]
+markers = ["integration: disposable real infrastructure", "e2e: deployed boundary", "live: external provider"]
+```
+
+In `pyproject.toml`, use `[tool.pytest]` for native TOML on pytest 9, or retain the supported
+`[tool.pytest.ini_options]` form below for compatibility. Check the selected config path printed
+by pytest and use `--collect-only` to verify the same test profile after migration.
+[pytest configuration](https://docs.pytest.org/en/stable/reference/customize.html), checked 2026-10-30.
+
 ## Project Structure
 
 ```
@@ -166,3 +192,35 @@ Run `pytest tests/test_setup.py -v`. If the async test fails with `PytestUnhandl
 ## Next
 
 - [03 — Unit Testing](03_unit_testing.md) — test pure logic without spinning up FastAPI.
+
+## Recap and retrieval
+
+- Discovery, execution and the process exit code all belong to the test-toolchain contract.
+- Marker defaults select a hermetic profile; an explicit -m expression replaces that selection.
+- Only the intentionally selected live job receives credentials and bounded prerequisites.
+
+**A test has live and integration markers. Does pytest -m live retain the default exclusions?**
+
+<details><summary>Reasoned answer</summary>
+
+No. The command-line expression replaces the configured -m expression. This is intentional opt-in; verify the collected list before supplying credentials.
+
+</details>
+
+**The command exits successfully but collects zero tests. Was the feature verified?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Check naming, testpaths and marker selection; an empty suite has no behavioral evidence.
+
+</details>
+
+**Try it:** Add a live-marked dummy test without any network calls and compare collection under the default profile and -m live.
+
+Hint: Use pytest --collect-only -q; do not provide credentials for a collection test.
+
+<details><summary>Worked solution</summary>
+
+Default collection excludes live; the explicit -m live selects it and replaces the default expression. Preserve combined exclusions when selecting any other profile.
+
+</details>

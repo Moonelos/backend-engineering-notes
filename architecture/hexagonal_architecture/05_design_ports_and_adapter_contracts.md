@@ -245,6 +245,23 @@ the explicitly defined already-approved outcome. A real database test must confi
 a dictionary fake cannot prove locking. Concurrent creation is a different case: there is no
 existing row to lock, so enforce a unique key and map a duplicate to its named replay/conflict result.
 
+The lock changes which observation request B is allowed to use:
+
+```mermaid
+sequenceDiagram
+    participant A as Approval request A
+    participant D as Ticket T-100 row
+    participant B as Approval request B
+    A->>D: Lock and read PENDING_REVIEW
+    B->>D: Wait for row lock
+    A->>D: Decide APPROVED and commit
+    D-->>B: Lock granted, read APPROVED
+    B->>B: Apply already-approved rule
+```
+
+B does not reuse a stale pre-lock read. Its decision uses the committed state after A releases the
+lock; removing the lock without adding a version condition reopens the lost-update race.
+
 The one-call `approve_ticket` action is intentional. It remains the public catalog operation for
 HTTP and worker callers. Do not add a coordinator that opens a transaction and merely calls a
 same-named implementation method; the port implementation already owns the behavior.

@@ -210,3 +210,25 @@ route dependencies, the action boundary has not actually been extracted.
 ---
 
 **Next**: [Part 2 — Build One Vertical Slice](02_build_one_vertical_slice.md)
+
+## Recap and retrieval
+
+- The application action owns policy and calls small contracts.
+- Adapters translate external representations into that policy’s values.
+- Changing dependency direction does not combine independent commits.
+
+**Saving classification succeeds but SQS publication fails. Did extracting an application action make them atomic?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Dependency ownership changed; two systems still commit separately. Use the canonical transactional outbox protocol for recoverable publication.
+
+</details>
+
+**Can a fake adapter passing prove a real provider response still matches the port?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Keep the fast policy test and add a narrow adapter/compatibility test at the external boundary.
+
+</details>

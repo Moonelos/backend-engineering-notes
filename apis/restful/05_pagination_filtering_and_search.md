@@ -71,6 +71,13 @@ ORDER BY created_at DESC, id DESC
 LIMIT :limit_plus_one;
 ```
 
+For the same timestamp `09:30`, suppose IDs 104, 103 and 102 are ordered descending.
+A page of two ends at `(09:30, 103)`. Filtering only `created_at < 09:30` loses 102;
+filtering only `created_at <= 09:30` repeats 104 and 103. The tuple comparison includes
+102 because its timestamp ties and its ID is lower. The index and cursor must use that
+same complete ordering. An update moving 102 above the cursor can still make it disappear
+from this traversal: stable continuation is not snapshot isolation.
+
 The unique `id` tie-breaker prevents two rows with the same timestamp from becoming unstable.
 
 ```json
@@ -96,6 +103,25 @@ Costs:
 - Updates to sort keys can still move items between pages.
 
 > **Rule**: Default to cursor pagination for large or frequently changing operational collections. Use offset when its UX benefit is real and the dataset/query plan is bounded.
+
+---
+
+First trace page traversal without cursor encoding. IDs below stand for descending ordering positions.
+
+```mermaid
+sequenceDiagram
+ participant C as Orders client
+ participant DB as Orders database
+ C->>DB: limit 2 on IDs 105,104,103,102
+ DB-->>C: 105,104
+ Note over DB: insert 106 before current position
+ C->>DB: offset 2
+ DB-->>C: 104,103 - duplicate 104
+ C->>DB: keyset id less than 104
+ DB-->>C: 103,102
+```
+
+After page one the client has seen 105 and 104. Inserting 106 pushes 104 to position two, so OFFSET 2 repeats it. The value boundary stays below 104, so keyset yields 103 and 102. Deleting 105 instead makes OFFSET 2 skip 103; keyset still yields 103 and 102. Neither method freezes mutable sort keys.
 
 ---
 
@@ -262,5 +288,30 @@ Pages are normally separate database snapshots. If consumers need a stable expor
 - Deep traversal and pathological queries have measured limits.
 
 ---
+
+
+## Recap
+
+- Offsets count positions, so inserts and deletes can shift the next page.
+- A complete ordered tuple preserves a continuation boundary across earlier inserts.
+- A signed cursor prevents tampering but does not freeze mutable rows or authorize a tenant.
+
+## Check yourself
+
+**Descending rows are 105,104,103,102. Page size is 2; after reading 105,104, row 106 is inserted. What does offset=2 return versus cursor<104?**
+
+<details><summary>Reasoned answer</summary>
+
+Offset returns 104,103, duplicating 104; cursor returns 103,102 because it follows a value boundary rather than the shifted row count.
+
+</details>
+
+**Delete 105 after reading 105 and 104; what does OFFSET 2 skip?**
+
+<details><summary>Reasoned answer</summary>
+
+The remaining order is 104,103,102; OFFSET 2 starts at 102 and skips 103. The cursor below 104 still returns 103,102.
+
+</details>
 
 **Next**: [Concurrency, Idempotency, and Retries](06_concurrency_idempotency_and_retries.md)

@@ -1,784 +1,271 @@
-# Part 8: Advanced Streaming Patterns
+# Part 8: Coordinate several streams without losing their owners
 
-<!-- length-justification: This deep-dive is the canonical owner for multi-provider stream coordination; fan-out, winner cleanup, aggregation, admission, and the composed endpoint remain together because resource ownership crosses each mechanism. -->
+> **Role:** deep dive and implementation. Start with [the finite SSE owner](07_streaming_patterns.md). You should be able to trace admission, headers, a retained parser iterator, disconnect and awaited close.
+>
+> **Outcome:** select the first useful provider stream, close every loser immediately, merge bounded labelled events, and distinguish replay from provider-specific resumability.
 
-> **Who this is for**: Engineers coordinating multiple long-lived upstream streams after basic
-> streaming and cancellation are understood.
+Our search assistant can consult providers A and B. We want one fast answer, or an
+explicit comparison containing both answers. These are different products: a race
+selects one source; a merge preserves both source identities. Neither can be implemented
+safely by returning an anonymous async generator and forgetting who opened each response.
 
-> **Principle**: Streaming complexity grows with fan-out, aggregation, and failure handling.
+## 1. An owner contains progress, not just a URL
 
-> **Key insight**: Advanced stream coordination requires explicit ownership of every response,
-> task, cursor, and client-visible error.
+[StreamOwner](examples/advanced_streaming.py) holds a response, one byte iterator, its
+partial-frame buffer and semantic outcome. `open()` creates the iterator once.
+`next()` advances it. The first-read task returns `(owner, first_frame)`, so the consumer
+continues from exactly that position.
 
----
+Creating a new `response.aiter_lines()` after reading the first line is not a continuation
+contract. The first iterator may already have buffered bytes or decoder state; a second
+can encounter an already-consumed stream or lose buffered data. HTTPX's manual-streaming
+[ownership rules](https://www.python-httpx.org/async/) also require closing the response
+regardless of how many iterators the application constructed. Keep one.
 
-## 1. Stream Multiplexing: Multiple Concurrent Streams
+An owner is useful even before `open()` completes. It starts with `response=None`;
+`close()` is idempotent and checks whether a response exists. If status validation fails,
+`open()` closes what it acquired. The outer lifetime still calls close: redundant close
+of the same owner is safer than guessing whether an inner generator's cleanup started.
 
-### Use Case
+## 2. Race the first useful item
 
-User sends one request, you need to:
-- Call multiple LLMs in parallel
-- Stream results as they arrive
-- Merge into single response stream
+[First-stream selection](examples/advanced_stream_racing.py) starts one first-read task
+per candidate. A candidate must open successfully and yield a `delta` with the expected
+shape. Empty EOF and an immediate done marker are not useful answers. An early failed
+provider does not win the race; selection continues while another candidate can succeed.
 
-### Pattern: First-Response-Wins Streaming
+Once there is a winner, cancel unfinished first-read tasks, **join every first-read task**,
+and close every nonwinner response. The set of completed tasks can contain several
+successes. Closing only tasks still marked pending leaks a loser which completed in the
+same event-loop turn.
+
+```mermaid
+sequenceDiagram
+  participant R as Race owner
+  participant A as Provider A owner
+  participant B as Provider B owner
+  participant C as Consumer
+  R->>A: open; first next()
+  R->>B: open; first next()
+  A-->>R: delta A0
+  B-->>R: delta B0 in same turn
+  R->>R: stable tie break chooses A
+  R->>B: close immediately, including completed first-read
+  R-->>C: A owner + A0
+  C->>A: next() on retained iterator
+  A-->>C: A1, then more for 60 seconds
+  C->>R: consumer exits or disconnects
+  R->>A: awaited close
+```
+
+B closes during selection, not sixty seconds later when A finishes. The test deliberately
+makes both first-read tasks complete without a delay, asserts one owner is already
+closed inside the winner's context, then continues A's same iterator through its next
+two deltas and done marker.
+
+Use the context manager for the complete consumer lifetime:
 
 ```python
-import asyncio
-import sys
-from typing import AsyncIterator
-
-
-async def stream_first_responder(
-    payload: dict,
-    providers: list[str],
-) -> AsyncIterator[str]:
-    """
-    Start streams to multiple providers, yield from first to respond.
-    Cancel others once we commit to one.
-    """
-    
-    tasks = [
-        asyncio.create_task(get_first_chunk(provider, payload))
-        for provider in providers
-    ]
-    winner_stream = None
-
-    try:
-        # A completed failure is not a winner; keep waiting until one provider
-        # yields a first chunk or every provider fails.
-        for completed in asyncio.as_completed(tasks):
-            try:
-                _, first_chunk, winner_stream = await completed
-            except Exception:
-                continue
-
-            yield first_chunk
-            async for chunk in winner_stream:
-                yield chunk
-            return
-
-        raise RuntimeError("all providers failed before producing a chunk")
-    finally:
-        # Multiple providers can finish in the same event-loop turn. Canceling
-        # only pending tasks would leak the already-open streams of completed
-        # nonwinners, so collect every result and close every stream.
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, tuple):
-                _, _, opened_stream = result
-                await opened_stream.aclose()
-
-
-async def get_first_chunk(provider: str, payload: dict):
-    """
-    Start stream, return first chunk + continuation.
-
-    Note: the continuation generator must keep the response context manager
-    open for the lifetime of the stream. We enter the context manager here
-    and close it explicitly when the generator is exhausted or cancelled.
-    """
-    cm = client.stream(...)
-    response = await cm.__aenter__()
-
-    try:
-        first_chunk = None
-        async for chunk in response.aiter_lines():
-            first_chunk = chunk
+# Integration excerpt inside a pre-admitted response owner; client and send_frame are owned by it.
+async with first_stream([
+    StreamOwner(client, '/provider-a'),
+    StreamOwner(client, '/provider-b'),
+], timeout=5) as (winner, first):
+    await send_frame(first)
+    while (frame := await winner.next()) is not None:
+        await send_frame(frame)
+        if frame.kind == 'done':
             break
-    except BaseException:
-        await cm.__aexit__(*sys.exc_info())
-        raise
-
-    async def continuation():
-        try:
-            async for chunk in response.aiter_lines():
-                yield chunk
-        finally:
-            await cm.__aexit__(None, None, None)
-
-    return provider, first_chunk, continuation()
 ```
 
----
+The full helpers and deterministic providers are in
+[advanced_stream_racing.py](examples/advanced_stream_racing.py) and
+[advanced_test_streaming.py](examples/advanced_test_streaming.py). This excerpt does not
+claim to be a standalone endpoint; Part 7 owns the ASGI response, send deadlines,
+authentication and disconnect watcher. Replace its single-provider body with this
+context only after reserving the fan-out resources described next.
 
-## 2. Stream Aggregation: Merging Multiple Streams
+## 3. Admission must describe the fan-out before headers
 
-### Use Case
+A two-provider race can temporarily hold two live responses, even though only one
+answer reaches the client. Reserve capacity for two before opening either, or acquire
+each provider's independent reservation before starting that provider. If the second
+reservation fails, the first must be unwound or an explicitly documented one-provider
+fallback selected. Do not partially acquire and then wait forever for the other half.
 
-Query multiple sources, merge results into single stream:
-- Search across multiple databases
-- Aggregate from multiple AI models
-- Real-time data from multiple feeds
+A local `WeightedGate.lease(weight=2)` reserves two units atomically for the whole race
+in one process. It conservatively keeps that reservation until winner cleanup. Releasing
+the loser portion early requires a different owner API with separately tracked leases;
+do not call `release()` twice against a single opaque weighted lease. Fleet provider
+limits in [Part 9](09_distributed_admission_control.md) require one attempt admission per
+actual provider call. Financial reservation in [Part 10](10_llm_token_economics.md) must
+include both possible billed generations.
 
-### Pattern: Interleaved Merge
+Admission decisions use verified tenant/tier and planned resources. The number of chunks
+which might eventually arrive is unknown and cannot justify a pre-header rate decision.
+A dynamic overload signal can reject new streams; it cannot retroactively turn a running
+200 response into 429. Existing streams need an in-band error or explicit cancellation
+policy. Document whether a fallback means reduced quality, stale data or fewer sources.
 
-```python
-import asyncio
-from typing import AsyncIterator
+Do not wrap `BoundedCaller.request_json()` around a stream. Its contract is to read a
+bounded JSON body and close it. Reuse its admission concepts with a stream owner whose
+lease lasts through the entire body. A request-scoped HTTPX client must not close while
+an owner still needs its response; the application lifespan owns shared clients.
 
+## 4. Merge with source identity and bounded supervision
 
-async def merge_streams(
-    *streams: AsyncIterator[str],
-    timeout: float = 30.0,
-) -> AsyncIterator[tuple[int, str]]:
-    """
-    Merge multiple streams, yielding (source_index, chunk) as data arrives.
-    """
-    
-    pending = {
-        asyncio.create_task(stream.__anext__()): (i, stream)
-        for i, stream in enumerate(streams)
-    }
+For the comparison product, [merged_stream](examples/advanced_stream_racing.py) owns a
+producer task for each named source. Every queue entry is `(source_id, Frame)`. The queue
+holds at most four entries, and each provider parser bounds a retained frame to 4096
+bytes. A slow consumer fills the queue, which blocks producer puts and slows upstream
+reads rather than allocating memory without limit.
 
-    try:
-        while pending:
-            done, _ = await asyncio.wait(
-                pending.keys(),
-                return_when=asyncio.FIRST_COMPLETED,
-                timeout=timeout,
-            )
-
-            if not done:
-                # Idle timeout: stop. Cleanup happens in `finally`.
-                break
-
-            for task in done:
-                source_idx, stream = pending.pop(task)
-
-                try:
-                    chunk = task.result()
-                    yield source_idx, chunk
-
-                    # Schedule next chunk from same stream
-                    pending[asyncio.create_task(stream.__anext__())] = (source_idx, stream)
-
-                except StopAsyncIteration:
-                    # This stream is done
-                    pass
-
-                except Exception as e:
-                    # This stream errored
-                    yield source_idx, f"ERROR: {e}"
-    finally:
-        # Always runs: idle timeout, error, or consumer disconnect
-        # (GeneratorExit). Cancel in-flight __anext__() tasks and close every
-        # upstream generator so connections are released promptly.
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending.keys(), return_exceptions=True)
-        await asyncio.gather(
-            *(s.aclose() for s in streams if hasattr(s, "aclose")),
-            return_exceptions=True,
-        )
-
-
-# Usage
-async def search_all_providers(query: str) -> AsyncIterator[str]:
-    """Search multiple providers, merge results."""
-    
-    streams = [
-        search_provider_a(query),
-        search_provider_b(query),
-        search_provider_c(query),
-    ]
-    
-    async for source_idx, chunk in merge_streams(*streams):
-        yield f"[{source_idx}] {chunk}"
+```mermaid
+flowchart LR
+  A[A owner: one iterator] --> PA[A producer]
+  B[B owner: one iterator] --> PB[B producer]
+  PA --> Q[Queue: max 4 labelled frames]
+  PB --> Q
+  Q --> C[One consumer: source plus event]
+  C --> S[Bounded downstream send]
+  C -. consumer exit .-> J[Cancel and join both producers]
+  J --> X[Close every response]
 ```
 
----
+Each producer reports either done, a sanitized error or missing-terminal error. The
+consumer removes that source from its pending set only on a terminal event. An error
+from B need not erase useful A output; the comparison UI can mark B failed while A
+continues. If the product requires all-or-nothing success, choose fail-fast semantics
+and cancel the remaining sources after the first error instead. That choice belongs in
+the protocol, not in an accidental `gather()` exception policy.
 
-## 3. Partial Failure Recovery
+A producer's `finally` closes its owner. It must not try to enqueue a completion sentinel
+unconditionally during cancellation: a full queue plus a disconnected consumer would
+make cleanup wait forever. The context exit instead cancels/joins all producers and
+closes all owners directly. This also works if the consumer reads one frame and stops.
+Use the context manager even when breaking early; abandoning the returned iterator alone
+is not a complete lifetime protocol.
 
-### Use Case
+The merge helper bounds buffering, not total operation duration. Place it inside the
+Part 7 total-deadline/response owner. The test verifies a bad source yields a labelled
+error while the healthy source reaches done, and an early consumer exit closes both
+still-running drip streams. It does not require a real provider or credential.
 
-Stream is partially complete when error occurs:
-- Network hiccup mid-stream
-- Provider rate limit hit
-- Temporary outage
+## 5. Transform one representation, then serialize once
 
-### Pattern: Checkpoint and Resume
+Inside the application use `Frame(kind, data)`, not a mixture of raw bytes, bare JSON
+strings and lines prefixed with `data:`. `Frame.encode()` produces one client SSE frame.
+A source-labelled merge should encode deltas with that source and include source identity
+on its terminal/error messages as well; the example yields `(source, frame)` so the
+response adapter retains that identity for every event, including done.
 
-```python
-from dataclasses import dataclass
-from typing import AsyncIterator, Optional
+The fixture's done marker is recognized before JSON parsing. A missing done marker is
+unknown completion. A known protocol failure is failed; caller disconnect is cancelled;
+provider done is done. Keep client delivery separately: a provider can finish while the
+browser disconnects before it receives the final frame. None of these statuses supplies
+missing token usage, which has its own reconciliation contract.
 
+Chunk transformations also affect latency. Buffering until a sentence boundary can
+improve display quality but requires a bounded character count and flush deadline; a
+provider might never emit punctuation. Redaction across chunk boundaries needs retained
+bounded context because a sensitive string can be split between two chunks. Do not log
+unredacted intermediate frames. For signatures/checksums, define whether they cover
+provider bytes or the transformed client representation; those are different objects.
 
-@dataclass
-class StreamCheckpoint:
-    """Checkpoint for resumable streaming."""
-    provider: str
-    payload: dict
-    chunks_received: int
-    last_chunk_id: Optional[str]
+## 6. Replay is not automatically resumable provider execution
 
+There are three distinct ways a connection can recover:
 
-async def resumable_stream(
-    payload: dict,
-    checkpoint: Optional[StreamCheckpoint] = None,
-) -> AsyncIterator[str]:
-    """
-    Stream with checkpoint support for resumption.
-    """
-    
-    if checkpoint:
-        # Resume from checkpoint
-        payload = {
-            **payload,
-            "resume_from": checkpoint.last_chunk_id,
-        }
-    
-    chunk_count = checkpoint.chunks_received if checkpoint else 0
-    last_chunk_id = checkpoint.last_chunk_id if checkpoint else None
-    
-    try:
-        async with client.stream(...) as response:
-            async for chunk in response.aiter_lines():
-                # Extract chunk ID for checkpointing
-                chunk_data = json.loads(chunk)
-                last_chunk_id = chunk_data.get("id")
-                chunk_count += 1
-                
-                yield chunk
-    
-    except Exception as e:
-        # Save checkpoint for potential resume
-        checkpoint = StreamCheckpoint(
-            provider="openai",
-            payload=payload,
-            chunks_received=chunk_count,
-            last_chunk_id=last_chunk_id,
-        )
-        
-        # Could store checkpoint in Redis for client to resume
-        await store_checkpoint(checkpoint)
-        
-        raise
+| Contract | Required durable state | What a reconnect does |
+|---|---|---|
+| Browser event replay | Stored client events with monotonic sequence IDs | Send events after `Last-Event-ID` from the same logical operation |
+| Provider-supported resume | Provider operation ID and documented cursor/offset | Continue or retrieve that provider operation within its retention window |
+| New generation | New admitted provider attempt and explicit UI replacement | Start new output; previous text may differ and cost may repeat |
 
+An arbitrary `resume_from=last_chunk` parameter cannot make a provider support resume.
+The provider must document cursor ordering, retention, authorization, duplicate events,
+terminal states and whether resumption re-executes work. Read that endpoint's contract;
+do not invent a generic LLM cursor API. This fixture intentionally supports no provider
+resume. Its local fake stream is a new generation on every open.
 
-async def stream_with_auto_resume(
-    payload: dict,
-    max_resumes: int = 3,
-) -> AsyncIterator[str]:
-    """
-    Automatically resume on transient failures.
-    """
-    
-    checkpoint = None
-    
-    for attempt in range(max_resumes + 1):
-        try:
-            async for chunk in resumable_stream(payload, checkpoint):
-                yield chunk
-            return  # Completed successfully
-        
-        except httpx.ReadTimeout:
-            # Transient - try to resume
-            checkpoint = await get_checkpoint()
-            if attempt < max_resumes:
-                await asyncio.sleep(backoff(attempt))
-                continue
-            raise
+For browser replay, persist events under `(tenant, operation_id, sequence)` and authorize
+that operation on reconnect. Save the terminal event too. If the requested sequence has
+expired, return an explicit gap/restart decision rather than silently skipping history.
+A reconnecting browser must deduplicate event IDs; transport delivery can repeat the
+last acknowledged event. `Last-Event-ID` belongs to the client event stream protocol,
+whose semantics are specified in the
+[HTML SSE standard](https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header).
+It does not by itself reveal a provider cursor or resume a crashed worker.
+
+## 7. Test and operate the fan-out
+
+Use the environment from Part 7:
+
+```bash
+cd examples
+.venv/bin/python -m pytest -q advanced_test_streaming.py
 ```
 
----
-
-## 4. Stream Transformation Pipeline
-
-### Use Case
-
-Process stream chunks through transformation pipeline:
-- Parse SSE format
-- Extract content from JSON
-- Apply filters or transformations
-
-### Pattern: Async Pipeline
-
-```python
-from typing import AsyncIterator, Callable, TypeVar
-
-T = TypeVar('T')
-U = TypeVar('U')
-
-
-async def map_stream(
-    stream: AsyncIterator[T],
-    func: Callable[[T], U],
-) -> AsyncIterator[U]:
-    """Map function over stream."""
-    async for item in stream:
-        yield func(item)
-
-
-async def filter_stream(
-    stream: AsyncIterator[T],
-    predicate: Callable[[T], bool],
-) -> AsyncIterator[T]:
-    """Filter stream by predicate."""
-    async for item in stream:
-        if predicate(item):
-            yield item
-
-
-async def batch_stream(
-    stream: AsyncIterator[T],
-    size: int,
-) -> AsyncIterator[list[T]]:
-    """Batch stream items."""
-    batch = []
-    async for item in stream:
-        batch.append(item)
-        if len(batch) >= size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-# Composable pipeline
-async def process_llm_stream(payload: dict) -> AsyncIterator[str]:
-    """
-    Full processing pipeline for LLM stream.
-    """
-    
-    # Raw stream
-    raw_stream = stream_llm(payload)
-    
-    # Parse SSE
-    parsed = map_stream(
-        raw_stream,
-        lambda line: json.loads(line[6:]) if line.startswith("data: ") else None,
-    )
-    
-    # Filter nulls and done signals
-    filtered = filter_stream(
-        parsed,
-        lambda x: x is not None and x != "[DONE]",
-    )
-    
-    # Extract content
-    content = map_stream(
-        filtered,
-        lambda x: x.get("choices", [{}])[0].get("delta", {}).get("content", ""),
-    )
-    
-    # Filter empty
-    non_empty = filter_stream(content, bool)
-    
-    async for chunk in non_empty:
-        yield chunk
-```
-
----
-
-## 5. Stream Rate Limiting
-
-### Use Case
-
-Limit how fast you emit chunks to client:
-- Prevent overwhelming slow clients
-- Match playback speed for media
-- Comply with downstream rate limits
-
-### Pattern: Throttled Stream
-
-```python
-import asyncio
-from typing import AsyncIterator
-
-
-async def throttle_stream(
-    stream: AsyncIterator[str],
-    chunks_per_second: float,
-) -> AsyncIterator[str]:
-    """
-    Throttle stream to max chunks per second.
-    """
-    
-    min_interval = 1.0 / chunks_per_second
-    last_emit = 0.0
-    
-    async for chunk in stream:
-        now = asyncio.get_running_loop().time()
-        elapsed = now - last_emit
-
-        if elapsed < min_interval:
-            await asyncio.sleep(min_interval - elapsed)
-
-        yield chunk
-        last_emit = asyncio.get_running_loop().time()
-
-
-async def adaptive_throttle(
-    stream: AsyncIterator[str],
-    initial_rate: float = 10.0,
-) -> AsyncIterator[str]:
-    """
-    Adaptively throttle based on observed downstream consumption time.
-
-    Measures how long each ``yield`` takes to return (i.e., how long the
-    consumer took to accept the chunk). Slow consumers indicate backpressure;
-    we reduce the rate. Fast consumers allow speed-up.
-    """
-
-    rate = initial_rate
-
-    async for chunk in stream:
-        before = asyncio.get_running_loop().time()
-        yield chunk
-        # Time the yield took to resume = rough proxy for consumer slowness.
-        consume_time = asyncio.get_running_loop().time() - before
-
-        expected = 1.0 / rate
-        if consume_time > expected * 2:
-            # Consumer is slow - back off.
-            rate = max(rate * 0.5, 1.0)
-        else:
-            # Consumer is keeping up - gently speed up.
-            rate = min(rate * 1.1, 100.0)
-
-        # Pace the next emission.
-        await asyncio.sleep(max(0.0, expected - consume_time))
-```
-
----
-
-## 6. Circuit Breaker for Streaming
-
-### Challenge
-
-Standard circuit breakers count failures per request.
-With streaming, one long stream = one request, but may have many chunks.
-
-### Pattern: Chunk-Aware Circuit Breaker
-
-```python
-import time
-from dataclasses import dataclass
-
-
-@dataclass
-class StreamingCircuitState:
-    failures: int = 0
-    successes: int = 0
-    last_failure: float = 0
-    state: str = "closed"  # closed, open, half_open
-
-
-class StreamingCircuitBreaker:
-    """
-    Circuit breaker that considers streaming behavior.
-    """
-    
-    def __init__(
-        self,
-        failure_threshold: int = 5,
-        success_threshold: int = 2,
-        timeout: float = 60.0,
-        min_chunks_for_success: int = 10,
-    ):
-        self.failure_threshold = failure_threshold
-        self.success_threshold = success_threshold
-        self.timeout = timeout
-        self.min_chunks = min_chunks_for_success
-        self.state = StreamingCircuitState()
-    
-    async def execute(
-        self,
-        stream_func,
-        *args,
-        **kwargs,
-    ) -> AsyncIterator[str]:
-        """
-        Execute streaming function through circuit breaker.
-        """
-        
-        if self.state.state == "open":
-            if time.time() - self.state.last_failure > self.timeout:
-                self.state.state = "half_open"
-            else:
-                raise CircuitBreakerOpen()
-        
-        chunk_count = 0
-        error_occurred = False
-        
-        try:
-            async for chunk in stream_func(*args, **kwargs):
-                chunk_count += 1
-                yield chunk
-        
-        except Exception as e:
-            error_occurred = True
-            self._record_failure()
-            raise
-        
-        finally:
-            if not error_occurred:
-                # Success only if we got enough chunks
-                if chunk_count >= self.min_chunks:
-                    self._record_success()
-                # Partial stream is ambiguous - don't count
-    
-    def _record_failure(self):
-        self.state.failures += 1
-        self.state.last_failure = time.time()
-        
-        if self.state.failures >= self.failure_threshold:
-            self.state.state = "open"
-    
-    def _record_success(self):
-        if self.state.state == "half_open":
-            self.state.successes += 1
-            if self.state.successes >= self.success_threshold:
-                self.state.state = "closed"
-                self.state.failures = 0
-                self.state.successes = 0
-        else:
-            self.state.failures = 0
-```
-
----
-
-## 7. Streaming Load Shedding
-
-### Challenge
-
-Load shedding for streaming must consider:
-- Current active streams (long-running)
-- New stream requests
-- System resources
-
-### Pattern: Stream-Aware Admission
-
-```python
-from dataclasses import dataclass
-from typing import AsyncIterator
-import asyncio
-
-
-@dataclass
-class StreamAdmissionState:
-    active_streams: int = 0
-    total_chunks_per_second: float = 0.0
-    
-    max_streams: int = 50
-    max_chunks_per_second: float = 1000.0
-
-
-class StreamAdmissionController:
-    """
-    Admission control for streaming endpoints.
-    """
-    
-    def __init__(self):
-        self.state = StreamAdmissionState()
-        self._lock = asyncio.Lock()
-    
-    async def admit(self) -> bool:
-        """Check if new stream should be admitted."""
-        async with self._lock:
-            if self.state.active_streams >= self.state.max_streams:
-                return False
-            
-            # Estimate: new stream will add ~20 chunks/sec
-            estimated_load = self.state.total_chunks_per_second + 20
-            if estimated_load > self.state.max_chunks_per_second:
-                return False
-            
-            self.state.active_streams += 1
-            return True
-    
-    async def release(self, chunks_emitted: int, duration: float):
-        """Release admission slot with metrics."""
-        async with self._lock:
-            self.state.active_streams -= 1
-            
-            # Update estimated throughput
-            if duration > 0:
-                rate = chunks_emitted / duration
-                # Exponential moving average
-                self.state.total_chunks_per_second = (
-                    0.9 * self.state.total_chunks_per_second +
-                    0.1 * rate * self.state.active_streams
-                )
-
-
-# Usage
-admission = StreamAdmissionController()
-
-
-async def stream_with_admission(payload: dict) -> AsyncIterator[str]:
-    """Stream with admission control."""
-    
-    if not await admission.admit():
-        raise HTTPException(503, "Too many active streams")
-    
-    start = time.time()
-    chunks = 0
-    
-    try:
-        async for chunk in stream_llm(payload):
-            chunks += 1
-            yield chunk
-    finally:
-        await admission.release(chunks, time.time() - start)
-```
-
----
-
-## 8. Complete Production Streaming Endpoint
-
-```python
-import asyncio
-import json
-import logging
-import time
-import httpx
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
-from aiolimiter import AsyncLimiter
-from typing import AsyncIterator
-
-logger = logging.getLogger(__name__)
-
-# === GLOBAL STATE ===
-llm_sem = asyncio.Semaphore(100)  # Higher for streaming
-llm_rate = AsyncLimiter(60, 60)
-client: httpx.AsyncClient = None
-admission = StreamAdmissionController()
-breaker = StreamingCircuitBreaker()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global client
-    client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0),
-        limits=httpx.Limits(max_connections=150, max_keepalive_connections=50),
-    )
-    yield
-    await client.aclose()
-
-
-app = FastAPI(lifespan=lifespan)
-
-
-async def production_stream(
-    request: Request,
-    payload: dict,
-) -> AsyncIterator[str]:
-    """
-    Production-grade streaming with all safeguards.
-    """
-    
-    # 1. Admission control
-    if not await admission.admit():
-        raise HTTPException(503, "Service at capacity")
-    
-    start_time = time.time()
-    chunk_count = 0
-    first_chunk_time = None
-    
-    try:
-        # 2. Acquire rate + concurrency slots under a short queue timeout.
-        #    NOTE: do NOT wrap the streaming loop itself with a wall-clock
-        #    timeout; rely on httpx per-chunk `read` timeout instead.
-        async with asyncio.timeout(5):
-            await llm_rate.acquire()
-            await llm_sem.acquire()
-
-        try:
-            # 3. Circuit breaker + stream body (no wall-clock timeout).
-            async for chunk in breaker.execute(_raw_stream, payload):
-                # 4. Client disconnect check
-                if await request.is_disconnected():
-                    break
-
-                # 5. Metrics
-                if first_chunk_time is None:
-                    first_chunk_time = time.time()
-                chunk_count += 1
-
-                # 6. Format as SSE
-                yield f"data: {chunk}\n\n"
-
-            yield "data: [DONE]\n\n"
-        finally:
-            llm_sem.release()
-
-    except asyncio.TimeoutError:
-        yield f"data: {json.dumps({'error': 'timeout'})}\n\n"
-    
-    except CircuitBreakerOpen:
-        yield f"data: {json.dumps({'error': 'service unavailable'})}\n\n"
-    
-    except Exception:
-        request_id = request.headers.get("x-request-id", "unavailable")
-        logger.exception("stream_failed", extra={"request_id": request_id})
-        yield f"data: {json.dumps({'error': 'internal_error', 'request_id': request_id})}\n\n"
-    
-    finally:
-        # 7. Release admission and record metrics
-        duration = time.time() - start_time
-        ttfc = first_chunk_time - start_time if first_chunk_time else None
-        
-        await admission.release(chunk_count, duration)
-        await record_metrics(duration, ttfc, chunk_count)
-
-
-async def _raw_stream(payload: dict) -> AsyncIterator[str]:
-    """Raw vendor stream."""
-    async with client.stream(
-        "POST",
-        "https://api.openai.com/v1/chat/completions",
-        json={**payload, "stream": True},
-    ) as response:
-        response.raise_for_status()
-        async for line in response.aiter_lines():
-            if line.startswith("data: ") and line != "data: [DONE]":
-                yield line[6:]
-
-
-@app.post("/v1/chat/stream")
-async def chat_stream(request: Request, payload: dict):
-    return StreamingResponse(
-        production_stream(request, payload),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-```
-
----
-
-## Summary: Streaming Complexity Ladder
-
-| Level | Pattern | When to use |
-|-------|---------|-------------|
-| Basic | Single stream + semaphore | Simple proxy |
-| Intermediate | + Disconnect detection + metrics | Production single-provider |
-| Advanced | + Circuit breaker + admission | High availability |
-| Expert | + Multi-stream + aggregation + resume | Multi-provider platforms |
-
----
-
-## Key Principles
-
-1. **Streaming is fundamentally different** — design for it explicitly
-2. **Semaphore duration is much longer** — size appropriately
-3. **Timeouts must be per-chunk** — not total time
-4. **Client disconnect is silent** — detect explicitly
-5. **Circuit breakers need chunk awareness** — partial streams are ambiguous
-6. **Admission control must track active streams** — not just request rate
-7. **Retries only work before streaming starts** — design for this limitation
-
----
-
-**This completes the streaming patterns guide.**
+The tests cover simultaneous winners, continuation on the retained iterator, immediate
+loser closure, failed and empty first candidates, labelled merge failure and early exit.
+Combine these with the ASGI disconnect/total/idle/send tests before changing the response
+implementation. Add provider-contract tests for your real dialect and supported resume
+endpoint; neither is implied by the local fixture's passing tests.
+
+Production checks should include candidate count, candidate admission failure, winner
+source, time to first useful frame, loser lifetime after selection, merge queue occupancy,
+per-source outcomes, total duplicate spend, cleanup duration and unknown final usage.
+Use bounded provider/model labels, not prompt text or arbitrary user IDs in metrics.
+Authenticate the caller before fan-out, restrict provider targets to trusted configuration,
+and protect event replay with the same tenant authorization as the original operation.
+
+If both provider bills remain high after racing, inspect whether losers close immediately
+and whether provider cancellation actually stops billing. If a stream hangs after B
+fails, inspect whether its terminal/error event reached the queue. If output skips words
+after the first chunk, inspect iterator ownership and decoder buffering. Roll out provider
+adapters behind a small canary and retain the previous wire parser until replay retention
+has passed; persisted client events may outlive the process version which created them.
+
+## Recap
+
+A multi-provider stream owns several responses and tasks before it owns a winner.
+Retain one iterator per response, close all losers immediately, bound merge queues and
+carry source identity through terminal events. Treat browser replay, provider resume and
+new generation as distinct contracts with distinct cost and durability requirements.
+
+## Check yourself
+
+<details><summary>Both providers return their first item together. A wins and runs for 60 seconds. When does B close?</summary>
+Immediately during selection, even though B's first-read task is already complete.
+Only closing unfinished tasks misses this race and retains B's connection and capacity.
+</details>
+
+<details><summary>A browser sends Last-Event-ID 18. Can we pass 18 to any provider and continue?</summary>
+No. It identifies an event in your client stream. Replay needs stored events from the
+same authorized operation; provider continuation requires that provider's own documented
+operation/cursor contract.
+</details>
+
+## Try it
+
+Change one candidate to return `[DONE]` without text while the other returns a useful
+first delta. Predict the winner and every owner's closed state, then run the fixture.
+Next set the merge queue to one item and stop consuming after the first delta. Assert
+all producer tasks finish and all responses close; explain why a sentinel put in a
+cancelled producer's finally block could deadlock that changed case.
+
+Scaffold: start with `owners = [StreamOwner(client, '/empty'), StreamOwner(client, '/ok')]`
+and fill in `assert winner is owners[___]`; inside the context assert the other owner is
+closed. Repeat `merged_stream(..., max_buffer=1)` and break after `anext(events)`.
+
+Hint: a useful first frame must be a delta. The context owns producer teardown even when
+the consumer stops before any terminal event.
+
+<details><summary>Reasoned solution</summary>
+The useful owner is index 1; index 0 closes during selection. Both close on context exit.
+A one-item merge queue may already be full when the consumer exits, so producer cleanup
+must close directly and cancellation must be joined. Awaiting a final sentinel put would
+need a consumer which no longer exists and could prevent cleanup forever.
+</details>
+
+**Next:** [Fleet admission](09_distributed_admission_control.md). **Back:** [learning map](README.md).

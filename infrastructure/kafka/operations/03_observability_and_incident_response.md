@@ -108,6 +108,18 @@ tests:
               summary: billing-v1 freshness metric is missing
 ```
 
+Before reload, include the rule file in the main `prometheus.yml` (the test file's `rule_files`
+only controls the test runner):
+
+```yaml
+# Merge into the existing main configuration; preserve its scrape_configs.
+rule_files:
+  - /etc/prometheus/kafka-orders.rules.yml
+```
+
+Mount the rule file at that path and run `promtool check config /etc/prometheus/prometheus.yml`
+in the same filesystem as the server. A valid unreferenced rule file is never evaluated.
+
 `promtool test rules` must report `SUCCESS`; this exercises firing labels and `for:` timing without
 waiting on a real incident.
 
@@ -133,7 +145,20 @@ to resolve. Stop the freshness exporter separately and require the missing-metri
 Do not inject delay or stop telemetry in production merely to test paging.
 
 The first rule's conjunction avoids paging for a large but rapidly draining batch. The separate
-`absent()` rule prevents a dead exporter from turning the conjunction into false green health.
+`absent()` rule detects disappearance of *all* matching series. It does not detect partition 7
+missing while partition 8 remains. For per-partition completeness, maintain an independently
+scraped inventory such as `orders_expected_partition{cluster,consumergroup,topic,partition}=1`
+and alert on the set difference:
+
+```promql
+orders_expected_partition{consumergroup="billing-v1",topic="orders.events.v1"} == 1
+unless on (cluster, consumergroup, topic, partition)
+orders_event_age_seconds{consumergroup="billing-v1",topic="orders.events.v1"}
+```
+
+Test two expected partitions with telemetry for only one: only the missing partition must appear.
+Also alert on the inventory exporter itself (`up == 0`), since losing both inputs cannot establish
+completeness. Keep the global rule as a separate whole-flow absence check.
 
 ## Diagnose from consequence toward the owning state
 

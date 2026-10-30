@@ -157,4 +157,27 @@ Do not build a workflow for one replay-safe outcome; use a durable job. Do not b
 
 ---
 
+## Recap and check yourself
+
+- A task owns one replay-safe outcome; a workflow persists intermediate decisions that constrain later actions.
+- Duration affects runtime design but does not alone create business states.
+- Run revision serializes changes; definition version decides which graph gives those changes meaning.
+
+**A two-hour conversion can restart safely from the beginning. Must it become a workflow?**
+
+<details><summary>Answer</summary>
+
+No. One durable job and replay-safe output can suffice. Add workflow state when an intermediate approval, branch or committed decision changes what may happen next.
+
+</details>
+
+**Version 4 removes an approval state while version-3 runs wait there. Can deployment reinterpret those rows?**
+
+<details><summary>Answer</summary>
+
+No. Preserve the version-3 handler until drain, or perform an explicit state migration with evidence. A run revision number alone cannot identify the old graph.
+
+</details>
+
+
 **Next**: [Minimal Durable Task Lifecycle](03_minimal_durable_task.md)

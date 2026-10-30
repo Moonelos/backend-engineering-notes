@@ -199,6 +199,22 @@ order when the stack closes. The sample worker registers cleanup during `_build_
 then uses `pop_all()` to transfer those callbacks to the runtime without executing them. If
 `_compose_runtime()` fails afterward, `build_runtime()` closes the resource bundle instead.
 
+The acquisition stack owns callbacks before the finished runtime exists:
+
+```mermaid
+flowchart TD
+    D[Open database and register close] --> H[Open HTTP and register close]
+    H --> B{Broker construction succeeds?}
+    B -->|No| F[Close HTTP then database]
+    B -->|Yes| P[pop_all transfers callbacks]
+    P --> R[Runtime owns cleanup stack]
+    R --> S[Stop intake and drain tasks]
+    S --> C[Close HTTP then database once]
+```
+
+Failure uses the pending stack immediately. Success moves its callbacks without executing them;
+shutdown must drain users of the resources before closing the transferred stack.
+
 This standalone Python example demonstrates that ownership transfer using recorded events instead
 of live clients. Run the whole block as a script; it needs only the standard library:
 
@@ -246,7 +262,7 @@ This verifies the lifecycle mechanism, not connectivity or graceful worker drain
 Returning a resource bundle makes ownership explicit; it does not make concurrent work stop.
 The supervisor must first stop intake and resolve or cancel in-flight tasks within the shutdown
 budget, then close the stack. Cancellation and provider-specific close operations still need
-bounded handling; see [signals and shutdown](../../fundamentals/core_concepts/signals.md).
+bounded handling; see [signals and shutdown](../../fundamentals/core_concepts/runtime/signals.md).
 
 ### Several supervisors can share resources without owning business stages
 
@@ -295,3 +311,35 @@ narrower lifetime. API dependencies expose a runtime view, never raw sessions.
 ---
 
 **Next**: [Part 7 — Apply the Pattern to APIs and Workers](07_apply_the_pattern_to_apis_and_workers.md)
+
+## Recap and retrieval
+
+- The composition root acquires real resources and injects adapters.
+- Cleanup is registered immediately so partial startup has an owner.
+- Successful ownership transfer moves cleanup to the runtime without running it twice.
+
+**Database and HTTP open, then broker construction fails before Runtime exists. Who closes them?**
+
+<details><summary>Reasoned answer</summary>
+
+The acquisition stack already owns the callbacks and closes HTTP then database. Waiting until Runtime construction would leak both resources.
+
+</details>
+
+**After pop_all transfers ownership, should the old stack close those resources?**
+
+<details><summary>Reasoned answer</summary>
+
+No. It no longer owns those callbacks; the new runtime stack closes them once at shutdown.
+
+</details>
+
+**Try it:** Inject a broker constructor failure after database/HTTP acquisition; fill in cleanup registration.
+
+Hint: Register each callback before acquiring the next resource.
+
+<details><summary>Worked solution</summary>
+
+Use AsyncExitStack callbacks immediately; assert cleanup order HTTP then database and no successfully returned Runtime. The success case transfers the stack and closes it once.
+
+</details>

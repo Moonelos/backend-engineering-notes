@@ -103,9 +103,22 @@ when a named interaction or failure requirement demands them.
 |------|---------|
 | **Job / Task** | A unit of work submitted by the client |
 | **Dispatch** | The act of sending a task to a worker |
-| **Heartbeat** | A periodic signal proving liveness |
+| **Heartbeat** | A periodic signal that renewal was observed; silence does not prove death |
 | **Task Token** | An opaque string the worker uses to signal completion back to the orchestrator |
 | **Callback** | A message from the worker to the orchestrator (or client) saying "I'm done" |
 | **Visibility Timeout** | How long a message is hidden from other consumers after being read (SQS concept, but the pattern is universal) |
 | **Dead Letter Queue (DLQ)** | Where messages go after repeated processing failures |
 | **Backpressure** | Mechanisms that slow down producers when consumers can't keep up |
+
+## Choose a client contract
+
+**A browser needs one-way progress and must recover after the laptop sleeps. What is sufficient?**
+
+<details><summary>Reasoned answer</summary>
+
+Use SSE for low-latency progress and an authorized durable status read on reconnect. A live stream
+cannot preserve events during disconnection. If the consumer cannot keep an inbound stream but
+has a registered HTTPS endpoint, use a signed durable webhook with retries; polling remains the
+fallback. The same `state` envelope and generation-fenced result apply to each choice.
+
+</details>

@@ -23,8 +23,8 @@ capacity**. The remaining feature rows are reference material after those gates 
 | Aspect | HTTPX | aiohttp |
 |--------|-------|---------|
 | Design | High-level, requests-like API | Low-level, flexible |
-| Defaults | Safe, opinionated | Minimal, configurable |
-| Target user | Application developers | System/infrastructure developers |
+| Timeout shape | Phase inactivity; add a total clock | Total plus connection/read controls |
+| Distinct features | Sync and async APIs; HTTP/2 extra | Native WebSocket client; per-host connector limits |
 
 Run the same bounded local request through both clients. In one terminal:
 
@@ -59,7 +59,9 @@ asyncio.run(main())
 # 200 True
 ```
 
-Those two lines prove equivalent request success and lifecycle cleanup. A connection-refused error
+Those two lines prove successful status/body reads. Context managers implement cleanup;
+assert `client.is_closed` and `session.closed` after the blocks to observe closed owners.
+Neither output alone verifies peer socket teardown. A connection-refused error
 means the local server is not running; an unclosed-session warning means the aiohttp context owner
 was removed.
 
@@ -81,7 +83,6 @@ timeout = httpx.Timeout(
 **Characteristics**:
 - Clear mapping to network lifecycle
 - `read` timeout resets per chunk (safe for streaming)
-- Harder to misuse
 - Explicit about what each timeout controls
 
 ### aiohttp: Total + Socket
@@ -89,16 +90,15 @@ timeout = httpx.Timeout(
 ```python
 timeout = aiohttp.ClientTimeout(
     total=60,        # total request time
-    connect=5,       # connection establishment
+    connect=5,       # pool wait plus connection establishment
     sock_read=30,    # socket read
-    sock_connect=5   # socket connect
+    sock_connect=5   # new peer connection only
 )
 ```
 
 **Characteristics**:
 - `total` is a global ceiling
-- Easier to accidentally break streaming with `total`
-- More tuning required for correct behavior
+- Use total for finite jobs; configure long-lived subscriptions deliberately
 - In current aiohttp, `sock_read` is the maximum interval between incoming data portions, so it
   behaves as an inactivity bound and resets as data arrives
 
@@ -189,8 +189,8 @@ client = httpx.AsyncClient(http2=True)
 | Use case | Why HTTPX |
 |----------|-----------|
 | API clients | Clean, simple API |
-| Standard HTTP | Safe defaults |
-| Most production services | Guardrails prevent mistakes |
+| Standard HTTP | Explicit phase timeouts and connection limits |
+| Existing HTTPX integration | Compatible transports, mocks and sync/async API surface |
 
 ---
 
@@ -207,15 +207,18 @@ httpx.WriteTimeout      # request stalled
 
 Each exception maps to a specific phase.
 
-### aiohttp: Broader Categories
+### aiohttp: Connection, socket-read and total timeouts
 
 ```python
-aiohttp.ServerTimeoutError    # general timeout
-aiohttp.ClientConnectorError  # connection issues
-asyncio.TimeoutError          # often bubbles up
+aiohttp.ConnectionTimeoutError  # connect or sock_connect budget
+aiohttp.SocketTimeoutError      # sock_read inactivity
+aiohttp.ClientConnectorError    # connection establishment error
+asyncio.TimeoutError            # also catches total timeout
 ```
 
-Less granular, harder to handle specific failures.
+`connect` includes waiting for a pooled connection; `sock_connect` covers a new peer
+connection. The concrete subclasses preserve that distinction.
+[aiohttp reference](https://docs.aiohttp.org/en/stable/client_reference.html), checked 2026-10-30.
 
 ---
 
@@ -269,10 +272,9 @@ async with aiohttp.ClientSession() as session:
 ### Choose HTTPX If
 
 - Building an API client
-- Want predictable behavior under load
+- Want the same library interface for sync and async HTTP clients
 - Need HTTP/2
-- Want guardrails against common mistakes
-- Team has varying experience levels
+- Have existing HTTPX transports or tests to preserve
 - Standard REST/JSON APIs
 
 ### Choose aiohttp If
@@ -328,42 +330,50 @@ async with aiohttp.ClientSession() as session:
 
 ---
 
-## 11. Performance
+## 11. Benchmark the same workload
 
-### Benchmark Considerations
+Use identical concurrency, payloads, TLS, server and timeout budgets. Record throughput,
+CPU, resident memory, p95/p99 latency, error rate and cleanup under cancellation. HTTP/2
+can reduce connection count through multiplexing, but peer limits and bottlenecks still
+matter. There is no universal memory/throughput ranking independent of that workload.
 
-| Factor | HTTPX | aiohttp |
-|--------|-------|---------|
-| Raw throughput | Comparable | Comparable |
-| Connection reuse | Good | Good |
-| Memory overhead | Slightly higher | Lower |
-| HTTP/2 multiplexing | Reduces connections | N/A |
+## HTTPX2 is a separate migration decision
 
-**Reality**: For most applications, the difference is negligible. Choose based on features and ergonomics, not benchmarks.
+HTTPX2 uses the `httpx2` import and `httpcore2` transport stack. Its default truststore uses
+operating-system trust, whereas this course's HTTPX 0.28.1 uses certifi by default.
+Do not only rename imports: test private CA acceptance, wrong-host rejection, environment
+proxy/trust policy, custom transports, MockTransport fixtures and response cleanup. Keep
+old and new dependency locks so a failed migration can roll back without ambiguous imports.
+[HTTPX2 documentation](https://pydantic.dev/docs/httpx2/get-started/) (checked 2026-10-30).
 
----
+Current Starlette supports HTTPX2 for TestClient and deprecates its old HTTPX backend.
+Run endpoint and streaming-lifecycle tests on the intended lock before switching; in-process
+transport behavior is not a real-socket streaming test. HTTPX2's optional WebSocket support
+also means the older HTTPX/aiohttp feature table cannot be applied to it unchanged.
 
-## 12. Final Rule of Thumb
+## Recap
 
-> **aiohttp gives you power.**
-> **HTTPX gives you guardrails.**
+- Choose protocol, timeout and per-host requirements before comparing ergonomics.
+- Successful body reads and observed owner cleanup are different acceptance claims.
+- Both clients need explicit finite-operation budgets and cancellation/resource checks.
 
-For most API client use cases, HTTPX's safer defaults and cleaner API make it the better choice.
+## Check yourself
 
-For infrastructure, proxies, WebSockets, or when you need fine-grained control, aiohttp's flexibility is worth the complexity.
+**You need WebSockets and ten connections per host. Does HTTP/2 alone choose the client?**
 
----
+<details><summary>Reasoned answer</summary>
 
-## Summary
+No. aiohttp directly supplies those features; HTTPX2 offers a separate option to investigate.
+If HTTP/2 is also mandatory, validate one candidate against all requirements or use distinct
+owned clients. The original HTTPX 0.28.1 feature list is not HTTPX2's feature list.
 
-| Aspect | HTTPX | aiohttp |
-|--------|-------|---------|
-| Best for | API clients | Infrastructure |
-| Learning curve | Lower | Higher |
-| Defaults | Safe | Minimal |
-| Control | Medium | High |
-| HTTP/2 | Native | None |
-| WebSockets | No | Yes |
-| Footguns | Few | More |
+</details>
 
-Choose the tool that matches your use case and team expertise.
+**A finite response emits a byte every second indefinitely. Does sock_read=5 finish the job?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Repeated progress satisfies inactivity. A total deadline must end a finite operation,
+while cleanup closes the response/session resources it owns.
+
+</details>

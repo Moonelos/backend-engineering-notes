@@ -411,3 +411,35 @@ hides it from this static graph; it does not satisfy the architecture rule.
 ---
 
 **Next**: [Part 10 — Grow Without Package Ceremony](10_grow_without_package_ceremony.md)
+
+## Recap and retrieval
+
+- Fake-port tests isolate application decisions from external setup.
+- Adapter tests exercise translations and real transactional boundaries.
+- Import constraints and behavioral assertions prove different properties.
+
+**An action passes fake-port tests but imports demo.db. Which evidence catches the breach?**
+
+<details><summary>Reasoned answer</summary>
+
+Import-linter catches the forbidden source dependency. That graph check still cannot prove rollback or authorization; keep behavioral tests for those claims.
+
+</details>
+
+**A repository fake ignores duplicate keys. Which test should verify real uniqueness?**
+
+<details><summary>Reasoned answer</summary>
+
+A production-dialect test with the actual constraint and competing writes, not another fake-based action test.
+
+</details>
+
+**Try it:** Add an accidental concrete-database import to an otherwise passing action. Select two independent checks.
+
+Hint: Source coupling and transaction behavior are different boundaries.
+
+<details><summary>Worked solution</summary>
+
+The import contract fails for the new edge; a separate real-adapter transaction test detects rollback/commit failures. Neither replaces the other.
+
+</details>

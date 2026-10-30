@@ -30,7 +30,11 @@ concurrency bounds simultaneous resource occupancy.
 
 Offsets 10, 11, and 12 run concurrently. If 11 fails while 12 succeeds, committing 13 would skip 11
 on restart. Track completed offsets and advance the commit frontier only through the highest
-contiguous success—in this case, 11 until offset 11 succeeds.
+completed prefix of the records actually delivered—in this case, 11 until offset 11 succeeds.
+Kafka offsets need not be consecutive integers: compaction and transaction filtering can leave
+gaps. If the client delivers 10 and then 12, and both finish, committing 13 is safe. If it also
+delivered 11 and that work remains unfinished, committing 13 is unsafe. Track delivery order,
+not an imagined record at every integer.
 
 For simpler correctness, process each partition sequentially and parallelize across partitions.
 Add within-partition concurrency only when order is irrelevant and the commit-frontier complexity
@@ -64,7 +68,7 @@ import os
 import signal
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -103,26 +107,27 @@ def handle(raw: bytes, lease: Lease) -> None:
 
 class Frontier:
     def __init__(self) -> None:
-        self.next_offset: dict[tuple[str, int], int] = {}
+        self.delivered: dict[tuple[str, int], deque[int]] = defaultdict(deque)
         self.done: dict[tuple[str, int], set[int]] = defaultdict(set)
 
     def observe(self, topic: str, partition: int, offset: int) -> None:
-        self.next_offset.setdefault((topic, partition), offset)
+        self.delivered[(topic, partition)].append(offset)
 
     def complete(self, topic: str, partition: int, offset: int) -> None:
         self.done[(topic, partition)].add(offset)
 
     def committable(self, owned: set[tuple[str, int]]) -> list[TopicPartition]:
         result = []
-        for key, frontier in list(self.next_offset.items()):
+        for key, delivered in list(self.delivered.items()):
             if key not in owned:
                 continue
-            while frontier in self.done[key]:
-                self.done[key].remove(frontier)
-                frontier += 1
-            if frontier != self.next_offset[key]:
-                self.next_offset[key] = frontier
-                result.append(TopicPartition(key[0], key[1], frontier))
+            next_offset = None
+            while delivered and delivered[0] in self.done[key]:
+                offset = delivered.popleft()
+                self.done[key].remove(offset)
+                next_offset = offset + 1
+            if next_offset is not None:
+                result.append(TopicPartition(key[0], key[1], next_offset))
         return result
 
 
@@ -173,6 +178,8 @@ def drain(deadline: float) -> None:
 
 
 def on_assign(client, partitions) -> None:
+    global paused
+    paused = False  # pause state belongs to the old assignment, not its replacement
     keys = {(p.topic, p.partition) for p in partitions}
     for key in keys:
         generations[key] += 1
@@ -189,7 +196,7 @@ def fence(keys: set[tuple[str, int]]) -> None:
 def forget(keys: set[tuple[str, int]]) -> None:
     owned.difference_update(keys)
     for key in keys:
-        frontier.next_offset.pop(key, None)
+        frontier.delivered.pop(key, None)
         frontier.done.pop(key, None)
 
 
@@ -252,6 +259,13 @@ try:
             continue
         if message.error():
             raise RuntimeError(message.error())
+        if len(pending) >= MAX_IN_FLIGHT:
+            # poll can both install a new assignment and return its first record. Do not
+            # dispatch beyond the budget; rewind this unstarted record before pausing it.
+            consumer.seek(TopicPartition(message.topic(), message.partition(), message.offset()))
+            consumer.pause(consumer.assignment())
+            paused = True
+            continue
         position = (message.topic(), message.partition(), message.offset())
         frontier.observe(*position)
         key = position[:2]
@@ -290,6 +304,18 @@ record, start the worker with output redirected to `worker.log`, wait until `sta
 appears, then send `SIGTERM`:
 
 ```bash
+set -euo pipefail
+wait_log() {
+  local file=$1 pattern=$2 pid=$3 deadline=$((SECONDS + 45))
+  until grep -qE "$pattern" "$file"; do
+    if ! kill -0 "$pid" 2>/dev/null || (( SECONDS >= deadline )); then
+      cat "$file" >&2
+      kill -TERM "$pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.1
+  done
+}
 export KAFKA_TOPIC="orders.worker-test-$RANDOM" KAFKA_GROUP="worker-test-$RANDOM"
 docker exec kafka-notes /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --create --topic "$KAFKA_TOPIC" \
@@ -300,14 +326,13 @@ printf '%s\n' \
   docker exec -i kafka-notes /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server localhost:9092 --topic "$KAFKA_TOPIC"
 uv run --with confluent-kafka python bounded_worker.py >worker.log 2>&1 & worker_pid=$!
-until grep -q 'started evt-slow' worker.log; do kill -0 "$worker_pid"; sleep 0.1; done
+wait_log worker.log 'started evt-slow' "$worker_pid"
 kill -TERM "$worker_pid"
 wait "$worker_pid" || test "$?" -eq 2
 grep '^shutdown' worker.log
 uv run --with confluent-kafka python bounded_worker.py >restart.log 2>&1 & restart_pid=$!
-until grep -q '^effect evt-slow' restart.log && grep -q '^effect evt-fast' restart.log; do
-  kill -0 "$restart_pid"; sleep 0.1
-done
+wait_log restart.log '^effect evt-slow' "$restart_pid"
+wait_log restart.log '^effect evt-fast' "$restart_pid"
 kill -TERM "$restart_pid"
 wait "$restart_pid" || test "$?" -eq 2
 grep '^effect' restart.log
@@ -350,19 +375,29 @@ Run these commands from a shell with job control. The first consumer initially o
 partitions; starting the second member forces one partition to move:
 
 ```bash
+set -euo pipefail
+wait_log() {
+  local file=$1 pattern=$2 pid=$3 deadline=$((SECONDS + 45))
+  until grep -qE "$pattern" "$file"; do
+    if ! kill -0 "$pid" 2>/dev/null || (( SECONDS >= deadline )); then
+      cat "$file" >&2
+      kill -TERM "$pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.1
+  done
+}
 export KAFKA_TOPIC="orders.rebalance-$RANDOM" KAFKA_GROUP="rebalance-$RANDOM"
 docker exec kafka-notes /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --create --topic "$KAFKA_TOPIC" \
   --partitions 2 --replication-factor 1
 uv run --with confluent-kafka python seed_rebalance.py
 uv run --with confluent-kafka python bounded_worker.py >worker-a.log 2>&1 & worker_a=$!
-until [ "$(grep -c '^started evt-p' worker-a.log)" -ge 2 ]; do
-  kill -0 "$worker_a"; sleep 0.1
-done
+wait_log worker-a.log '^started evt-p0' "$worker_a"
+wait_log worker-a.log '^started evt-p1' "$worker_a"
 uv run --with confluent-kafka python bounded_worker.py >worker-b.log 2>&1 & worker_b=$!
-until grep -q '^revoked' worker-a.log && grep -q '^effect evt-p' worker-b.log; do
-  kill -0 "$worker_a"; kill -0 "$worker_b"; sleep 0.1
-done
+wait_log worker-a.log '^revoked' "$worker_a"
+wait_log worker-b.log '^effect evt-p' "$worker_b"
 kill -TERM "$worker_a" "$worker_b"
 wait "$worker_a" || test "$?" -eq 2
 wait "$worker_b" || test "$?" -eq 2
@@ -388,5 +423,42 @@ Do not parallelize within a partition when processing order is part of the invar
 partitions with a correct key or optimize the handler before weakening ordering.
 
 ---
+
+## Recap
+
+- Capacity bounds apply across assignment changes as well as steady-state polling.
+- The safe checkpoint follows the completed prefix of delivered records.
+- Revocation ends ownership; a late completion from an older generation cannot advance it.
+
+## Check yourself
+
+**Q: Offsets 10 and 12 finish, but delivered offset 11 fails. May the worker commit 13?**
+
+<details><summary>Answer</summary>
+
+No. Restart from 13 would skip unfinished 11. Commit at most 11. If 11 was never delivered because it is a filtered or compacted gap, the completed delivered prefix can instead advance to 13.
+
+</details>
+
+**Q: A rebalance installs fresh partitions while 100 tasks are pending. May the first new record be dispatched?**
+
+<details><summary>Answer</summary>
+
+No. The assignment has a new pause state but the process still has the same occupied capacity. The post-poll guard rewinds that unstarted record and pauses the current assignment until work drains.
+
+</details>
+
+## Try it
+
+Extract Frontier and fill assertions for deliveries [0,2,5], completions [2,0], then completion [5].
+
+Hint: Completion order differs from delivery order; absence of offset 1 is not failed work.
+
+<details><summary>Worked solution</summary>
+
+The first committable offset is 3, then 6. Completing only 2 initially yields no commit because delivered 0 is still unfinished.
+
+</details>
+
 
 **Next**: [Topic and Partition Design](04_topic_and_partition_design.md)

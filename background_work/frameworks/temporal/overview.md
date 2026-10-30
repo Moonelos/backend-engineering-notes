@@ -135,6 +135,27 @@ if __name__ == "__main__":
     asyncio.run(run_worker() if sys.argv[1] == "worker" else start_workflow())
 ```
 
+The worker can disappear during approval because the service has the history needed to rebuild the wait.
+
+```mermaid
+sequenceDiagram
+    participant W as Worker A
+    participant H as Temporal history
+    participant R as Replacement worker B
+    participant U as Reviewer
+    W->>H: Record research activity completed for run-42
+    W->>H: Wait for approve signal
+    Note over W: Worker exits
+    R->>H: Replay run-42
+    H-->>R: Recorded research result, no new provider call
+    R->>R: Rebuild approval wait
+    U->>H: approve editor-7
+    H->>R: Deliver recorded signal
+    R->>H: Schedule generate_final with stable operation key
+```
+
+The recorded activity result avoids another provider call during replay. If the provider succeeded but activity completion never reached history, an activity retry may call it again; that is why the key is stable across attempts. The signal also belongs to history, so losing the waiting worker does not lose the review decision.
+
 The result contains `artifact:run-42:run-42:generate_final:v3`. Stopping and restarting the worker while the workflow waits for approval does not lose the wait; the service history owns it.
 
 The example is minimal. Production activities also need provider timeouts, stable request hashes, heartbeat/checkpoint policy for long work, sanitized errors, and application-level evidence around external effects.
@@ -169,5 +190,36 @@ Do not use it for one independent task, a simple nightly firing, or a low-volume
 **How you know it is working**: kill workflow and activity workers at each activity boundary, resume them, and observe one explainable workflow history plus one business effect per operation key. Monitor workflow-task failures, activity retries/timeouts, stuck executions, task-queue age, and version compatibility.
 
 ---
+
+## Recap and check yourself
+
+- The service records history while workers execute workflow decisions and activities.
+- Replay rebuilds state from recorded results; an unrecorded activity completion can execute again.
+- Workflow changes must preserve replay compatibility and activities need stable effect identity.
+
+**The worker restarts after research completion was recorded but before approve arrives. Must research call its provider again?**
+
+<details><summary>Answer</summary>
+
+No. Replay uses the activity result in history and reconstructs the wait. If completion was never recorded, the activity may run again and needs idempotency.
+
+</details>
+
+**A workflow uses a fresh random business operation key each time an activity retries. Is history sufficient to prevent double charging?**
+
+<details><summary>Answer</summary>
+
+No. Retries can repeat an unrecorded effect. Keep the business operation key stable independently of execution attempt identity.
+
+</details>
+
+**Try it:** Pause after recorded research completion, restart the worker, then send approval. Fill an expected event trace: research completed → ... → generation scheduled.
+
+<details><summary>Hint and worked solution</summary>
+
+Replay reconstructs the wait from history; it is not a second research invocation. The middle step is replayed approval wait followed by the recorded approval signal. Assert one recorded research result; separately test an activity whose completion was not recorded, which may be attempted again.
+
+</details>
+
 
 **Next**: [LangGraph for Checkpointed Agent Workflows](../langgraph/overview.md)

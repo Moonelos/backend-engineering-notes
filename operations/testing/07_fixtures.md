@@ -72,8 +72,12 @@ async def client():
 @pytest.fixture(autouse=True)
 def reset_dependency_overrides():
     """Ensure no override leaks between tests."""
-    yield
-    app.dependency_overrides.clear()
+    previous = app.dependency_overrides.copy()
+    try:
+        yield
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
 ```
 
 `autouse=True` makes the fixture run automatically for every test — no need to list it in each signature. See [05 — Dependency Overrides](05_dependency_overrides.md) for why this matters.
@@ -132,6 +136,19 @@ def db_session(engine, tables):
     conn.close()
 ```
 
+Fixture dependencies also determine reverse teardown order:
+
+```mermaid
+flowchart LR
+    E[Engine setup] --> T[Tables setup] --> S[Connection and transaction] --> U[Test user rows]
+    U --> C[Close session] --> R[Rollback transaction] --> D[Close connection]
+    D --> X[Drop tables at owner scope] --> Z[Dispose engine]
+```
+
+The session cannot outlive its connection and the connection cannot outlive its engine. Register
+cleanup before later setup can fail; `yield` teardown is reached only after the fixture successfully
+yielded, so use context managers or immediate finalizers for multi-step acquisition failures.
+
 ### The Scope Trade-Off
 
 Larger scope is faster but more coupled. A session-scoped `db_session` would be fast, but two tests running in it would see each other's writes. The convention is:
@@ -153,8 +170,10 @@ def make_user(db_session):
     """Factory fixture — create users with custom attributes."""
     created = []
 
-    def _make_user(username="testuser", email="test@example.com", role="user"):
-        user = User(username=username, email=email, role=role)
+    def _make_user(username=None, email=None, role="user"):
+        n = len(created) + 1
+        user = User(username=username or f"user_{n}",
+                    email=email or f"user_{n}@example.com", role=role)
         db_session.add(user)
         db_session.flush()
         created.append(user)
@@ -290,3 +309,35 @@ def test_env_defaults(monkeypatch):
 ## Next
 
 - [08 — Database Testing](08_database_testing.md) — put these fixture patterns to use with real (or fake) databases.
+
+## Recap and retrieval
+
+- Fixtures express acquisition dependencies and reverse teardown ownership.
+- Expensive servers may be shared while rows and overrides reset per test.
+- Factories must generate unique defaults when the schema enforces uniqueness.
+
+**Two tests need different users and one expensive server. Which state can be shared?**
+
+<details><summary>Reasoned answer</summary>
+
+The server only if isolation is explicit; give identities, rows, overrides and transaction state function lifetime and restore surrounding state on failure.
+
+</details>
+
+**A factory creates admin and target with different usernames but the same default email. What fails?**
+
+<details><summary>Reasoned answer</summary>
+
+A unique-email constraint. Generate distinct email defaults, and specify duplicates explicitly only in tests intended to assert rejection.
+
+</details>
+
+**Try it:** Create three users without specifying emails, then create an intentional duplicate in a constraint test.
+
+Hint: The factory counter supplies unique defaults; explicit arguments still win.
+
+<details><summary>Worked solution</summary>
+
+Use user_1@example.com through user_3@example.com by default. Pass a prior address explicitly for the duplicate test and assert the production constraint outcome.
+
+</details>

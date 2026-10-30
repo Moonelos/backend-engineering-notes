@@ -1,565 +1,177 @@
-# Part 4: Kubernetes and Distributed Systems
+# Part 4: Preserve the provider budget while replicas change
 
-<!-- length-justification: This is the Kubernetes continuation for outbound-call controls; replica multiplication, shared quotas, autoscaling, disruption, ingress, and shutdown remain together because each changes the effective global budget. -->
+> **Who this is for**: Readers who have run [the caller](03_call_patterns.md) and understand
+> process-local ownership. Kubernetes controller mechanics are taught in the
+> [runtime chapter](../../../operations/deployment/03_kubernetes_runtime.md).
 
-> **Who this is for**: Engineers who already bound calls in one process and need those guarantees to survive multiple Kubernetes pods and autoscaling.
+The provider allows 500 starts per minute. Ten processes each create a local limiter of
+500/minute. Each limiter is correct locally, yet the fleet can start 5,000/minute. The
+error is the owner of the counter, not an insufficiently strict local implementation.
 
-> **Principle**: Per-pod rate limiters are process-local. Vendor limits are global.
+## Trace one burst before scaling it
 
-> **Key insight**: Replication multiplies every process-local allowance, so a global promise requires either partitioned budgets or one atomic shared decision.
+One process receives 500 requests at t=0. It has 50 active slots; each admitted operation
+lasts 30 seconds; admission may wait five seconds. Assume the rate policy initially permits
+80 starts. Only 50 can start: thirty extra rate permissions cannot create execution slots.
+No slot frees before t=30, so all remaining 450 requests exceed the five-second wait budget
+unless they were rejected earlier by a waiter cap.
 
-> **See also**: [Part 9 — Distributed Admission Control](09_distributed_admission_control.md) for the full Redis-centric pattern. This file establishes *why* per-pod limiters fail at scale; Part 9 covers the production-grade replacement (atomic Lua admission scripts, key taxonomy, retries-vs-quota accounting). The `GlobalVendorRateLimiter` shown below is a minimal example of the broader admission controller pattern.
+With a cap of 100 waiting callers, the result is sharper: 50 active, 100 waiting, 350 rejected
+immediately. At t=5 the 100 waiters time out; at t=30 the 50 active operations finish.
+An ordinary semaphore without that waiter cap would initially allocate all 450 waiting tasks.
 
----
+| Time | Active | Waiting | Completed | Rejected so far |
+|---|---:|---:|---:|---:|
+| t0 after admission | 50 | 100 | 0 | 350 |
+| t5 after wait deadline | 50 | 0 | 0 | 450 |
+| t30 | 0 | 0 | 50 | 450 |
 
-## 1. The Fundamental Problem
+The provider start allowance and execution concurrency answer different questions. Measure
+both before increasing either. A rejection can be a successful capacity-control decision,
+but it is still a user outcome that must appear in the product's SLI.
 
-### Scenario
+## Local controls protect a process; shared controls conserve a fleet allowance
 
-Assume:
-- Vendor rate limit: **500 requests / minute**
-- Kubernetes pods: **10**
-- Each pod uses:
-  ```python
-  AsyncLimiter(500, 60)
-  ```
-
-### What Happens?
-
-Each pod independently believes it may send **500 req/min**.
-
-**Actual cluster behavior**:
-
-```
-Total cluster rate = 10 × 500 = 5,000 req/min ❌
-```
-
-The vendor limit is **exceeded by 10x**.
-
-### Why This Happens
-
-There is **no shared state** between pods:
-- Each pod has its own memory
-- Each `AsyncLimiter` is independent
-- Pods cannot "see" each other's activity
-
-**Key fact**:
-
-> **Per-pod rate limiters are process-local.**
-> **Vendor limits are global.**
-
----
-
-## 2. What "Local Fairness" Actually Means
-
-Local fairness is **not about the vendor**.
-
-It means:
-
-> **Protecting a single pod from overload, even if the cluster is healthy.**
-
-### What Local Fairness Protects
-
-Pod-level resources:
-- CPU
-- Memory
-- Socket pools
-- Event loop responsiveness
-- Tail latency
-- Pod stability
-
-### What Local Fairness Ensures
-
-- No single pod collapses under burst traffic
-- Load is smoothed locally
-- Failures are fast and controlled
-- Health checks continue to pass
-
-**Mental model**:
-
-> Local rate limiting is about **pod survivability**, not vendor protection.
-
----
-
-## 3. Bursty Traffic Scenario
-
-### Setup
-
-Assume:
-- Vendor rate limit: **500 req/min** (global)
-- Each pod can safely handle: **50 concurrent outbound calls**
-- Suddenly: **500 requests arrive at ONE pod**
-
-### Without Local Limits
-
-```
-500 requests arrive
-  ↓
-500 async tasks start
-  ↓
-500 HTTP calls open
-  ↓
-Sockets exhausted
-Memory pressure
-Event loop starvation
-Latency explodes
-Retries amplify load
-Health checks fail
-Pod removed from service
-  ↓
-Cascading failure to other pods
+```mermaid
+flowchart LR
+ subgraph P1[Process 1]
+ L1[Local slots and waiter cap]
+ end
+ subgraph P2[Process 2]
+ L2[Local slots and waiter cap]
+ end
+ L1 --> R[Atomic shared provider admission: 500 per minute]
+ L2 --> R
+ P3[New and surge processes] --> R
+ R --> V[Provider]
 ```
 
-**Even if the vendor limit is respected globally, the pod dies first.**
+Every actual attempt, including retries, passes through the same shared decision. Scaling
+to 20 processes increases local capacity and placement choices; it does not change the
+provider's 500/minute contract. Two workers in each pod are two independent local owners,
+so count processes, not just pod objects, when calculating local capacity.
 
----
+A gateway's per-replica counter has the same multiplication problem. Its location at the
+front of the fleet does not prove that its state is shared. Test with two replicas and
+observe total admitted provider starts, rather than looking only at one pod's metric.
 
-## 4. Correct Layered Handling
+## Three allocation strategies and their trade-offs
 
-### Layer 1: Local Concurrency Cap (Semaphore)
+| Strategy | One shared quota stays conserved when… | Main cost |
+|---|---|---|
+| Atomic shared admission | Every attempt consults one authoritative decision | Extra latency and dependency availability |
+| Static partition | All disjoint allocations sum to at most 500, including overlap | Idle allocations cannot move automatically |
+| Leased allocation | Grant/renew/expiry and generation fencing prevent double-spending | More ownership and recovery logic |
 
-```python
-llm_sem = asyncio.Semaphore(50)
+Static partitioning is not inherently wrong. Ten processes can each own 50/minute, but
+adding ten more cannot independently grant another 50 to each. Transfer allocations only
+when old owners stop spending them, or issue nonoverlapping leases with explicit expiry.
+Partitioned budgets can waste spare capacity; a shared authority pools it more flexibly.
+
+For a 10-to-15 rolling overlap, ten old allocations of 50 already consume the complete
+500. Giving each new process 50 adds 250 that the provider never granted. Drain/revoke old
+allocations before transferring them, or use the shared authority so old and new processes
+compete within the same allowance. A process restart must not reset durable daily spend.
+
+## Why two Redis commands are not one admission decision
+
+Consider one remaining permit. W1 reads count=499; W2 also reads 499; both decide to allow
+and increment. The count becomes 501 after two successful starts. Locking only the Python
+process cannot serialize another process. Evaluate the eligibility check and reservation
+atomically at the state owner.
+
+```mermaid
+sequenceDiagram
+ participant W1 as Worker 1
+ participant R as Shared counter
+ participant W2 as Worker 2
+ W1->>R: Atomic admit attempt A at count 499
+ R-->>W1: Granted; count becomes 500
+ W2->>R: Atomic admit attempt B
+ R-->>W2: Denied; count remains 500
 ```
 
-**Purpose**: "This pod will never have more than 50 in-flight vendor calls."
+The complete two-client Redis implementation and failure tests belong to
+[Part 9](09_distributed_admission_control.md). It also owns key slotting, expiry, script
+cache reload, ambiguous command outcomes and failover policy. An isolated `INCR` example
+cannot stand in for those requirements.
 
-**Effect**:
-- First 50 requests run
-- Remaining 450 requests wait or fail fast
-- The pod survives
+The local caller accepts `attempt_admission(operation_id, attempt_no)` as an async context
+manager. Entry returns only after the shared decision; exit releases its attempt lease
+when the response is closed. The `(operation_id, attempt_no)` identity lets the adapter
+recover an admission whose response was lost. Incrementing a counter with a new random ID
+after every timeout can charge or reserve twice. User logical-request quota is separate
+from provider-attempt quota: one user request with three attempts need not count as three
+user requests, but it does consume three provider starts.
 
-This is a **capacity guard**, not a rate limit.
+## Capacity choices follow the bottleneck
 
-> ⚠️ **The semaphore is per-pod, just like the rate limiter.** `asyncio.Semaphore(50)` caps in-flight calls *within one process*. With 10 pods, cluster-wide concurrency is `10 × 50 = 500`, not 50. You cannot bound *global* concurrency with an in-process semaphore — that needs distributed admission control ([Part 9](09_distributed_admission_control.md)). The local semaphore protects the pod; it says nothing about the cluster.
+For 10 admitted attempts/s and two-second mean duration, expected active demand is 20.
+Compare it with the provider's measured capacity and the process's memory, CPU and connection
+cost. Choose headroom for bursts and a hard active cap; then measure rejection, queue age,
+pool wait and attempt duration under load. A semaphore larger than a socket pool can be
+reasonable with HTTP/2, or can create a deliberate bounded HTTP/1.1 pool wait. It is not
+universally forbidden; the queues and protocol determine the consequence.
 
-### Layer 2: Local Queue Timeout (Admission Control)
+Local start spacing smooths bursts but does not guarantee tenant fairness. A hot tenant
+can occupy the same local queue before another arrives. Add authenticated per-tenant limits
+or a bounded fair scheduler when that outcome violates the product contract. Limit the
+number of tracked tenant queues too, or attacker-created identities can exhaust memory.
 
-```python
-async with asyncio.timeout(5):
-    async with llm_sem:
-        ...
-```
+Autoscaling can relieve CPU or local wait caused by insufficient local capacity. It cannot
+increase a fixed provider allowance or repair a slow dependency. If CPU is low, provider
+429s rise and the shared budget is exhausted, adding pods mainly creates more contenders.
+Scale using a signal tied to the actual local bottleneck and verify that total provider
+attempts remain conserved during a rollout and a restart.
 
-**Purpose**: "If a request cannot start within 5 seconds, reject it."
+## Decide the shared-state outage policy before it happens
 
-**Effect**:
-- No unbounded queues
-- No silent latency growth
-- Fast 504/429 response to client
+If Redis is unavailable, do not silently fall back to 500/minute *per process*. Strict quota
+or spend protection should deny new protected work until admission can be established.
+A degraded mode is possible only with an explicitly reserved, bounded allowance and a
+policy for reconciling uncertain admissions. A lease expiry frees bookkeeping; it does not
+prove the old remote operation stopped. Long operations need renewal/fencing policy or a
+conservative capacity assumption.
 
-### Layer 3: Local Rate Limiter (Fairness, NOT Vendor Protection)
+Load balancing is not fairness. Independent requests may land on unevenly loaded pods;
+sticky routing may worsen a hot user's concentration. Return the documented overload status,
+measure per-process skew, and retry only under the caller's bounded safe-operation policy.
+Moving retries among pods must not bypass the shared provider decision.
 
-**Do NOT use the vendor rate.**
+## Production-readiness checks
 
-Instead, base it on **pod capacity**.
+- Measure total starts through two processes, then a rollout overlap; the quota stays conserved.
+- Reject above the local waiter cap without allocating another unbounded task or queue.
+- Retry consumes provider capacity again while logical-user accounting follows its separate contract.
+- Exercise Redis denial, timeout after admission, restart and failover with stable identities.
+- Observe admission duration, rejection reason, active leases, oldest waiter and retry amplification.
+- Keep provider credentials out of limiter keys, metrics and logs; authorize operator overrides.
 
-#### Calculate Pod Capacity
+## Recap
 
-```
-Assumptions:
-- Semaphore = 50
-- Average vendor latency ≈ 30s
+- Rate permission cannot create a free concurrency slot.
+- Process-local correctness does not imply a conserved fleet quota.
+- Shared atomic decisions or correctly partitioned grants survive replica and rollout changes.
+- A dependency outage needs an explicit admission policy, not an accidental local fallback.
 
-Sustainable throughput:
-throughput ≈ semaphore / avg_latency
-throughput ≈ 50 / 30s
-throughput ≈ 1.67 req/sec
-throughput ≈ 100 req/min
-```
-
-#### Set Local Rate Limiter
-
-```python
-llm_rate = AsyncLimiter(80, 60)  # 80/min with safety margin
-```
-
-**Purpose**:
-- Smooths bursts
-- Prevents self-overload
-- Keeps latency predictable
-- **NOT** for vendor protection
-
-### What Happens to 500 Incoming Requests
-
-With semaphore=50, local rate=80/min, queue timeout=5s:
-
-| Requests | Outcome |
-|----------|---------|
-| ~50 | Start immediately |
-| ~30 | Start gradually (rate-limited queue) |
-| ~420 | Fail fast (queue timeout → 504/429) |
-
-**The pod remains stable.**
-
----
-
-## 5. How the Vendor Is Actually Protected
-
-**Not by per-pod logic.**
-
-Vendor protection requires a **global rate limiter**.
-
-### Options
-
-| Solution | Pros | Cons |
-|----------|------|------|
-| Redis-based token bucket | Precise, cluster-wide | Requires Redis |
-| API Gateway rate limiting | Simple, external | Less flexible |
-| Istio/Envoy rate limiting | Service mesh integration | Complex setup |
-
-Only a **shared, cluster-wide limiter** can enforce:
-
-```
-Σ(vendor calls from all pods) ≤ vendor limit
-```
-
----
-
-## 6. Redis-Based Global Rate Limiter
-
-```python
-import asyncio
-import redis.asyncio as redis
-import time
-from fastapi import HTTPException
-
-
-class VendorRateLimitExceeded(Exception):
-    """Raised when vendor rate limit is exceeded after waiting."""
-    pass
-
-
-class GlobalVendorRateLimiter:
-    """
-    Redis-backed global rate limiter for vendor API calls.
-    Uses a sliding-window algorithm.
-
-    NOTE: This is a teaching example. The check (zcard) and the write
-    (zadd) are separate round-trips, so concurrent callers can both pass
-    the check before either writes — the limiter can overshoot under load.
-    Part 9 replaces this with a single atomic Lua script that has no such
-    race. Do not copy this verbatim into production.
-    """
-    
-    def __init__(
-        self,
-        redis_client: redis.Redis,
-        vendor_key: str,
-        limit: int,
-        window_seconds: int = 60,
-    ):
-        self.redis = redis_client
-        self.key = f"vendor:rate:{vendor_key}"
-        self.limit = limit
-        self.window = window_seconds
-    
-    async def acquire(self) -> bool:
-        """
-        Try to acquire a token immediately.
-        Returns True if acquired, False if rate limit exceeded.
-        """
-        now = time.time()
-        window_start = now - self.window
-        
-        pipe = self.redis.pipeline()
-        pipe.zremrangebyscore(self.key, 0, window_start)
-        pipe.zcard(self.key)
-        results = await pipe.execute()
-        
-        count = results[1]
-        
-        if count >= self.limit:
-            return False
-        
-        await self.redis.zadd(self.key, {f"{now}": now})
-        await self.redis.expire(self.key, self.window + 10)
-        
-        return True
-    
-    async def wait_and_acquire(self, timeout: float = 5.0) -> None:
-        """
-        Wait up to timeout seconds to acquire a token.
-        
-        Why wait instead of immediate rejection?
-        - Avoids socket overhead from client retries
-        - Reduces connection churn
-        - Smooths burst traffic
-        - Often succeeds within a few hundred ms
-        
-        Raises:
-            VendorRateLimitExceeded: if timeout exceeded without acquiring.
-        """
-        start = time.time()
-        
-        while True:
-            if await self.acquire():
-                return  # Success
-            
-            elapsed = time.time() - start
-            if elapsed >= timeout:
-                raise VendorRateLimitExceeded(
-                    f"Could not acquire vendor token within {timeout}s"
-                )
-            
-            # Brief wait before retry - avoids Redis hammering
-            # and often succeeds as other requests complete
-            await asyncio.sleep(0.1)
-
-
-# === GLOBAL INITIALIZATION (at app startup) ===
-redis_client: redis.Redis = None
-
-vendor_limiter = GlobalVendorRateLimiter(
-    redis_client=redis_client,  # Set during startup
-    vendor_key="openai",
-    limit=500,
-    window_seconds=60,
-)
-```
-
-### Two Approaches: Immediate vs Wait
-
-| Approach | Use when | Behavior |
-|----------|----------|----------|
-| `acquire()` | Need instant decision | Returns bool immediately |
-| `wait_and_acquire()` | Can tolerate brief wait | Waits up to timeout, then fails |
-
-**Why `wait_and_acquire` is often better:**
-
-- Client retry creates new TCP connection → expensive
-- Waiting 100-200ms often succeeds as tokens become available
-- Reduces overall system load
-- Smoother traffic pattern
-
-### Usage with Local Protections
-
-The limiter above is intentionally non-atomic teaching code and must not back a copyable production
-path. In production, bind `vendor_limiter` to the atomic Lua-backed implementation in
-[Part 9: Distributed Admission Control](09_distributed_admission_control.md); the usage below assumes
-that implementation.
-
-```python
-import asyncio
-import httpx
-from aiolimiter import AsyncLimiter
-
-# === GLOBAL PRIMITIVES (created once at startup) ===
-llm_sem = asyncio.Semaphore(50)
-llm_rate_local = AsyncLimiter(80, 60)
-client: httpx.AsyncClient = None
-
-
-async def call_llm(payload: dict):
-    # Global vendor protection with wait
-    await vendor_limiter.wait_and_acquire(timeout=3.0)
-    
-    # Local capacity protection
-    async with llm_sem:
-        async with asyncio.timeout(30):
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                json=payload,
-            )
-            response.raise_for_status()
-            return response.json()
-```
-
----
-
-## 7. Correct Production Architecture
-
-```
-Incoming traffic
-  ↓
-Load Balancer (Kubernetes Service)
-  ↓
-[Per-Pod Layered Defense]
-  ↓
-  Local queue timeout (fail fast)
-  ↓
-  Local semaphore (machine capacity)
-  ↓
-  Local rate limiter (fairness / smoothing)
-  ↓
-  GLOBAL vendor rate limiter (Redis)
-  ↓
-Vendor API
-```
-
-### Responsibility Separation
-
-| Layer | Scope | Purpose |
-|-------|-------|---------|
-| Queue timeout | Local | Admission control |
-| Semaphore | Local | Pod capacity protection |
-| Local rate limiter | Local | Burst smoothing |
-| Global rate limiter | Global | Vendor contract enforcement |
-
----
-
-## 8. How to Choose Values
-
-### Semaphore Size
-
-```
-= maximum concurrent calls the pod can safely handle
-```
-
-Based on:
-- CPU cores
-- Memory available
-- Socket/connection limits
-- Vendor latency profile
-
-Typical values:
-- Small pods: 20-50
-- Medium pods: 50-100
-- Large pods: 100-200
-
-**Never**:
-- Unlimited
-- Larger than your socket pool
-- Based on vendor limits (that's global)
-
-### Local Rate Limiter
-
-```
-≈ (semaphore / avg_vendor_latency) × safety_margin
-
-safety_margin ≈ 0.7 - 0.9
-```
-
-Example:
-```
-semaphore = 50
-avg_latency = 30s
-safety = 0.8
-
-local_rate ≈ (50 / 30) × 0.8 ≈ 1.33 req/sec ≈ 80 req/min
-```
-
-### Global Rate Limiter
-
-```
-= vendor contract (exactly)
-```
-
-**Never**:
-- Per pod
-- Divided by number of pods
-- Based on local capacity
-
----
-
-## 9. Kubernetes Autoscaling Considerations
-
-### The Problem
-
-With Horizontal Pod Autoscaler (HPA):
-- Pods scale up → total cluster capacity increases
-- Per-pod rate limiters remain the same
-- **Vendor limits are still global**
-
-```
-Initial: 10 pods × 80 req/min = 800 req/min (local capacity)
-Scaled: 20 pods × 80 req/min = 1,600 req/min (local capacity)
-
-But vendor limit = 500 req/min (global) ❌
-```
-
-### The Solution
-
-**Global rate limiter must be**:
-- Shared across all pods
-- Independent of pod count
-- Enforced at the cluster level
-
-**Never**:
-- Divide vendor limit by pod count
-- Reconfigure on scale events
-- Rely on "coordination" between pods
-
----
-
-## 10. Rolling Deployments
-
-### The Problem
-
-During rolling deployments:
-- Old pods still running
-- New pods starting
-- **Total pod count temporarily increases**
-
-```
-Normal: 10 pods
-During deploy: 10 old + 5 new = 15 pods temporarily
-```
-
-Per-pod local limits based on "expected cluster size" will be wrong.
-
-### The Solution
-
-Use a **global rate limiter** that is:
-- Independent of deployment state
-- Shared across old and new pods
-- Enforced regardless of pod count
-
----
-
-## 11. Load Balancer Behavior
-
-### Non-Deterministic Distribution
-
-Load balancers distribute traffic:
-- Round-robin
-- Least connections
-- Random
-- **NOT based on internal pod state**
-
-This means:
-- One pod might be overloaded
-- Another pod might be idle
-- LB doesn't know about semaphore pressure
-
-### Handling Imbalance
-
-1. **Readiness probes** (reactive)
-   - Overloaded pod fails health check
-   - LB stops routing to it
-
-2. **Fast queue timeouts** (proactive)
-   - Overloaded pod rejects quickly (504/429)
-   - Client retries
-   - LB routes retry to different pod
-
-3. **Connection-based routing**
-   - Use least-connections algorithm
-   - Better distribution under uneven load
-
----
-
-## 12. Summary: Local vs Global
-
-| Concern | Scope | Mechanism |
-|---------|-------|-----------|
-| Pod capacity | Local | Semaphore |
-| Pod admission | Local | Queue timeout |
-| Burst smoothing | Local | Local rate limiter |
-| Vendor protection | Global | Redis rate limiter |
-
-### Key Principles
-
-1. ❌ Per-pod rate limiting does **NOT** protect vendor APIs
-2. ✅ Per-pod rate limiting provides **local fairness**
-3. ✅ Semaphores enforce **machine capacity**
-4. ✅ Global rate limiting enforces **vendor contracts**
-5. ❗ Kubernetes autoscaling and deployments require global coordination
-
-### Design Principle
-
-> **We enforce vendor limits globally and protect each pod locally from overload.**
-
----
-
-**Next**: [Part 5: Production Architecture](05_production_architecture.md) — complete stack and execution order.
+## Check yourself
+
+**Five surge processes join ten existing processes. What allowance must remain unchanged?**
+
+<details><summary>Reasoned answer</summary>
+
+The aggregate 500 starts/minute across all old, new and other provider consumers. New local
+slots do not create quota. Shared admission or conserved allocation transfers maintain it.
+
+</details>
+
+**Why do the other 450 burst requests fail despite an 80-start rate allowance?**
+
+<details><summary>Reasoned answer</summary>
+
+All 50 execution slots remain occupied for 30 seconds, beyond the five-second admission
+budget. The thirty unused rate permissions do not release those slots.
+
+</details>
+
+**Next**: [Compose the runtime and deployment boundaries](05_production_architecture.md).

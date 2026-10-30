@@ -110,4 +110,29 @@ retention. Separate topics and integrate deliberately.
 
 ---
 
+## Recap
+
+- A topic groups data with one retention, access and contract lifecycle.
+- Partitions buy independent work only when the key distribution and downstream capacity permit it.
+- Changing partition count changes placement; retention and compaction preserve different histories.
+
+## Check yourself
+
+**Q: Handler capacity doubles after nine partitions were created. Can the topic shrink to three in place?**
+
+<details><summary>Answer</summary>
+
+No. Kafka cannot decrease a topic partition count in place. Keep nine or migrate to a new topic with explicit key-order and checkpoint handling.
+
+</details>
+
+**Q: One order key carries half the traffic. Will doubling partitions halve its processing time?**
+
+<details><summary>Answer</summary>
+
+No. That key still maps to one partition. Measure that serial workload and choose a different business invariant or processing design before changing the key.
+
+</details>
+
+
 **Next**: [Schema Registry and Serialization](05_schema_registry_and_serialization.md)

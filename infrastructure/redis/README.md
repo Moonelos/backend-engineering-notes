@@ -72,3 +72,14 @@ reference material, not prerequisites.
 - **Networking basics** — TCP connections, client-server model, connection pooling
 - [Concurrency & Async](../../fundamentals/concurrency/async/01_event_loop_and_tasks.md) — event loops before using async Redis clients
 - [FastAPI Dependency Injection](../../fundamentals/fastapi/02_dependency_injection.md) — for the FastAPI integration patterns in `04`
+
+## What's changing — checked 2026-10-30
+
+The runnable baseline remains Redis 7.x. **GA, migration context:** Redis 8.2 adds stream deletion
+policies and 8.6 adds bounded producer deduplication; [Streams](02_pubsub_and_streams.md) separates
+these from business-effect idempotency. **GA:** 8.10 adds cumulative stream reply limits and an
+MP-AOF node-backup path; check client support and rehearse restore before changing commands.
+[8.10 features](https://redis.io/docs/latest/develop/whats-new/8-10/).
+**PREVIEW:** 8.12's release candidate includes set-member expiration and protected-from-eviction
+keys. Treat those as migration experiments, not guarantees available on this 7.x baseline.
+[8.12 release notes](https://redis.io/docs/latest/operate/oss_and_stack/stack-with-enterprise/release-notes/redisce/redisos-8.12-release-notes/).

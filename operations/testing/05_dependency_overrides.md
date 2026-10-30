@@ -6,12 +6,15 @@
 ## Smallest observable override
 
 ```python
+previous = app.dependency_overrides.copy()
 app.dependency_overrides[get_current_user] = lambda: User(id="test-user")
 try:
-    response = TestClient(app).get("/me")
-    assert response.json() == {"id": "test-user"}
+    with TestClient(app) as client:
+        response = client.get("/me")
+        assert response.json() == {"id": "test-user"}
 finally:
-    app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.clear()
+    app.dependency_overrides.update(previous)
 ```
 
 The visible result is the fake identity in the response; seeing a production user means the
@@ -184,8 +187,9 @@ def test_something():
 ```
 
 ```python
-# ✅ Okay — clean up with try/finally
+# ✅ Restore enclosing overrides even if the request fails
 def test_something():
+    previous = app.dependency_overrides.copy()
     app.dependency_overrides[get_db] = fake_db
     try:
         with TestClient(app) as client:
@@ -193,6 +197,7 @@ def test_something():
             assert response.status_code == 200
     finally:
         app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
 ```
 
 ```python
@@ -215,6 +220,24 @@ erase that baseline after the first test and allow later tests to call the produ
 > **Do this in `conftest.py` once, for the whole project.** Debugging a test suite where override state leaks between tests is among the least rewarding activities in software.
 
 ---
+
+Follow a nested override through failure to see why cleanup restores rather than merely empties:
+
+```mermaid
+sequenceDiagram
+    participant O as Outer DB fixture
+    participant M as App override mapping
+    participant I as Inner auth fixture
+    O->>M: get_db maps to test_db
+    I->>M: Snapshot existing mapping
+    I->>M: Add get_current_user to fake_auth
+    Note over I: Request assertion fails
+    I->>M: Finally restore snapshot
+    M-->>O: get_db still maps to test_db
+```
+
+The inner fixture owns only its temporary changes. Restoring the snapshot preserves the outer
+fixture's connection boundary; clearing everything can silently re-enable a production dependency.
 
 ## Overriding Only for a Block
 
@@ -291,3 +314,35 @@ Refactoring for testability is a feature, not a chore. If you cannot test a piec
 ## Next
 
 - [06 — Async Testing](06_async_testing.md) — pytest-asyncio configuration, async fixtures, the sync/async pitfalls.
+
+## Recap and retrieval
+
+- Overrides map exact dependency callable identities to replacements.
+- Installing on a different app or callable leaves the production edge unchanged.
+- Cleanup restores the enclosing mapping so nested fixtures retain their guarantees.
+
+**An outer fixture installs a test database and an inner test installs fake auth. What does inner cleanup restore?**
+
+<details><summary>Reasoned answer</summary>
+
+The prior mapping including the outer database override. Clearing the dictionary alone can reconnect later requests to the real dependency.
+
+</details>
+
+**A wrapper has the same name as get_db. Will it match a Depends(get_db) key?**
+
+<details><summary>Reasoned answer</summary>
+
+Only if it is the same callable object. Names are descriptive; dictionary key identity controls replacement.
+
+</details>
+
+**Try it:** Start with {get_db: test_db}, install fake auth in an inner context, then raise an exception. Fill in cleanup.
+
+Hint: Snapshot before mutation and use finally.
+
+<details><summary>Worked solution</summary>
+
+Clear and update from the snapshot in finally. Assert get_db still maps to test_db and fake auth is absent after the exception.
+
+</details>

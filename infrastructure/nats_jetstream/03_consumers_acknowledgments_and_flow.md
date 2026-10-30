@@ -64,7 +64,7 @@ that window with idempotency.
 
 ## 3. Four bounds prevent one worker from owning the stream
 
-- `AckWait` is the initial processing lease; set it above normal processing time or send progress.
+- `AckWait` is the initial redelivery timer; it does not fence or stop the original worker; set it above normal processing time or send progress.
 - `BackOff` defines redelivery delays and overrides the simple `AckWait` redelivery schedule.
 - `MaxDeliver` bounds attempts but does not itself move failed work to another stream.
 - `MaxAckPending` caps delivered-but-unacknowledged messages and therefore bounds in-flight work.
@@ -73,8 +73,9 @@ For 20 concurrent tasks that usually finish in 2 seconds and may take 15 seconds
 might use `MaxAckPending=20`, `AckWait=30s`, and delayed retries of `5s, 30s, 5m`. The values must
 follow measured task latency and downstream capacity, not broker throughput.
 
-> **Key insight**: consumer configuration is a distributed lease and admission-control policy, not
-> just a way to select messages.
+> **Key insight**: consumer configuration controls delivery timers and admission. Timer expiry can
+> allow another delivery while the first external operation still runs; only the effect store can
+> enforce idempotency or fencing.
 
 ---
 

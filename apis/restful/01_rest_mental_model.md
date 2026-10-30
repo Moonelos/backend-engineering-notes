@@ -176,4 +176,29 @@ Do not add a second API technology to repair a bad domain model. First confirm t
 
 ---
 
+
+## Recap
+
+- A resource has identity independently of a particular representation.
+- Stateless requests carry the context needed to interpret each operation.
+- Server-held resource state is compatible with stateless interactions.
+
+## Check yourself
+
+**A server stores orders but every request identifies its order and sends credentials. Is storage alone a violation of statelessness?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Resource state belongs on the server; hidden conversational context needed to interpret the next request is the relevant distinction.
+
+</details>
+
+**The server requires a previous hidden wizard step to understand GET /checkout. What is missing?**
+
+<details><summary>Reasoned answer</summary>
+
+The request lacks the application context needed for independent interpretation. Give the workflow explicit resource identity and state.
+
+</details>
+
 **Next**: [HTTP Semantics](02_http_semantics.md)

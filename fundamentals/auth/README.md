@@ -62,17 +62,40 @@ Most of this section is about **token-based** auth (JWTs + an auth header). The 
 |-----------|-----------------|------------------------|
 | **Revocation** | Instant — delete the row, user is logged out on next request | Not instant — tokens stay valid until `exp`. Need a deny-list for immediate cutoff (see [cognito/tokens.md § Token Revocation](./cognito/tokens.md#token-revocation)) |
 | **Stateless servers** | No — session store is a required dependency | Yes — verify the signature, read claims |
-| **Cross-domain** | Hard — cookies are scoped to a domain; third-party cookies are dying in browsers | Easy — Bearer token in the `Authorization` header works anywhere |
+| **Cross-domain** | Cookie scope, browser policy and credentials mode constrain delivery | Explicit bearer delivery still needs CORS permission in browsers and the recipient's audience policy |
 | **Mobile / CLI clients** | Awkward — needs cookie jar emulation | Natural — fetch a token, send as header |
-| **XSS risk** | Lower — cookie can be `HttpOnly` and the JS can't read it | Higher — tokens are usually stored in localStorage or memory where JS can reach them |
+| **XSS risk** | HttpOnly prevents direct cookie reads; injected scripts may still act as the user | Script-readable tokens can be stolen; HttpOnly token cookies trade this for cookie/CSRF concerns |
 | **CSRF risk** | Yes — cookies are sent automatically by the browser; use CSRF tokens and an appropriate `SameSite` policy | Depends on transport — an automatically sent token cookie remains CSRF-relevant; an `Authorization` header is not auto-attached, but a script-readable token increases cross-site scripting theft impact |
 | **Size** | Small cookie (a session ID) | Larger header — JWTs are commonly 1–4 KB; matters on every request |
 | **Downstream services** | Need to verify the session, usually via a central auth service | Self-contained — any service with the JWKS can verify |
 
 ### The rules of thumb
 
-- **Web-only SaaS, single domain, can afford a session store**: sessions are simpler and more secure (HttpOnly, CSRF manageable). Don't fix what isn't broken.
+- **Web-only SaaS, single domain, can afford a session store**: a server session can simplify immediate revocation; use HttpOnly cookies and explicit CSRF controls.
 - **Multi-client (web + mobile + API), multi-service, microservices**: tokens. The cross-domain and stateless-verification advantages outweigh the revocation pain.
 - **"I need both"** — OIDC providers like Cognito let you do both: browsers get a session cookie at the auth server; backend APIs get a JWT. That's the common pattern for modern auth.
 - **Session cookies + `SameSite=Strict` / `SameSite=Lax`** — with modern browser defaults (`SameSite=Lax` is default), CSRF risk is dramatically reduced. Don't dismiss sessions for CSRF fears alone.
 - **Revocation latency is usually the deciding factor.** If your app requires "cancel this session now" (password reset forces logout, employee fired), tokens add friction (build a deny-list) that sessions give you for free.
+
+
+## Local milestone and transfer check
+
+After JWT and OAuth, run `python3 fundamentals/auth/examples/refresh_rotation.py` from the repository
+root. It races refresh requests and proves that a reused predecessor revokes its successor. The
+[Cognito practical guide](cognito/oauth-jwt-guide.md#first-result-exercise-the-api-boundary-locally)
+adds real locally signed tokens and HTTP rejection fixtures before requiring an AWS deployment.
+
+**Decision exercise:** a browser session must be disabled immediately, while downstream APIs cache
+JWT verification keys. What must participate in the authorization decision beyond signature checks?
+<details><summary>Answer</summary>A server-side session/revocation version check, or a documented
+bounded cutoff based on expiry if immediate revocation is not required. A JWKS cache contains
+signing keys, not the state of individual sessions. Cookie transport and JWT serialization do not
+by themselves decide revocation behavior.</details>
+
+## What's changing — checked 2026-10-30
+
+Cognito supports overlapping confidential-client secrets, domainless SDK M2M issuance and
+multi-Region replication. The [practical guide](cognito/oauth-jwt-guide.md) owns the issuance choice;
+[User Pool configuration](cognito/user-pool.md#client-secret-rotation-and-recovery-changes) owns
+secret rollout, regional limitations and issuer migration. OAuth 2.1 remains draft guidance;
+[OAuth 2.0](oauth2.md) distinguishes it from published security requirements.

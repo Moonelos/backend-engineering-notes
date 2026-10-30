@@ -137,7 +137,7 @@ VALUES (
     )
 )
 ON CONFLICT (stream_id, stream_version) DO NOTHING
-RETURNING stream_version;
+RETURNING event_id, stream_version;
 ```
 
 Zero rows mean another command appended first. Reload the new suffix, fold again, and re-decide. If `cancel` won, `approve` is now illegal; it is not a database retry.
@@ -227,3 +227,33 @@ Do not choose event sourcing only to obtain an audit log. A current-state row pl
 ---
 
 **Continue with**: [Background-Work Reliability](../../../reliability/README.md)
+
+## Recap and check yourself
+
+- An ordered event stream is the authority; current state is a fold of its events.
+- Expected stream version serializes appends and projections track their applied position.
+- Replay and schema evolution must preserve event meaning rather than reinterpret history silently.
+
+**Projection is at version 6 but event 8 arrives. Apply it and catch up later?**
+
+<details><summary>Answer</summary>
+
+No. Stop that stream and fetch version 7. Applying 8 first breaks the ordered fold and can produce a state that never existed.
+
+</details>
+
+**The append succeeded but outbox insertion failed in the same transaction. Is the event committed?**
+
+<details><summary>Answer</summary>
+
+No, if both share that transaction it rolls back. The append must return or retain event_id so the same transaction can create its delivery intent.
+
+</details>
+
+**Try it:** A projector expects version 7 and receives 8. Fill the recovery action before applying any event.
+
+<details><summary>Hint and worked solution</summary>
+
+Do not advance the applied cursor past a gap. Fetch/replay missing version 7, then 8, and commit projection/cursor together. Quarantine the stream if the gap cannot be resolved rather than inventing history.
+
+</details>

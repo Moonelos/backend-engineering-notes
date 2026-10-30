@@ -82,6 +82,23 @@ Origin proves browser page origin, not user identity. Non-browser attackers can 
 
 ---
 
+A hostile page can initiate a socket using credentials that the browser attaches automatically.
+
+```mermaid
+sequenceDiagram
+ participant A as attacker.test page
+ participant B as Victim browser
+ participant S as WebSocket server
+ A->>B: open wss://api.example.com
+ B->>S: handshake plus ambient cookie; Origin attacker.test
+ S->>S: authenticate cookie AND verify Origin
+ S-->>B: reject disallowed Origin
+```
+
+The page chooses the destination; the browser contributes the ambient cookie. Checking the cookie proves the user session, while checking the exact Origin decides whether this page may act through it. Browser Origin checks do not replace authentication for non-browser clients.
+
+---
+
 ## 5. Authorization Is Per Message and Resource
 
 Binding `user_id` to a connection does not authorize every topic.
@@ -186,5 +203,30 @@ Metrics must use bounded labels. Connection ID, user ID, topic ID, and raw close
 - [OWASP WebSocket Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/WebSocket_Security_Cheat_Sheet.html)
 
 ---
+
+
+## Recap
+
+- An ambient browser cookie can authenticate a hostile page’s connection attempt.
+- Exact Origin checks and credential validation enforce different boundaries.
+- Every message still needs action/resource authorization and bounded cost.
+
+## Check yourself
+
+**A valid cookie is attached to a handshake initiated at attacker.test. Does a valid session establish permission to accept this browser origin?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Authenticate the user and separately check exact Origin; otherwise the hostile page can act through the victim session.
+
+</details>
+
+**Authentication was valid at connection time but permission is revoked. Can future writes remain authorized forever?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Define a revalidation/revocation policy for the long-lived channel and check current action/resource authority when processing messages.
+
+</details>
 
 **Next**: [Scaling and Distributed Architecture](05_scaling_and_distributed_architecture.md)

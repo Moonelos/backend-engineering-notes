@@ -19,7 +19,9 @@
 | [kafka/](kafka/README.md) | Retained logs, Python clients, delivery semantics, reliability, and operations |
 | [nats_jetstream/](nats_jetstream/README.md) | Durable subject messaging, pull consumers, Python workers, reliability, and operations |
 | [observability/](observability/README.md) | OpenTelemetry primer, Python SDK setup, metrics export methods, OTel Collector config |
-| [Messaging options](../architecture/long_running_tasks/04_infrastructure.md#2-rabbitmq-amqp) | RabbitMQ, SQS, Kafka, and when Redis is not enough |
+| [Messaging](messaging/README.md) | Broker selection, RabbitMQ, SQS and durable message contracts |
+| [Secrets](secrets/README.md) | Retrieval, rotation, leases and emergency revocation |
+| [Search](search/README.md) | PostgreSQL full-text, OpenSearch and vector-search tradeoffs |
 
 ---
 

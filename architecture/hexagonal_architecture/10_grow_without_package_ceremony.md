@@ -177,3 +177,13 @@ dependency graph.
 ---
 
 **Next**: [Part 11 — Migrate and Review an Existing Service](11_migrate_and_review_an_existing_service.md)
+
+## Decision exercise
+
+**tickets has four cohesive actions while send_alert.py is one function. Should both become packages?**
+
+<details><summary>Reasoned answer</summary>
+
+Only the ticket slice has earned another navigation/ownership boundary. Symmetric directory trees create ceremony without independent responsibility; let actual code pressure determine the split.
+
+</details>

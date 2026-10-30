@@ -2,12 +2,22 @@
 
 > Design FastAPI services, workers, and AI-enabled backends so business actions outlive their current frameworks and providers.
 
-The implementation convention follows the supplied
-[Python Service Architecture](../../python-service-architecture/SKILL.md): plain async actions,
+The implementation convention used in this course is: plain async actions,
 explicit runtime collaborators, pure domain decisions, mandatory application I/O ports, and
 separate HTTP, worker, and concrete integration boundaries. Those are this collection's selected
 rules; the broader Ports and Adapters pattern does not prescribe Python folder names.
 The service/library samples are explicitly comparative source tours, not the current scaffold.
+
+For choosing between layers, feature slices and business modules, start with the
+[architecture decision guide](../01_architecture_decision_guide.md). The
+[modular-monolith path](../modular_monolith/README.md) shows complementary business ownership
+and a selective-port policy; this course retains its stricter application I/O-port convention.
+
+For the smaller code choices inside those boundaries, use [Python design patterns](../design_patterns/README.md):
+Strategy and factories, Adapter versus Facade, commands, wrappers and state-dependent behavior.
+Its selection examples complement this course's application I/O-port convention. The
+[investigation pattern map](12_trace_an_investigation_across_services.md#8-map-the-patterns-to-the-problem-they-solve)
+connects those names to the existing end-to-end trace.
 
 ---
 
@@ -105,4 +115,4 @@ current standard; they are not proof that every failure window is handled.
 - Comfortable reading typed Python and `async` functions.
 - [FastAPI fundamentals](../../fundamentals/fastapi/README.md) are useful for the API chapter but not required for the first example.
 - [Testing fundamentals](../../operations/testing/README.md) provide the broader pytest path; this section focuses on tests as architectural evidence.
-- For the sample-reading path, [context managers](../../fundamentals/core_concepts/context_managers.md) and [typing](../../fundamentals/core_concepts/typing.md) provide optional depth on `async with`, `Callable`, and structural protocols.
+- For the sample-reading path, [context managers](../../fundamentals/core_concepts/control_flow/context_managers.md) and [typing](../../fundamentals/core_concepts/typing/typing.md) provide optional depth on `async with`, `Callable`, and structural protocols.

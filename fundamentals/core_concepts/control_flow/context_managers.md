@@ -1,0 +1,406 @@
+# Context Managers
+
+> **Who this is for**: Python developers who use `with` but do not yet have a
+> precise model of setup, teardown, exception propagation, or async resource
+> lifetimes.
+
+> Context managers are the mechanism behind the `with` statement. They pair **setup** with **guaranteed teardown** — even when the body raises — and they are everywhere in this corpus: database sessions, file handles, HTTP clients, logging contexts, contextvars binding, FastAPI lifespan, FastAPI dependencies with `yield`, distributed locks.
+
+If generator suspension or one-shot iteration is unfamiliar, read
+[Iterators, Generators, and Lazy Pipelines](iterators_and_generators.md) first;
+Section 3 builds directly on that execution model.
+
+---
+
+## 1. What `with` Actually Does
+
+```python
+with open("data.txt") as f:
+    content = f.read()
+# file is closed here, even if read() raised
+```
+
+The `with` statement is syntactic sugar for calling two dunder methods: `__enter__` and `__exit__`. Conceptually:
+
+```python
+# with open("data.txt") as f: body  # equivalent to:
+import sys
+
+cm = open("data.txt")
+f = cm.__enter__()
+try:
+    # body
+    content = f.read()
+except BaseException:
+    if not cm.__exit__(*sys.exc_info()):
+        raise
+else:
+    cm.__exit__(None, None, None)
+```
+
+The important guarantees, once `__enter__` has succeeded:
+
+- `__exit__` runs when control leaves the body — on normal exit, on exception, or
+  on `return`/`break`/`continue` from inside. Like `finally`, it cannot run after
+  `SIGKILL`, `os._exit()`, a power loss, or an interpreter crash.
+- `__exit__` receives the exception info. If it returns a truthy value, the exception is **suppressed**. Almost every context manager returns `None` (falsy), meaning exceptions propagate normally.
+- `__enter__`'s return value is what `as <name>` binds. It does not have to be the context manager itself.
+- If `__enter__` itself raises, Python does not call that object's `__exit__`
+  because the context was never entered. `__enter__` must clean up anything it
+  acquired before failing.
+
+> **Key insight**: a context manager owns a lifetime. Enter starts it; exit ends
+> it. The body borrows the resource only inside that boundary.
+
+---
+
+Context entry and exit have different failure responsibilities:
+
+```mermaid
+sequenceDiagram
+ participant C as Caller
+ participant M as Context manager
+ C->>M: enter: acquire resource
+ alt entry succeeds
+ M-->>C: bound resource
+ C->>C: execute body, possibly raise
+ C->>M: exit with exception details
+ M-->>C: cleanup; propagate unless suppressed
+ else entry fails
+ M->>M: clean partial acquisition here
+ M-->>C: exception; no automatic exit call
+ end
+```
+
+Only successful entry earns a later `__exit__` call. Register incremental acquisitions with `ExitStack` or clean partial state inside entry itself.
+
+## 2. Class-Based Context Managers
+
+```python
+class Timer:
+    def __init__(self, label: str):
+        self.label = label
+
+    def __enter__(self):
+        import time
+        self.start = time.perf_counter()
+        return self  # what `as t` will bind
+
+    def __exit__(self, exc_type, exc, tb):
+        import time
+        self.duration = time.perf_counter() - self.start
+        print(f"{self.label}: {self.duration:.3f}s")
+        # return None → exceptions (if any) propagate
+
+
+with Timer("load") as t:
+    expensive_call()
+print(t.duration)
+```
+
+**Parameters of `__exit__`:**
+
+| Param | On normal exit | On exception |
+|-------|----------------|--------------|
+| `exc_type` | `None` | exception class |
+| `exc` | `None` | exception instance |
+| `tb` | `None` | traceback object |
+
+---
+
+## 3. `@contextmanager` Decorator
+
+Most of the time a class is overkill. `contextlib.contextmanager` turns a generator into a context manager: the code before `yield` is `__enter__`, the code after `yield` is `__exit__`.
+
+```python
+from contextlib import contextmanager
+import time
+
+
+@contextmanager
+def timer(label: str):
+    start = time.perf_counter()
+    try:
+        yield               # body of `with` runs here
+    finally:
+        print(f"{label}: {time.perf_counter() - start:.3f}s")
+
+
+with timer("load"):
+    expensive_call()
+```
+
+**The `try/finally` is load-bearing.** When the body raises, `contextlib` throws
+that exception back into the generator at the suspended `yield`. Without
+`finally`, normal code after `yield` is skipped. The safe pattern is:
+
+```python
+@contextmanager
+def my_cm():
+    resource = acquire()
+    try:
+        yield resource
+    finally:
+        release(resource)
+```
+
+This is the generator-based equivalent of a class with `__enter__`/`__exit__`.
+
+---
+
+## 4. Suppressing Exceptions
+
+A class-based `__exit__` returning truthy suppresses the exception. In a
+generator-based context manager, the body's exception appears at `yield`;
+catching it and completing the generator without re-raising suppresses it:
+
+```python
+from contextlib import contextmanager
+
+
+@contextmanager
+def ignore(*exceptions):
+    try:
+        yield
+    except exceptions:
+        pass
+
+
+with ignore(FileNotFoundError):
+    open("maybe-missing.txt")
+# control reaches here whether the file existed or not
+```
+
+`contextlib` ships this as `contextlib.suppress(...)`. Use it sparingly — silently swallowing exceptions is usually wrong.
+
+---
+
+## 5. Async Context Managers — `async with`
+
+For resources that need **await** during setup or teardown (HTTP clients, DB sessions, async locks), use `__aenter__` / `__aexit__`, or `@asynccontextmanager`:
+
+```python
+from contextlib import asynccontextmanager
+import httpx
+
+
+@asynccontextmanager
+async def http_client():
+    client = httpx.AsyncClient(timeout=30)
+    try:
+        yield client
+    finally:
+        await client.aclose()   # async teardown
+
+
+async def main():
+    async with http_client() as client:
+        r = await client.get("https://example.com")
+```
+
+**You cannot use `with` on an async context manager, and you cannot use `async with` on a sync one.** The `@contextmanager` and `@asynccontextmanager` decorators are not interchangeable.
+
+---
+
+## 6. `ExitStack` — Dynamic Composition
+
+When you do not know *ahead of time* how many context managers you need — or you need to build them in a loop — `contextlib.ExitStack` lets you push them onto a stack that unwinds in last-in, first-out (LIFO) order on exit. If `a.txt` opens before `b.txt`, `b.txt` closes first, preserving the nesting order ordinary `with` blocks would have used.
+
+```python
+from contextlib import ExitStack
+
+
+def open_many(paths: list[str]):
+    with ExitStack() as stack:
+        files = [stack.enter_context(open(p)) for p in paths]
+        # all files are open here; all closed at the end of `with`
+        return process(files)
+```
+
+Async version is `AsyncExitStack` with `enter_async_context(...)`.
+
+`ExitStack` is also how you build "enter these N context managers, but decide which ones at runtime" patterns — e.g. conditionally attach a profiler, conditionally acquire a distributed lock.
+
+It also handles **partial setup**. If opening the third file fails, the first two
+have already been registered with the stack and are closed while the exception
+propagates:
+
+```python
+from contextlib import ExitStack
+from pathlib import Path
+
+
+def read_all(paths: list[Path]) -> list[str]:
+    with ExitStack() as stack:
+        readers = [
+            stack.enter_context(path.open(encoding="utf-8"))
+            for path in paths
+        ]
+        return [reader.read() for reader in readers]
+```
+
+---
+
+## 7. Lifetime and Reuse
+
+A generator created by a `@contextmanager` function is one-shot:
+
+```python
+manager = timer("load")
+
+with manager:
+    expensive_call()
+
+# ❌ The same generator-backed manager cannot be entered again.
+with manager:
+    expensive_call()
+```
+
+Call the decorated factory again to create a fresh manager:
+
+```python
+with timer("first"):
+    expensive_call()
+
+with timer("second"):
+    expensive_call()
+```
+
+Choose the boundary at the lifetime you actually need. Creating a fresh HTTP
+client inside every request defeats connection pooling; keeping a database
+transaction open across slow network calls holds locks and connections too long.
+
+| Resource | Typical useful lifetime |
+|----------|-------------------------|
+| File handle | One read/write operation |
+| Database transaction | One short atomic unit of work |
+| Database/HTTP connection pool | Application lifespan |
+| Lock | Only the protected critical section |
+| Temporary contextvar binding | One request or operation |
+
+The protocol guarantees teardown. It does not choose a good lifetime for you.
+
+---
+
+## 8. Common Pitfalls
+
+### Exception inside `with` — the resource still closes
+
+```python
+with open("x.txt") as f:
+    data = f.read()
+    raise ValueError("oops")
+# f.close() ran before the ValueError propagated
+```
+
+This is the entire point of `with`. You do not need a manual `try/finally`.
+
+### Forgetting `try/finally` in `@contextmanager`
+
+```python
+# ❌ resource leaks if body raises
+@contextmanager
+def broken():
+    conn = open_connection()
+    yield conn
+    conn.close()            # never runs if body raised
+
+# ✅ cleanup guaranteed
+@contextmanager
+def correct():
+    conn = open_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+```
+
+### `yield`ing twice in a `@contextmanager` generator
+
+```python
+@contextmanager
+def bad():
+    yield 1
+    yield 2   # RuntimeError: generator didn't stop
+```
+
+A context-manager generator must yield **exactly once**. One setup, one body, one teardown.
+
+### Mixing up what `as` binds
+
+```python
+with open("x.txt") as f:     # f is the file object (what __enter__ returned)
+    ...
+
+with Timer("t") as t:        # t is the Timer instance (we returned self)
+    ...
+
+with lock:                   # no `as` — we don't need the return value
+    ...
+```
+
+### Catching `Exception` in `__exit__` and returning truthy by accident
+
+```python
+class Bad:
+    def __exit__(self, *exc):
+        log_if_error(exc)
+        return True   # ❌ silently swallows every exception
+```
+
+Return `None` (or nothing) unless you specifically mean to suppress.
+
+---
+
+## 9. Where You Actually See This in This Corpus
+
+| File | Context manager usage |
+|------|-----------------------|
+| [fastapi/02_dependency_injection.md](../../fastapi/02_dependency_injection.md) | `yield`-based dependencies (same generator-CM pattern) + `@asynccontextmanager` lifespan |
+| [concurrency/async/03_contextvars.md](../../concurrency/async/03_contextvars.md) | `contextvars.Context().run(...)` and the set/reset `try/finally` pattern |
+| [database/04_async_sqlalchemy.md](../../database/04_async_sqlalchemy.md) | `async with session.begin():` for transactions |
+| [httpx/01_mental_model.md](../../httpx/01_mental_model.md) | `async with httpx.AsyncClient() as client:` |
+| [infrastructure/redis/03_caching_patterns.md](../../../infrastructure/redis/03_caching_patterns.md) | Distributed lock context managers |
+| [fastapi/05_middleware.md](../../fastapi/05_middleware.md) | `asynccontextmanager` in lifespan examples |
+
+If you understand the generator-with-`try/finally` form, you understand every one of these — they are all the same mechanism with different setup/teardown work inside.
+
+---
+
+
+## Recap
+
+- Successful entry owns eventual exit; failed entry must clean partial acquisition.
+- Exit can clean and propagate; suppression is a separate deliberate decision.
+
+## Check yourself
+
+**Q: If __enter__ opens one resource then raises, is __exit__ called?**
+
+<details><summary>Answer</summary>
+
+No. Entry never completed. Clean inside __enter__ or register each acquisition with ExitStack.
+
+</details>
+
+**Q: Does returning True from __exit__ only mean cleanup succeeded?**
+
+<details><summary>Answer</summary>
+
+No. It suppresses the body exception. Return a false value when the error should propagate.
+
+</details>
+
+## Try it
+
+Open two resources with ExitStack; make the second acquisition fail. Predict the first closer.
+
+Hint: Register the first before attempting the second.
+
+<details><summary>Worked solution</summary>
+
+The stack closes the first during unwinding. The failing second acquisition must clean any partial state it created itself.
+
+</details>
+
+**Next**: [Decorators — from rebinding to production patterns](../language/decorators.md)

@@ -10,10 +10,7 @@
 
 An HTTP cache stores a response and may reuse it for a later request when the method, target, freshness, validators, and selection fields allow it.
 
-```text
-client → browser cache → CDN/shared cache → gateway cache → origin
-                       cache hit ────────────────┘
-```
+A fresh cache hit is answered by the cache. A miss or required validation contacts the origin.
 
 Caching can remove network hops and origin work, but a wrong cache key can cross users or tenants. Design storage and reuse explicitly; do not rely on a platform's accidental defaults.
 
@@ -82,6 +79,23 @@ The client reuses its stored body. A validator saves representation transfer and
 Time validators are convenient but can lack sufficient resolution and may not capture every representation change. Prefer `ETag` when a reliable version or content validator exists.
 
 Strong validators identify byte-equivalent representations. Weak tags such as `W/"..."` indicate semantic equivalence suitable for cache validation but not every range or concurrency use. Use strong tags for `If-Match` lost-update protection.
+
+---
+
+For an expired stored response, validation asks whether its existing body is still usable.
+
+```mermaid
+sequenceDiagram
+ participant B as Browser cache
+ participant O as Origin
+ Note over B: stored ord_123 body and order-17
+ B->>O: GET ord_123 / If-None-Match order-17
+ O-->>B: 304 / ETag order-17
+ B->>B: reuse stored body
+ Note over O: changed version requires 200 plus new body
+```
+
+A 304 transfers no replacement body: the cache reuses its stored body. A changed ETag requires 200 and a new representation. Validation can still require work at the origin; it primarily saves body transfer. On a fresh cache hit the cache answers directly without contacting the origin.
 
 ---
 
@@ -172,5 +186,30 @@ Test at least:
 - [HTTP Semantics — RFC 9110](https://www.rfc-editor.org/rfc/rfc9110)
 
 ---
+
+
+## Recap
+
+- Freshness determines whether a stored response can be reused without contacting the origin.
+- A validator can produce 304, allowing the cache to reuse an existing body.
+- Cache keys must include the representation and authorization dimensions that change the response.
+
+## Check yourself
+
+**Cache-Control:no-cache is present. Can the browser retain the response body, and can it reuse it offline without validation?**
+
+<details><summary>Reasoned answer</summary>
+
+It can store it, but must validate before reuse; no-store is the storage prohibition.
+
+</details>
+
+**The server sends 304 but the client has no stored body. Can it display the resource?**
+
+<details><summary>Reasoned answer</summary>
+
+No. A 304 carries no replacement representation. Obtain a full response rather than treating the validator as content.
+
+</details>
 
 **Next**: [REST API Security](08_security.md)

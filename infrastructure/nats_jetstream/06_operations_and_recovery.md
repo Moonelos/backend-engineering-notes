@@ -35,12 +35,33 @@ separates those layers.
 
 ---
 
+The stream quorum and the backup are different failure domains:
+
+```mermaid
+flowchart LR
+    P[Publisher: evt-202] --> L[ORDERS leader, zone A]
+    L --> R1[Replica, zone B]
+    L --> R2[Replica, zone C]
+    L -->|Point-in-time snapshot| B[Off-cluster backup]
+    B --> T[Isolated restore target]
+    I[Separate identity and server-config backup] --> T
+```
+
+Two live replicas can keep the stream writable after one node fails. They also replicate a delete,
+so only the independent point-in-time copy can recover the pre-delete state. Restoring credentials
+is a separate task from restoring messages.
+
 ## 2. Disk capacity must satisfy both steady state and recovery
 
 Use local, high-performance persistent storage for file-backed streams. Bound each stream with age
 and bytes, set account and server storage limits, and reserve headroom for bursts, compaction,
 catch-up, and snapshots. A volume at 95% utilization has no useful recovery margin even if the
 steady-state calculation fits.
+
+For example, 500 messages/second × 1,024 bytes × 86,400 seconds is 44.24 GB of payload per
+replica for one day. R3 stores about 132.71 GB across the cluster before indexes/protocol overhead.
+A 30% planning margin raises that to about 172.52 GB; validate real bytes and catch-up traffic under
+peak load. An `MaxAge=24h` setting cannot promise a full day if the byte cap evicts older records first.
 
 Measure:
 
@@ -82,11 +103,49 @@ A **stream snapshot** creates a portable point-in-time backup of stream configur
 Back up account/operator identity and server configuration separately; stream bytes alone may be
 unusable when credentials and trust roots are lost.
 
-Use the supported `nats stream backup` and `nats stream restore` workflow described in the
-[backup and recovery guide](https://docs.nats.io/learn/backup-recovery/), store backups outside the
-cluster's failure domain, and rehearse restore into an isolated environment. **Success signal:** a
-fresh environment can authenticate, restore the stream, report the expected message count, and
-consume a sampled event within the recovery target.
+### Restore the actual ORDERS bytes into a separate server
+
+Keep the first-round-trip `nats-notes` server running. Pause fixture publishers so message count and
+sequence range describe one stable snapshot. These Bash commands use the course's CLI image and
+create a new recovery target; the original stream is never deleted:
+
+```bash
+set -euo pipefail
+backup_dir=$(mktemp -d)
+docker run --rm --network container:nats-notes \
+  --user "$(id -u):$(id -g)" -v "$backup_dir:/backup" natsio/nats-box:0.19.7 \
+  nats stream backup ORDERS /backup/orders --consumers
+
+docker run --rm -d --name nats-notes-restore nats:2.14.6 -js -sd /data
+# Bound readiness to 30 attempts; fail before restore if JetStream stays unavailable.
+ready=0
+for attempt in $(seq 1 30); do
+  if docker run --rm --network container:nats-notes-restore natsio/nats-box:0.19.7 \
+    nats stream ls --json >/dev/null 2>&1; then ready=1; break; fi
+  sleep 1
+done
+test "$ready" -eq 1
+docker run --rm --network container:nats-notes-restore \
+  -v "$backup_dir:/backup:ro" natsio/nats-box:0.19.7 \
+  nats stream restore /backup/orders
+
+docker run --rm --network container:nats-notes-restore natsio/nats-box:0.19.7 \
+  nats stream info ORDERS --json
+docker run --rm --network container:nats-notes-restore natsio/nats-box:0.19.7 \
+  nats consumer add ORDERS restore-check --pull --deliver all --ack explicit --defaults
+docker run --rm --network container:nats-notes-restore natsio/nats-box:0.19.7 \
+  nats consumer next ORDERS restore-check --count 1 --ack
+docker stop nats-notes-restore
+```
+
+Compare restored `state.messages`, `first_seq`, and `last_seq` with the snapshot metadata and
+original quiesced stream; the first fixture payload must still contain `ord-42`. A fresh verification
+consumer proves readable history without moving the restored business consumer's checkpoint.
+Record elapsed restore time against the target. Preserve `backup_dir` until the comparison passes,
+then remove that lab directory explicitly. The isolated R1 target tests backup readability, not R3
+availability. For production also restore account/operator identity into the isolated environment,
+authenticate with a test user, and prove its allowed/denied operations before routing traffic.
+[Backup workflow](https://docs.nats.io/learn/backup-recovery/stream-backup-restore), checked 2026-10-30.
 
 Do not treat filesystem-level copying of a live store directory as a portable logical backup.
 
@@ -94,6 +153,18 @@ Do not treat filesystem-level copying of a live store directory as a portable lo
 > rolling upgrades that preserve stream quorum. Test client reconnect behavior during the roll.
 
 ---
+
+## What's changing: rehearse the 2.15 transition
+
+Checked 2026-10-30: **GA, optional migration**. The course's 2.14.6 lab is a historical pin; take a
+production 2.14 line through at least 2.14.7 before 2.15. Inventory stream/consumer counts, take a
+verified backup, roll nodes while preserving quorum and defer scale/move updates during mixed
+versions. After all nodes converge, exercise a controlled move/evacuation and recheck lag. Version
+2.15 introduces desired-state reconciliation, evacuation APIs and backup v2; plan consumer limits
+explicitly because the new per-stream default is 1,000. Rehearse rollback only to a compatible
+2.14.7+ build, including desired-state cleanup and configuration changes from the upgrade guide;
+replacing binaries alone is not a recovery plan.
+[2.15 migration guide](https://docs.nats.io/release-notes/upgrade-to-2.15).
 
 ## 5. What breaks, and when not to self-host
 
@@ -112,5 +183,42 @@ system even when JetStream's API is attractive.
 > they are not a transparent multi-region switch.
 
 ---
+
+## Recap
+
+- R3 needs two available replicas to progress; cluster membership alone does not set R3.
+- Capacity must cover retention, replication and recovery headroom.
+- Snapshots recover a past state; identity/configuration need independent backup and tests.
+
+## Check yourself
+
+**Q: Three servers are healthy but ORDERS is R1. Does losing its data server preserve stream writes?**
+
+<details><summary>Answer</summary>
+
+No. Only that server has the stream replica. A three-server cluster is not evidence that each stream has three copies.
+
+</details>
+
+**Q: A replicated accidental purge reaches every replica. Which recovery asset can restore the earlier events?**
+
+<details><summary>Answer</summary>
+
+A verified point-in-time snapshot outside the cluster failure domain. A live replica or mirror can reproduce the same deletion.
+
+</details>
+
+## Try it
+
+For 500 messages/s at 1,024 bytes over 24 hours, fill the payload storage estimate for R3 and a 30% margin, then run the isolated restore.
+
+Hint: Multiply bytes per replica by three before adding margin; verify counts and one payload.
+
+<details><summary>Worked solution</summary>
+
+About 44.24 GB per replica, 132.71 GB total, 172.52 GB with the stated margin before measurement-specific adjustments. Restore must match snapshot sequence/count and permit the sample read within the recovery target.
+
+</details>
+
 
 **Next**: [Security and Multitenancy](07_security_and_multitenancy.md)

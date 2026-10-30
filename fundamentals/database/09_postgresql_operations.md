@@ -117,3 +117,28 @@ If the primary sample is `0/500` and the replica has replayed `0/480`, it has no
 A support report says “disk grew 20%, vacuum ran, and the replica lag chart says 30 minutes.” No writes occurred during the last 30 minutes. Should you run VACUUM FULL and fail over?
 
 The supplied evidence supports neither action. Ordinary vacuum may have created reusable space without shrinking the file; compare write volume, relation size trends, retaining snapshots and estimated dead tuples. The replica timestamp may simply reflect inactivity; compare WAL positions or a heartbeat before declaring it stale. Failover does not remove bloat and may select a less current server. If the real issue is an old application snapshot, ending that transaction enables cleanup while failover only adds disruption.
+
+## Check your understanding
+
+Snapshots govern visibility, vacuum reuses eligible dead space, and analyze updates planner statistics. Long transactions require diagnosis beyond row count.
+
+**Prediction:** Switch terminal A to READ COMMITTED. What does its second SELECT see after B commits 100 to 80?
+
+<details><summary>Answer</summary>
+80, because each statement gets a fresh snapshot. In REPEATABLE READ the transaction continues to see 100 until its snapshot ends.
+</details>
+
+**Diagnosis:** Does a stable live-row count rule out MVCC-related storage growth?
+
+<details><summary>Answer</summary>
+No. Obsolete versions may remain because of old snapshots or insufficient vacuum progress. Inspect transaction age and dead tuples separately.
+</details>
+
+
+**Try it:** Repeat the two-terminal lab with `BEGIN ISOLATION LEVEL READ COMMITTED` in terminal A. Leave the expected value for its second SELECT blank; inspect transaction age separately before COMMIT.
+
+Hint: READ COMMITTED chooses a snapshot per statement.
+
+<details><summary>Solution</summary>
+After B commits 80, A's next SELECT sees 80; REPEATABLE READ kept 100. Still inspect long transaction age and retained locks/resources: seeing fresh values does not imply that an open transaction is operationally harmless.
+</details>

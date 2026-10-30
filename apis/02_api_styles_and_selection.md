@@ -182,4 +182,29 @@ Trying to standardize every arrow on one technology would make at least one boun
 
 ---
 
+
+## Recap
+
+- Choose the interaction direction and ownership before selecting a protocol.
+- Client diversity favors accessible contracts; controlled peers can benefit from generated RPC.
+- A persistent bidirectional channel also needs application reliability and security.
+
+## Check yourself
+
+**The order-status browser only receives occasional server updates and never sends application messages on that channel. Is WebSocket still the default?**
+
+<details><summary>Reasoned answer</summary>
+
+No. SSE or polling meets the one-way requirement with less connection-protocol machinery; the two-way premise in the platform example no longer holds.
+
+</details>
+
+**A mobile client is often offline. Does choosing WebSocket deliver all missed events?**
+
+<details><summary>Reasoned answer</summary>
+
+No. A live connection is only a transport. Retained events, a cursor or a snapshot API provide recovery.
+
+</details>
+
 **Next**: [API Contracts and Lifecycle](03_api_contracts_and_lifecycle.md)

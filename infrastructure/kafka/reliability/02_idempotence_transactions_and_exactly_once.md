@@ -14,15 +14,18 @@
 
 ## 1. Producer idempotence makes retry sequencing safe
 
-Modern clients enable idempotence when compatible settings remain in force. `acks=all`, retries,
-and bounded in-flight requests let the broker assign a producer ID and reject a repeated sequence
+Defaults are client-specific. The Java producer enables idempotence by default when compatible
+settings remain in force; this course's `confluent-kafka` client uses librdkafka, where
+`enable.idempotence` defaults to `false`. Set `"enable.idempotence": True` explicitly in its producer
+configuration. `acks=all`, retries and compatible bounded in-flight requests allow retry sequencing
+with a producer ID so the broker can reject a repeated sequence
 number. For example, if batch sequence `17` reaches the leader but its acknowledgment is lost, the
 retry still carries sequence `17`; the leader returns success without appending a second copy. A
 new intentional `produce()` call uses sequence `18`, so producer idempotence does not deduplicate
 two business calls with the same payload. Explicitly verify effective configuration rather than
 assuming a framework wrapper preserved it. See the
 [Kafka 4.3 producer configuration](https://kafka.apache.org/43/configuration/producer-configs/)
-for the exact compatibility constraints.
+for Java compatibility constraints and the [librdkafka configuration](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md) for the Python client's defaults (checked 2026-10-30).
 
 ---
 
@@ -62,7 +65,7 @@ explicit abort_transaction()        none                    orders[2]@8
 `read_committed`; restart and obtain one committed result. Counting records under the default
 isolation silently includes aborted work.
 
-The collection includes that exact process-death test. Start the disposable Kafka 4.3.1 broker from
+The collection includes that exact process-death test. Start the disposable Kafka 4.3.2 broker from
 the first fundamentals note. Then, from `infrastructure/kafka/examples/python`, run:
 
 ```bash
@@ -95,5 +98,42 @@ Avoid Kafka transactions for simple source producers or external sinks when idem
 clearer and cheaper.
 
 ---
+
+## Recap
+
+- Producer idempotence suppresses eligible transport retries within its protocol scope.
+- Kafka transactions bind output records and consumed offsets in one Kafka boundary.
+- read_committed hides unresolved/aborted output; remote effects remain outside that boundary.
+
+## Check yourself
+
+**Q: A transaction produces output then dies before commit. Should read_committed return it?**
+
+<details><summary>Answer</summary>
+
+No. The unresolved transaction may delay visibility until it resolves; a stable transactional identity supports recovery. Input resumes from the committed group offset.
+
+</details>
+
+**Q: Does placing an email API call between begin_transaction and commit_transaction make email exactly once?**
+
+<details><summary>Answer</summary>
+
+No. Kafka cannot roll back or atomically commit the external provider. Persist an outbound intent and use the provider idempotency/reconciliation contract.
+
+</details>
+
+## Try it
+
+Adapt the transaction crash harness to stop after produce but before commit; complete the expected output assertion.
+
+Hint: Inspect with read_committed, not a default visibility assumption.
+
+<details><summary>Worked solution</summary>
+
+Assert no committed output for the aborted attempt and one committed output after replay. Also assert the consumed offset only advances with the successful transaction.
+
+</details>
+
 
 **Next**: [Retries, Dead Letters, and Replay](03_retries_dead_letters_and_replay.md).

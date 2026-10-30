@@ -72,7 +72,7 @@ admitted provider attempt stalled and may be eligible for a bounded retry if the
 idempotent. If the program hangs instead of printing `admission_timeout`, the capacity wait is not
 inside its own deadline.
 
-**Stop here** for a small local integration whose calls are already bounded and non-retryable.
+**Stop here** to explain the difference between local admission and provider failure. This tiny mock is not the complete transport/deadline policy.
 Continue when real load introduces queues, retries, multiple pods, or shared provider quotas.
 
 ---
@@ -100,92 +100,28 @@ provider policy.
 |------|-------|-------------|
 | [01](01_core_concepts.md) | Core Concepts | Mental model, the real concurrency limit, fundamental bound |
 | [02](02_concurrency_and_timeouts.md) | Concurrency & Timeouts | Timeout layers, asyncio vs httpx, what each controls |
-| [03](03_call_patterns.md) | Call Patterns | Gold standard pattern, retry logic, exception handling |
+| [03](03_call_patterns.md) | Call Patterns | One bounded implementation, retry eligibility, typed failures |
 | [04](04_kubernetes.md) | Kubernetes | Multi-pod concerns, local vs global limits |
 | [05](05_production_architecture.md) | Production Architecture | Complete stack, execution order, deployment |
 | [06](06_advanced_patterns.md) | Advanced Patterns | Circuit breakers, bulkheads, hedging, priority queues, load shedding |
 | [07](07_streaming_patterns.md) | Streaming Patterns | SSE, streaming timeouts, semaphore duration |
-| [08](08_streaming_advanced.md) | Streaming Advanced | Multi-stream, aggregation, circuit breakers for streaming |
-| [09](09_distributed_admission_control.md) | Distributed Admission Control | Redis-centric admission, key taxonomy, atomic Lua, retries & quota accounting |
-| [10](10_llm_token_economics.md) | LLM Token Economics | Reserve → Retry → Reconcile pattern for token quotas; estimation strategies; cost observability & retry budgets |
-| [11](11_idempotency.md) | Idempotency Keys | Safe POST retries, dedup state machine, Postgres + Redis implementations |
+| [08](08_streaming_advanced.md) | Streaming Advanced | Retained stream owners, first-useful-frame race, bounded merge and replay |
+| [09](09_distributed_admission_control.md) | Distributed Admission Control | Atomic leased attempts, stable recovery identities, rate and concurrency limits |
+| [10](10_llm_token_economics.md) | LLM Token Economics | Durable PostgreSQL reservation, every-attempt usage, unknown outcomes and reconciliation |
+| [11](11_idempotency.md) | Idempotency Keys | Tenant-scoped PostgreSQL effect/result transaction, fenced recovery and remote identity |
 
 ---
 
-## The Non-Negotiable Layers
+## One composed implementation
 
-A safe production stack requires all of these:
+[Part 3](03_call_patterns.md#run-one-operation-before-studying-the-policy) supplies the complete
+caller, local app and tests. Its active-owner cap and waiter cap are separate. The admission
+timer exits before execution begins; the original total clock remains around every attempt
+and sleep. Optional rate and shared-admission policies are added only when the provider or
+product has that quota.
 
-1. **Client connection limits** — hard physical cap on sockets
-2. **Client transport timeouts** — phase/inactivity bounds for connect, pool, write, and read waits
-3. **Semaphore** — logical concurrency gate
-4. **Rate limiter** — vendor quota compliance
-5. **Application timeout** — task cancellation & system safety
-6. **Queue timeout** — fail fast under overload
-
-Removing any layer introduces known failure modes.
-
----
-
-## Composed production pattern
-
-### Minimal Safe Pattern
-
-```python
-import asyncio
-import httpx
-from aiolimiter import AsyncLimiter
-
-# Client with mandatory connection limits
-client = httpx.AsyncClient(
-    limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-    timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0),
-)
-
-# Application-level controls
-sem = asyncio.Semaphore(50)
-rate = AsyncLimiter(60, 60)
-
-
-class AdmissionTimeout(Exception):
-    pass
-
-
-class AttemptDeadlineExceeded(Exception):
-    pass
-
-
-async def call_api(payload: dict):
-    for attempt in range(3):
-        try:
-            try:
-                async with asyncio.timeout(5):  # local admission timeout
-                    await rate.acquire()
-                    await sem.acquire()
-            except TimeoutError as exc:
-                raise AdmissionTimeout("local capacity unavailable") from exc
-
-            try:
-                try:
-                    async with asyncio.timeout(30):  # downstream attempt deadline
-                        response = await client.post(
-                            "https://vendor.example/api", json=payload
-                        )
-                except TimeoutError as exc:
-                    raise AttemptDeadlineExceeded from exc
-                response.raise_for_status()
-                return response.json()
-            finally:
-                sem.release()
-
-        except AdmissionTimeout:
-            raise  # local overload is deliberately not retried
-        except (httpx.TimeoutException, AttemptDeadlineExceeded):
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            raise
-```
+Use that implementation when adding behavior so exception classification, cancellation and
+resource ownership cannot drift between copied production variants.
 
 ---
 
@@ -195,7 +131,7 @@ async def call_api(payload: dict):
 2. **HTTPX timeouts bound transport phases/inactivity** — they are not a total deadline
 3. **Rate limiting ≠ concurrency control** — they serve different purposes
 4. **Retries must be outside semaphore** — never sleep while holding resources
-5. **Per-pod limits don't protect vendors** — use Redis for global limits
+5. **Quota scope must match its owner** — use shared atomic decisions or conserved allocations across processes
 6. **Queue timeout is not retryable** — overload should fail fast
 
 ---
@@ -204,8 +140,8 @@ async def call_api(payload: dict):
 
 ❌ Client without connection limits (unbounded sockets)
 ❌ Using only one total deadline without phase limits or failure-specific diagnostics
-❌ Semaphore inside retry loop (holding resource during sleep)
-❌ No queue timeout (unbounded queues)
+❌ Holding a permit across retry sleep
+❌ Missing waiter-count bound or admission deadline
 ❌ Per-pod rate limiters for vendor protection
 ❌ One circuit-breaker state shared across unrelated dependency partitions or failure domains
 ❌ Catching only `asyncio.TimeoutError` (missing httpx exceptions)
@@ -220,10 +156,10 @@ async def call_api(payload: dict):
 **Working result by entry 2**: run the Quick Start above, then explain why admission failure and a
 downstream attempt timeout take different retry paths.
 
-1. **Do:** run the [first baseline](#first-runnable-baseline-classify-capacity-separately-from-dependency-failure) and observe all three outputs.
-2. **Understand:** use its admission-versus-attempt contrast, then read [Call Patterns](03_call_patterns.md) for the canonical composed implementation.
-3. **Deepen as needed:** [Core Concepts](01_core_concepts.md) and [Concurrency & Timeouts](02_concurrency_and_timeouts.md) own the full capacity and timeout references.
-3. **Harden:** [Call Patterns](03_call_patterns.md) — add the canonical composition and failure mapping.
+1. **Do:** run the [first baseline](#first-runnable-baseline-classify-capacity-separately-from-dependency-failure) and observe its three outcomes.
+2. **Understand capacity:** [Core Concepts](01_core_concepts.md) traces admitted attempts, waiting tasks and connections.
+3. **Understand time:** [Concurrency & Timeouts](02_concurrency_and_timeouts.md) separates admission, attempt and total clocks.
+4. **Compose and verify:** [Call Patterns](03_call_patterns.md) runs the complete caller and changed-condition tests.
 
 **Stop here if** one process owns the quota and only idempotent operations are retried. Continue to
 distributed admission or idempotency when those conditions stop holding.
@@ -238,15 +174,15 @@ distributed admission or idempotency when those conditions stop holding.
 
 1. Review Parts 1-5
 2. Read [Advanced Patterns](06_advanced_patterns.md) — circuit breakers, bulkheads, hedging, priority queues
-3. Read [Idempotency Keys](11_idempotency.md) — make the aggressive retries from Part 3 safe for non-GET endpoints (double-charge protection)
+3. Read [Idempotency Keys](11_idempotency.md) — preserve operation identity and effects across caller and process recovery
 
 ### For Distributed / Multi-Pod Systems
 
 1. Review Part 4 (Kubernetes) and Part 5 (Production Architecture)
-2. Read [Distributed Admission Control](09_distributed_admission_control.md) — Redis as the single source of truth, atomic Lua admission, the "Redis + if statements" pattern that replaces in-process limiters
+2. Read [Distributed Admission Control](09_distributed_admission_control.md) — Redis as the shared authority for leased provider attempts, retaining local bounds and separate durable quota ownership
 3. For LLM workloads, also read [LLM Token Economics](10_llm_token_economics.md) — Reserve → Retry → Reconcile
 
-> **Note**: Parts 1–3 describe the **transport layer** (sockets, timeouts, in-process semaphores). Part 9 describes the **admission layer** (cluster-wide Redis-backed checks). Real systems need both. If you only read parts 1–3, you'll have a single-pod story that breaks when you scale out.
+> **Note**: Parts 1–3 describe the **transport layer** (sockets, timeouts, in-process semaphores). Part 9 describes the **admission layer** (cluster-wide Redis-backed checks). Real systems need both. If you only read parts 1–3, you'll have process-local bounds that need a conserved fleet allocation or shared authority when the quota is fleet-wide.
 
 ---
 
@@ -280,16 +216,13 @@ Vendor API
 
 ## Dependencies
 
-```bash
-# Required
-pip install fastapi uvicorn httpx aiolimiter
+Use the versions for the selected executable path:
 
-# For production (Redis-backed features)
-pip install redis limits
+- [Part 3 setup](03_call_patterns.md#run-one-operation-before-studying-the-policy) installs the HTTPX/FastAPI test baseline; optional process-local start spacing is implemented explicitly.
+- [Container requirements](examples/requirements.txt) pin hashes for the local app image.
+- [Advanced requirements](examples/advanced_requirements.txt) pin the Redis, Psycopg, HTTP and test libraries for Parts 6–11; [Compose](examples/advanced_compose.yaml) supplies isolated Redis/PostgreSQL.
 
-# For structured logging
-pip install structlog
-```
+The advanced path's database owns durable usage and idempotency state. Redis owns short-lived admission leases and rate history; its existence alone does not establish durable business accounting.
 
 ---
 

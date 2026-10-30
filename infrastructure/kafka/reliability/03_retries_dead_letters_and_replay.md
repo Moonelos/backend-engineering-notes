@@ -155,5 +155,30 @@ specific state change that could make the next attempt succeed.
 
 ---
 
+## Recap
+
+- Retry moves work through time; it may also move it out of its original order.
+- A parking record needs the event, failure context and a controlled replay policy.
+- Replay is fresh execution against current dependencies and must remain bounded and idempotent.
+
+## Check yourself
+
+**Q: Failed order event 8 moves to a retry topic while event 9 continues. Is entity order preserved?**
+
+<details><summary>Answer</summary>
+
+No. The retry path lets 9 overtake 8. If business order matters, block within a bounded policy or isolate keys using an explicit ordering protocol.
+
+</details>
+
+**Q: The bug is fixed. Is replaying the whole dead-letter topic at maximum speed safe?**
+
+<details><summary>Answer</summary>
+
+No. Restored traffic can overwhelm dependencies or repeat irreversible effects. Reconcile identities, replay a small sample, rate-limit and observe result/error ages before expanding.
+
+</details>
+
+
 **Next**: [Polling Transactional Outbox](04_transactional_outbox_and_cdc.md), then the separate
 [CDC relay](06_cdc_outbox_relay.md) when database-log capture is justified.

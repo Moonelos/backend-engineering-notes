@@ -73,13 +73,11 @@ async def check_fixed_window(
 
 ### Why pipeline, not Lua?
 
-`INCR` followed by `EXPIRE` in a pipeline is *not* atomic in the strict sense — another command could land between them — but it doesn't matter here because:
-
-- `INCR` on a non-existent key returns `1`
-- `EXPIRE` is idempotent — setting it twice on the same key is fine
-- The TTL only matters for cleanup, not correctness
-
-If you want strict atomicity (e.g. for the multi-dimension admission script in part 9), use Lua.
+Standalone redis-py `pipeline()` defaults to `transaction=True`: these commands execute as a
+`MULTI/EXEC` batch without interleaving. `pipeline(transaction=False)` only batches network I/O
+and permits interleaving. This fixed-window algorithm does not need a conditional server-side
+branch, so a transaction is sufficient. Lua becomes useful when the decision depends on an
+intermediate value and only accepted requests should mutate several counters.
 
 > **Note on the unconditional `EXPIRE`**: this snippet calls `EXPIRE` on every request rather than only on the first one (`count == 1`). That keeps the pipeline branch-free at the cost of one redundant `EXPIRE` per request. Because the key is window-pinned (a new key appears each window), the TTL doesn't drift meaningfully, so it's a fine trade for simplicity here. The "TTL Hygiene" section below explains when the first-INCR-only pattern is worth the extra round-trip.
 
@@ -115,11 +113,13 @@ sorted set: rpm:user:42
 To check: drop entries with score < (now - window), count what's left.
 ```
 
-### The split implementation explains the formula but is not concurrency-safe
+### A transactional attempt log counts rejected requests too
 
-The following split read/check/increment version is an **explanatory excerpt only**. Concurrent
-callers can all observe the same below-limit count and then increment past the cap. Use it to see
-the weighting formula; do not copy it into a service.
+This standalone redis-py pipeline executes prune/count/add atomically. It counts the previous
+attempts, then records this attempt even when rejected; that policy is conservative under a flood.
+Use a shared authoritative clock when several hosts enforce one strict rolling-window contract.
+To count only accepted requests, move the conditional count/add into one Lua script; do not split
+it into a client-side check followed by a later write.
 
 ```python
 import time
@@ -149,7 +149,9 @@ async def check_sliding_log(
     return count < limit
 ```
 
-> **Note on ordering**: the snippet adds *before* checking, so a single request can never see itself — but if you prefer reject-without-recording (so a rejected request leaves no trace), check first then conditionally add.
+> **Decision boundary:** `ZCARD` executes before this attempt is added, so `count < limit` admits
+only when the preceding attempts fit. Rejected attempts are still stored and can extend denial
+under sustained abuse. A client-side check followed by a separate add would introduce a race.
 
 ### Trade-offs
 
@@ -231,24 +233,24 @@ async def check_sliding_counter(
 | Concern | Fixed window | Sliding log | Sliding counter |
 |---------|-------------|-------------|-----------------|
 | Memory per key | 1 int | N entries | 2 ints |
-| Boundary burst | ❌ Yes (2× burst) | ✅ None | ✅ Bounded (~1.05×) |
+| Boundary burst | ❌ Yes (2× burst) | ✅ None | Approximate; can approach 2× |
 | Cost per check | 1 op | O(log N) | 2 GETs + 1 INCR |
-| Correctness | Approximate | Exact | Approximate but bounded |
+| Correctness | Approximate | Exact | Assumes roughly uniform arrivals |
 
-The hybrid gives you ~95% of the precision of a true sliding window at ~5% of the cost. Cloudflare's [public writeup](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) describes the exact pattern and shows the error is bounded by `1 / (limit / window_seconds)` which is small for reasonable limits.
+Weighting assumes the previous window's requests were spread evenly. It cannot recover their
+actual timestamps. Consider limit 100 per 60 seconds: 100 requests at t=59.9 and 100 at t=119.8
+fit in one real 60-second interval. Before the last new admission, the estimate is
+`99 + 100 * (1 - 59.8/60) = 99.333`, so it still admits. Atomic Lua prevents concurrent stale
+reads; it cannot fix this approximation error. Do not infer a universal 5% error bound from a
+workload's empirical results.
 
 ### Trade-offs
 
-✅ **Bounded burst**: at worst slightly over limit at boundary, never 2×.
-✅ **Cheap**: two integers per key, two GETs per check.
-✅ **Production-grade when the decision and increment are atomic**: real edge platforms use this
-shape with a single serialized operation.
+- Two integer counters keep memory small and work per decision bounded.
+- Exact event timing is discarded, so adversarial bursts can approach twice a rolling-window cap.
+- A single server operation makes decisions atomic; it does not make the estimate exact.
 
-❌ **Slightly approximate**: under tail traffic patterns the estimate can be off by a few percent. Not visible to users.
-❌ **Incorrect under concurrency if you split GET and INCR** — multiple callers can be admitted
-from the same stale observation. The Lua form below is the copyable default.
-
-### Copyable production default: atomic Lua (single round-trip)
+### Atomic approximation when the policy permits it
 
 ```lua
 -- KEYS[1] = current window key
@@ -315,8 +317,8 @@ class SlidingCounter:
 
 ### When to use
 
-- **Default choice for distributed rate limiting**. Pick this unless you have a specific reason to use one of the others.
-- Per-user RPM, global RPM, vendor RPM, model RPM — anywhere with high traffic and the need for "pretty good" precision.
+- High-volume fairness policies that explicitly tolerate this approximation.
+- Use an exact sliding log for strict rolling quotas, or match the provider's actual token-bucket contract. Throughput does not justify weakening a contractual bound.
 
 ---
 
@@ -350,18 +352,24 @@ This matches how AWS API Gateway, Stripe, GitHub API, and most cloud providers e
 -- KEYS[1] = bucket key (stores hash with "tokens" and "ts")
 -- ARGV[1] = capacity (max tokens)
 -- ARGV[2] = refill_rate (tokens per second)
--- ARGV[3] = now (unix seconds, float)
--- ARGV[4] = cost (tokens this request consumes, usually 1)
+-- ARGV[3] = cost (tokens this request consumes, usually 1)
 
 local capacity = tonumber(ARGV[1])
 local refill_rate = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-local cost = tonumber(ARGV[4])
+local cost = tonumber(ARGV[3])
+if not capacity or not refill_rate or not cost or capacity <= 0 or refill_rate <= 0
+   or cost <= 0 or cost > capacity then
+  return redis.error_reply("invalid capacity, refill rate, or cost")
+end
+local clock = redis.call("TIME")
+local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
 
 local data = redis.call("HMGET", KEYS[1], "tokens", "ts")
 local tokens = tonumber(data[1]) or capacity
 local last = tonumber(data[2]) or now
 
+-- A backwards server-clock adjustment must not move the saved timestamp backwards.
+now = math.max(now, last)
 -- Refill since last check
 local elapsed = math.max(0, now - last)
 tokens = math.min(capacity, tokens + elapsed * refill_rate)
@@ -396,7 +404,10 @@ class TokenBucket:
     ) -> bool:
         if self._sha is None:
             self._sha = await self.r.script_load(TOKEN_BUCKET_LUA)
-        eval_args = (1, key, capacity, refill_rate, time.time(), cost)
+        import math
+        if not all(math.isfinite(x) and x > 0 for x in (capacity, refill_rate, cost)) or cost > capacity:
+            raise ValueError("positive finite capacity/rate/cost required; cost <= capacity")
+        eval_args = (1, key, capacity, refill_rate, cost)
         try:
             result = await self.r.evalsha(self._sha, *eval_args)
         except NoScriptError:
@@ -427,15 +438,16 @@ class TokenBucket:
 | Use case | Algorithm |
 |----------|-----------|
 | Per-user requests/min, internal | **Fixed window** (cheap, boundary burst is fine) |
-| Per-user requests/min, customer-facing | **Sliding counter** (clean UX, no boundary bursts) |
+| Per-user requests/min, customer-facing | **Sliding counter** only with accepted approximation |
 | Vendor API with strict cap, low traffic | **Sliding log** (exact) |
-| Vendor API with strict cap, high traffic | **Sliding counter** (cheap + bounded) |
+| Vendor API with strict cap, high traffic | **Exact sliding log** or the provider's documented policy |
 | Variable-cost requests (LLM tokens, $) | **Token bucket** (cost = N tokens) |
 | Match an external API's stated semantics | Whatever that API uses (usually token bucket) |
 
 ### The default
 
-If you don't know which one to pick, pick **sliding counter**. It's the right answer 80% of the time.
+Write the contract first: fixed windows, exact rolling windows and burst-plus-refill are different
+policies. Choose an approximation only after quantifying acceptable overshoot and failure behavior.
 
 ---
 
@@ -474,14 +486,36 @@ end
 return 1
 ```
 
-### The leak problem
+### A lease belongs to one operation, not a shared count
 
-Counters don't auto-decrement. If a process crashes between `INCR` and `DECR`, the slot leaks forever. Two defences:
+`INCR` and `DECR` preserve an existing TTL; activity does **not** refresh it. If a shared count
+expires while A is active, B can enter a supposedly full system. A's later `DECR` can even create
+`-1`. Therefore the counter above is only a no-crash demonstration, not a recoverable occupancy cap.
+Give each operation a unique reservation ID and its own expiry in a sorted set:
 
-1. **TTL on the inflight key**: `EXPIRE inflight 60` — if no INCR/DECR activity for 60s, the key vanishes and resets the count. Imperfect but bounds the leak.
-2. **Use a sorted set with timestamps** (heavier): each in-flight request is a member with `score = now + max_request_duration`. A periodic sweeper runs `ZREMRANGEBYSCORE` to drop expired entries. This is what production-grade implementations do.
+```lua
+-- KEYS[1]: reservations; ARGV: operation_id, limit, lease_ms
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local limit = tonumber(ARGV[2])
+local lease = tonumber(ARGV[3])
+if not limit or not lease or limit < 1 or lease <= 0 then
+  return redis.error_reply('positive limit and lease required')
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 1 end
+if redis.call('ZCARD', KEYS[1]) >= limit then return 0 end
+redis.call('ZADD', KEYS[1], now + lease, ARGV[1])
+return 1
+```
 
-For most apps the TTL approach is fine. Don't over-engineer.
+Release with `ZREM reservations operation_id`, so a late release cannot decrement somebody else's
+slot. Retry an ambiguous reservation with the same ID. No shared-key expiry resets active members.
+The caller must cancel work before its lease expires or renew that exact reservation while it is
+still owned. Expiry alone does not stop an already-running external call; for a strict cap, bound
+and fence work or retain the reservation until reconciliation establishes completion. If Redis is
+unavailable, choose and document fail-closed admission or an explicitly weaker local fallback.
+
 
 ---
 

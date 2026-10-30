@@ -40,7 +40,7 @@ markers = [
 Run them intentionally:
 
 ```bash
-pytest -m "not llm_eval"
+pytest -m "not llm_eval and not integration and not e2e and not live"
 RUN_LLM_EVALS=1 pytest -m "live and llm_eval"
 ```
 
@@ -402,12 +402,39 @@ repeatedly. Gate on a confidence interval or another predeclared uncertainty bou
 pass/fail draw. Keep a separate budget-limited smoke set for pull requests and run the larger
 repeated evaluation on a schedule or before model or prompt promotion.
 
-OpenAI currently exposes active Evals guides and `/v1/evals` API operations. Keep your evaluation
-data in a repository or governed data store and make the runner portable across hosted and local
-tooling; do not infer that evaluation as a practice is deprecated from the lifecycle of a legacy
-surface.
+**Deprecated platform — checked 2026-10-30:** OpenAI Evals becomes read-only for existing users on
+2026-10-31 and is scheduled to shut down on 2026-11-30. Do not make a new release gate depend on
+that hosted dashboard/API. Export datasets, grading rubrics/configuration and per-case run results
+while available, preserving model/prompt/judge versions and failure slices. Evaluation remains a
+required engineering practice; this is the lifecycle of one hosted platform.
+[Official Evals guide](https://developers.openai.com/api/docs/guides/evals) and
+[deprecation timeline](https://developers.openai.com/api/docs/deprecations).
+
+Move the versioned cases into your governed repository/store and run them through the portable
+`classify_ticket(case["input"], live_model)` loop above, or an explicitly selected replacement runner.
+The marked, budget-limited job owns provider credentials. First replay saved outputs through the
+same rubric, compare per-case results with the export, then run a bounded live comparison. A runner
+migration should not silently change the dataset or judge at the same time. The
+[eval architecture lesson](../../architecture/llm_systems/04_evals_and_regression.md) owns release
+thresholds, paired comparisons and rollback evidence.
 
 ---
+
+Separate contract evidence from sampled model behavior:
+
+```mermaid
+flowchart LR
+    C[Versioned prompt and schema] --> D[Deterministic adapter and tool tests]
+    C --> E[Fixed dataset plus model and judge versions]
+    E --> S[Per-case and per-slice scores with uncertainty]
+    D --> G[Release gate]
+    S --> G
+    G --> R[Bounded canary and rollback decision]
+```
+
+The deterministic branch can reject broken JSON handling or unauthorized tools without a model.
+The eval branch measures behavior under a declared distribution; passing the first cannot stand in
+for the second, and the judge/dataset versions are part of the result's identity.
 
 ## Snapshot Tests: Use Carefully
 
@@ -430,7 +457,7 @@ Bad snapshot targets:
 ```python
 def test_ticket_prompt_snapshot(snapshot):
     messages = build_ticket_prompt("The app crashes")
-    snapshot.assert_match(messages)
+    assert messages == snapshot
 ```
 
 If a snapshot changes every time the model changes a synonym, delete it or move that concern into an eval.
@@ -474,3 +501,35 @@ Rules of thumb:
 
 - [09 - Mocking External Services](09_mocking_external.md) - provider and network boundaries.
 - [11 - Coverage & CI](11_coverage_and_ci.md) - keep live evals out of the fast suite.
+
+## Recap and retrieval
+
+- Deterministic tests protect prompts, adapters, schemas and tool authority around supplied outputs.
+- Model quality needs representative versioned evaluations and uncertainty-aware release gates.
+- Live selection must preserve explicit cost, credential and isolation controls.
+
+**Adapter tests pass after a model update. Is classification quality unchanged?**
+
+<details><summary>Reasoned answer</summary>
+
+No. Re-run the predeclared versioned eval, including risky slices and uncertainty bounds; separately verify SDK/provider compatibility.
+
+</details>
+
+**A prompt snapshot calls a live model. What boundary did it accidentally add?**
+
+<details><summary>Reasoned answer</summary>
+
+A stochastic external dependency and spend. Snapshot the deterministic constructed messages using Syrupy equality; evaluate live output under the marked bounded profile.
+
+</details>
+
+**Try it:** Add a prompt change that keeps the schema valid but weakens tenant refusal. Choose checks for contract and quality.
+
+Hint: A schema oracle cannot establish permission behavior or model success rates.
+
+<details><summary>Worked solution</summary>
+
+Keep deterministic authority-denial tests, snapshot reviewed prompt/schema changes, and run the fixed eval’s tenant-isolation slice with cost and uncertainty gates. Do not update the expected quality threshold after seeing the result.
+
+</details>

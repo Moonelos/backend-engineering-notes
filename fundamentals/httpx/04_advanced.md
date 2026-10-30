@@ -178,13 +178,18 @@ for attempt in range(3):
         response.raise_for_status()
         return response.json()
     except httpx.HTTPStatusError as e:
-        if e.response.status_code >= 500:
-            await asyncio.sleep(backoff(attempt))
-            continue
-        raise
+        if e.response.status_code not in {502, 503, 504} or attempt == 2:
+            raise
+        await asyncio.sleep(backoff(attempt))
+        continue
 ```
 
 ---
+
+This loop is a retry-policy excerpt within an async function with `client`, `url` and
+`backoff` supplied. It raises the last failure immediately after exhaustion. The complete
+[bounded caller](../fastapi/safe_and_scalable_api_calls/03_call_patterns.md) also owns total
+deadline, local admission, Retry-After and safe operation identity.
 
 ## 5. Error Model
 
@@ -279,7 +284,7 @@ response = await client.get(
 
 ```python
 async def log_request(request):
-    logger.info(f"Request: {request.method} {request.url}")
+    logger.info("outbound_request method=%s host=%s", request.method, request.url.host)
 
 async def log_response(response):
     logger.info(f"Response: {response.status_code}")
@@ -350,14 +355,14 @@ def create_production_client() -> httpx.AsyncClient:
         logger.debug(
             "http_request",
             method=request.method,
-            url=str(request.url),
+            host=request.url.host,  # Fixed/allowlisted provider; never log query credentials.
         )
 
     async def log_response(response):
         logger.debug(
             "http_response",
             status_code=response.status_code,
-            url=str(response.url),
+            host=response.url.host,
         )
 
     return httpx.AsyncClient(
@@ -399,9 +404,32 @@ async def shutdown():
 
 ---
 
+## See stream ownership and HTTP/2 multiplexing separately
+
+```mermaid
+sequenceDiagram
+ participant A as Application
+ participant C as Owned AsyncClient
+ participant P as HTTP2 peer
+ A->>C: Open response stream A
+ C->>P: Stream 1 on connection K
+ A->>C: Open response stream B
+ C->>P: Stream 3 on connection K
+ P-->>C: Interleaved frames for streams 1 and 3
+ C-->>A: Each response has its own iterator
+ A->>C: Consume or close both responses
+ Note over C: Connection K remains reusable if healthy
+```
+
+Closing a response ends its stream ownership; closing the client ends the pool lifetime.
+HTTP/2 may share a connection but does not merge response iterators or remove peer stream
+limits. Abandoning a body without closure can retain capacity even when application code
+has stopped reading it.
+
 ## TLS / SSL Configuration
 
-HTTPX uses the system's default CA bundle (via `certifi`) and verifies certificates by default. Most of the time you don't have to touch it. The times you do:
+HTTPX 0.28.1 uses certifi's CA bundle by default and verifies certificates. That bundle is
+not the operating system trust store; custom contexts and environment overrides can change it. Most of the time you don't have to touch it. The times you do:
 
 ### Custom CA bundle
 
@@ -421,7 +449,8 @@ ctx.load_verify_locations(cafile="/path/to/ca-bundle.pem")
 client = httpx.AsyncClient(verify=ctx)
 ```
 
-Environment override without changing code: `SSL_CERT_FILE=/path/to/bundle.pem` (read by OpenSSL/`certifi`).
+Environment override without changing code: `SSL_CERT_FILE=/path/to/bundle.pem` is honored
+by HTTPX when environment trust is enabled. It selects a CA file; it does not alter certifi itself.
 
 ### Do not disable verification
 
@@ -469,7 +498,9 @@ client = httpx.AsyncClient(verify=ctx)
 
 ### Common pitfalls
 
-- **Certificate errors in Docker** — some base images ship an outdated CA bundle. The `certifi` package that HTTPX uses is usually fine; if not, `apt-get install ca-certificates` in the image.
+- **Certificate errors in Docker** — inspect which trust store the client actually uses.
+  Updating OS ca-certificates does not update certifi. Update the selected bundle or supply
+  a verified context that intentionally uses the required store. Test trusted and wrong-host certificates.
 - **Connecting to an IP instead of a hostname** — certs are issued for hostnames. Use the hostname and set up DNS; avoid `verify=False` as a workaround.
 - **Clock skew** — a large clock drift on your host can fail cert validation even when the cert is valid. Check NTP sync if validation fails in weird ways.
 - **HTTP/2 over TLS** — `http2=True` requires ALPN negotiation to pick h2; that only works over TLS (HTTPS), not plain HTTP.
